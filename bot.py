@@ -1,85 +1,94 @@
+import os
 import discord
 import asyncio
-import re
-from datetime import timedelta
-from paddleocr import PaddleOCR
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-# 🔑 Discord BOT のトークンを設定
-TOKEN = "YOUR_DISCORD_BOT_TOKEN"
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID"))  # 通知専用チャンネル
 
-# Discord の Intents 設定
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# PaddleOCR 初期化（英語、日本語両対応なら lang='japan' も可）
-ocr = PaddleOCR(use_angle_cls=True, lang='en')
-
-# 時間抽出用正規表現（例: 02:34:56）
-time_pattern = re.compile(r'(\d{1,2}:\d{2}:\d{2})')
-
-# サーバー番号抽出用（例: s1281）
-server_pattern = re.compile(r's\d{3,4}')
-
+# ========== 時刻処理 ==========
 def parse_time_to_timedelta(time_str: str) -> timedelta:
-    """OCR で取得した HH:MM:SS を timedelta に変換"""
+    """OCRの時刻(02:38:18) → timedeltaに変換"""
     h, m, s = map(int, time_str.split(":"))
     return timedelta(hours=h, minutes=m, seconds=s)
 
+# ========== 通知スケジュール ==========
+async def schedule_notification(mode, server_num, event_time):
+    """
+    イベント時刻の5分前と15秒前に通知専用チャンネルにメッセージ送信
+    """
+    notify_channel = client.get_channel(NOTIFY_CHANNEL_ID)
+    if notify_channel is None:
+        print("⚠ 通知チャンネルが見つからない！")
+        return
+
+    event_str = event_time.strftime("%H:%M:%S")
+    now = datetime.now()
+    diff = (event_time - now).total_seconds()
+
+    if diff <= 0:
+        return  # すでに過ぎていたら何もしない
+
+    # 5分前通知
+    if diff > 300:
+        await asyncio.sleep(diff - 300)
+        await notify_channel.send(f"⏳ {mode}-{server_num}-{event_str} の開始5分前！")
+
+    # 15秒前通知
+    now2 = datetime.now()
+    diff2 = (event_time - now2).total_seconds()
+    if diff2 > 15:
+        await asyncio.sleep(diff2 - 15)
+    elif diff2 <= 0:
+        return
+    await notify_channel.send(f"⚠️ {mode}-{server_num}-{event_str} の開始15秒前！")
+
+# ========== OCR結果処理 ==========
+async def process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst):
+    """
+    OCRで取得した時刻にスクショのタイムスタンプを加算 → 通知も設定
+    """
+    if ocr_time:
+        delta = parse_time_to_timedelta(ocr_time)
+        real_event_time = screenshot_timestamp_jst + delta
+        real_event_str = real_event_time.strftime("%H:%M:%S")
+
+        # s1281なら防衛、それ以外は奪取
+        mode = "防衛" if server_num == "s1281" else "奪取"
+        final_message = f"{mode}-{server_num}-{real_event_str}"
+
+        # スクショ投稿チャンネルにも送る
+        await message.channel.send(final_message)
+
+        # 通知専用チャンネルに 5分前＆15秒前通知をスケジュール
+        asyncio.create_task(schedule_notification(
+            mode,
+            server_num,
+            real_event_time
+        ))
+
+# ========== Discord起動 ==========
 @client.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user}")
+    print(f"✅ ログイン完了: {client.user}")
 
 @client.event
 async def on_message(message):
-    # BOT のメッセージは無視
     if message.author.bot:
         return
 
-    # メッセージに画像が含まれている場合のみ処理
-    if message.attachments:
-        for attachment in message.attachments:
-            # 画像を一時保存
-            img_path = f"/tmp/{attachment.filename}"
-            await attachment.save(img_path)
+    # ここでOCR処理やサーバー番号抽出して `server_num`, `ocr_time`, `screenshot_timestamp_jst` を決める
+    # 仮の例
+    if message.content.startswith("テスト"):
+        server_num = "s1281"
+        ocr_time = "02:38:18"
+        screenshot_timestamp_jst = datetime.now()
+        await process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst)
 
-            # PaddleOCR でテキスト抽出
-            result = ocr.ocr(img_path, cls=True)
-            extracted_text = " ".join([line[1][0] for block in result for line in block])
-            print("📜 OCR結果:", extracted_text)
-
-            # サーバー番号を取得
-            server_match = server_pattern.search(extracted_text)
-            server_num = server_match.group() if server_match else "???"
-
-            # 時間を取得
-            time_match = time_pattern.search(extracted_text)
-            ocr_time = time_match.group() if time_match else None
-
-            # スクリーンショットのアップロード時刻（UTC → JST）
-            screenshot_timestamp = attachment.created_at.replace(tzinfo=None)
-            screenshot_timestamp_jst = screenshot_timestamp + timedelta(hours=9)
-
-            # デフォルトメッセージ
-            final_message = "❌ 時間が読み取れませんでした"
-
-            if ocr_time:
-                # OCR 時刻を timedelta に変換
-                delta = parse_time_to_timedelta(ocr_time)
-
-                # スクショ時刻 + OCR時間 → 実際のイベント発生時刻
-                real_event_time = screenshot_timestamp_jst + delta
-
-                # ✅ 月日を削除して、HH:MM:SS のみ
-                real_event_str = real_event_time.strftime("%H:%M:%S")
-
-                # サーバー番号が s1281 の場合は「防衛」、それ以外は「奪取」
-                mode = "防衛" if server_num == "s1281" else "奪取"
-
-                # 形式: 奪取-s1281-14:30:39
-                final_message = f"{mode}-{server_num}-{real_event_str}"
-
-            await message.channel.send(final_message)
-
-# BOT 実行
 client.run(TOKEN)
