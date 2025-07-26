@@ -1,38 +1,44 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-WORKDIR /app
+# 環境変数設定（ロケールなど）
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1
 
-# まずビルドに必要なツール・ライブラリをインストール
+# ---- 依存パッケージをインストール ----
 RUN apt-get update && apt-get install -y \
+    # Cビルドに必要な基本ツール
     build-essential \
-    libgl1-mesa-dev \
-    libjpeg-dev \
-    libfreetype6-dev \
-    liblcms2-dev \
-    libopenjp2-7-dev \
-    libtiff-dev \
-    tesseract-ocr \
-    libleptonica-dev \
-    libxml2-dev \
-    zlib1g-dev \
-    libffi-dev \
+    cmake \
+    pkg-config \
+    # paddleocr / PyMuPDF に必要なライブラリ
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
+    # PyMuPDF のビルドに必要
+    swig \
+    # 追加ツール
+    git wget curl \
     && rm -rf /var/lib/apt/lists/*
 
-# pip を最新化
-RUN pip install --upgrade pip
+# ---- pip 最新化 ----
+RUN pip install --upgrade pip setuptools wheel
 
-# paddleOCRの依存関係をインストール
+# ---- PaddlePaddle (CPU版) ----
 RUN pip install --no-cache-dir paddlepaddle==2.5.2
+
+# ---- PaddleOCR ----
 RUN pip install --no-cache-dir paddleocr==2.7.0.3
 
-# その他必要なライブラリ
-RUN pip install --no-cache-dir shapely scikit-image imgaug pyclipper lmdb tqdm rapidfuzz opencv-python-headless
+# (オプション) 日本語OCRのため追加モデルもダウンロードしたいなら
+# RUN paddleocr --lang jp
 
-# requirements.txtがあるならここでインストール
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ---- 作業ディレクトリ ----
+WORKDIR /app
 
-# アプリのソースコードをコピー
-COPY . .
+# (必要ならソースコードをコピー)
+# COPY . .
 
-CMD ["python", "main.py"]
+CMD ["python3"]
