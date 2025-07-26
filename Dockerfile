@@ -1,31 +1,31 @@
-# ベースイメージ
 FROM python:3.10-slim
 
-# 必要なシステムライブラリをインストール
+# --- 追加: PaddleOCR に必要なライブラリをインストール ---
 RUN apt-get update && apt-get install -y \
-    libglib2.0-0 libsm6 libxrender1 libxext6 libgl1 \
+    libglib2.0-0 \
+    libgl1-mesa-glx \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \ 
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 作業ディレクトリ
+# --- 作業ディレクトリ設定 ---
 WORKDIR /app
 
-# まず NumPy 1.26.4 をインストール（imgaug が NumPy 2.0 に未対応のため）
-RUN pip install --no-cache-dir numpy==1.26.4
+# --- 依存関係をコピーしてインストール ---
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
 
-# その後 PaddleOCR 関連ライブラリをインストール
-RUN pip install --no-cache-dir \
-    paddlepaddle==2.5.2 \
-    paddleocr==2.7.0.3 \
-    opencv-python==4.6.0.66 \
-    opencv-contrib-python==4.6.0.66 \
-    imgaug==0.4.0
+# --- Numpy のバージョンを PaddleOCR 互換に固定 ---
+RUN pip install --no-cache-dir "numpy<2.0"
 
-# さらに他の必要ライブラリもまとめてインストール
-RUN pip install --no-cache-dir \
-    flask discord.py requests
+# --- アプリケーション本体をコピー ---
+COPY . /app
 
-# アプリケーションファイルをコピー
-COPY bot.py /app/
+# --- PaddleOCR のキャッシュを先に生成（初回メモリ節約のため） ---
+RUN python3 -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en')"
 
-# コンテナ起動時に Flask（または必要なスクリプト）を実行
+# --- 実行コマンド ---
 CMD ["python3", "bot.py"]
