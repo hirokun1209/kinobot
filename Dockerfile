@@ -2,16 +2,18 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# 依存パッケージ
-RUN apt-get update && apt-get install -y libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 && apt-get clean
+# OpenCVとPaddleOCRに必要なネイティブライブラリ
+RUN apt-get update && apt-get install -y \
+    libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 libgomp1 \
+ && apt-get clean
 
-# まず互換性のあるnumpyをインストール
+# numpyを互換性のあるバージョンに固定
 RUN pip install --no-cache-dir numpy==1.26.4
 
-# OpenCV と PaddleOCR 関連
+# OpenCVとPaddleOCRをインストール（バージョン固定）
 RUN pip install --no-cache-dir opencv-python==4.6.0.66 paddlepaddle==2.5.2 paddleocr==2.7.0.3
 
-# Discord bot など他の依存
+# 他の依存ライブラリ（FlaskやDiscordなど）
 RUN pip install --no-cache-dir flask discord.py
 
 COPY bot.py /app/
