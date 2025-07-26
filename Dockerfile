@@ -18,3 +18,5 @@ COPY bot.py /app/
 
 # BOT起動コマンド
 CMD ["python", "bot.py"]
+
+pip install discord.py python-dotenv pillow pytesseract
