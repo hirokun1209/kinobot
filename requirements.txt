@@ -1,6 +1,4 @@
-torch==2.5.1+cpu
-easyocr==1.7.0
 discord.py
-pillow
-opencv-python-headless
+pillow==9.5.0
+easyocr==1.7.0
 flask
