@@ -1,5 +1,6 @@
 discord.py
 pillow
 easyocr==1.7.0
-torch==2.0.1
-flask
+torch==2.5.1   # ← 軽量版CPU対応
+torchvision==0.20.1
+torchaudio==2.5.1
