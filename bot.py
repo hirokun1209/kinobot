@@ -1,122 +1,150 @@
 import os
+import re
 import discord
-import asyncio
+from discord.ext import commands
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
+import threading
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from paddleocr import PaddleOCR
+import tempfile
 
-# ====== .env から読み込み ======
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID"))
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+PREFIX = "!"
 
-# ====== Discord 設定 ======
+# OCR初期化（日本語対応）
+ocr = PaddleOCR(use_angle_cls=True, lang='japan')
+
 intents = discord.Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# ====== PaddleOCR モデル初期化 ======
-ocr_model = PaddleOCR(use_angle_cls=True, lang="japan")
+# ======================
+# ✅ ヘルスチェックサーバー
+# ======================
+def run_healthcheck():
+    class HealthHandler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
 
-# ====== OCR処理関数 ======
-def ocr_image_paddle(image_path: str) -> str:
-    """画像ファイルから文字を抽出"""
-    result = ocr_model.ocr(image_path, cls=True)
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    server.serve_forever()
+
+# ======================
+# ✅ 時刻パース補助
+# ======================
+def parse_time_string(time_str):
+    """12:34 → datetime.timedelta"""
+    match = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
+    if not match:
+        return None
+    h, m = map(int, match.groups())
+    return timedelta(hours=h, minutes=m)
+
+def add_times(base, add):
+    """timedelta同士を足して 24時間超えは繰り返し"""
+    total_minutes = (base.total_seconds() + add.total_seconds()) / 60
+    hours = int(total_minutes // 60) % 24
+    minutes = int(total_minutes % 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+# ======================
+# ✅ 起動イベント
+# ======================
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+
+# ======================
+# ✅ OCRコマンド
+# ======================
+@bot.command()
+async def ocr(ctx):
+    """添付画像をOCR解析"""
+    if not ctx.message.attachments:
+        await ctx.send("❌ 画像を添付してね！")
+        return
+
+    img = ctx.message.attachments[0]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        await img.save(tmp.name)
+        tmp_path = tmp.name
+
+    result = ocr.ocr(tmp_path, cls=True)
+    os.remove(tmp_path)
+
     text_list = []
     for line in result:
         for word_info in line:
             text_list.append(word_info[1][0])
-    return "\n".join(text_list)
 
-# ====== 時刻処理 ======
-def parse_time_to_timedelta(time_str: str) -> timedelta:
-    """OCRの時刻(02:38:18) → timedeltaに変換"""
-    h, m, s = map(int, time_str.split(":"))
-    return timedelta(hours=h, minutes=m, seconds=s)
+    if text_list:
+        await ctx.send("✅ OCR結果:\n```\n" + "\n".join(text_list) + "\n```")
+    else:
+        await ctx.send("❌ テキストが検出できなかったよ")
 
-# ====== 通知スケジュール ======
-async def schedule_notification(mode, server_num, event_time):
-    """イベント時刻の5分前と15秒前に通知"""
-    notify_channel = client.get_channel(NOTIFY_CHANNEL_ID)
-    if notify_channel is None:
-        print("⚠ 通知チャンネルが見つからない！")
+# ======================
+# ✅ 時間計算コマンド
+# ======================
+@bot.command()
+async def time(ctx, base_time: str, add_time: str):
+    """
+    時刻計算: !time 12:30 01:15 → 13:45
+    """
+    base = parse_time_string(base_time)
+    add = parse_time_string(add_time)
+
+    if not base or not add:
+        await ctx.send("❌ 時刻は HH:MM 形式で入力してね（例: !time 12:30 01:15）")
         return
 
-    event_str = event_time.strftime("%H:%M:%S")
-    now = datetime.now()
-    diff = (event_time - now).total_seconds()
+    result = add_times(base, add)
+    await ctx.send(f"⏰ **{base_time} + {add_time} = {result}**")
 
-    if diff <= 0:
-        return  # すでに過ぎていたらスキップ
-
-    # 5分前通知
-    if diff > 300:
-        await asyncio.sleep(diff - 300)
-        await notify_channel.send(f"⏳ {mode}-{server_num}-{event_str} の開始5分前！")
-
-    # 15秒前通知
-    now2 = datetime.now()
-    diff2 = (event_time - now2).total_seconds()
-    if diff2 > 15:
-        await asyncio.sleep(diff2 - 15)
-    elif diff2 <= 0:
-        return
-    await notify_channel.send(f"⚠️ {mode}-{server_num}-{event_str} の開始15秒前！")
-
-# ====== OCR結果処理 ======
-async def process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst):
-    """OCRで取得した時刻にスクショのタイムスタンプを加算 → 通知も設定"""
-    if ocr_time:
-        delta = parse_time_to_timedelta(ocr_time)
-        real_event_time = screenshot_timestamp_jst + delta
-        real_event_str = real_event_time.strftime("%H:%M:%S")
-
-        mode = "防衛" if server_num == "s1281" else "奪取"
-        final_message = f"{mode}-{server_num}-{real_event_str}"
-
-        # スクショ投稿チャンネルに送信
-        await message.channel.send(final_message)
-
-        # 通知専用チャンネルに 5分前＆15秒前通知をスケジュール
-        asyncio.create_task(schedule_notification(
-            mode,
-            server_num,
-            real_event_time
-        ))
-
-# ====== Discordイベント ======
-@client.event
-async def on_ready():
-    print(f"✅ ログイン完了: {client.user}")
-
-@client.event
-async def on_message(message):
-    if message.author.bot:
+# ======================
+# ✅ OCR + 時刻抽出 → 計算
+# ======================
+@bot.command()
+async def ocr_time(ctx, add_time: str):
+    """
+    添付画像からOCRした時間に追加時間を足す:
+    !ocr_time 01:15 （画像に12:30 → 13:45）
+    """
+    if not ctx.message.attachments:
+        await ctx.send("❌ 画像を添付してね！")
         return
 
-    # 添付画像がある場合OCR
-    if message.attachments:
-        for attachment in message.attachments:
-            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg")):
-                img_path = f"/tmp/{attachment.filename}"
-                await attachment.save(img_path)
+    # 画像保存
+    img = ctx.message.attachments[0]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        await img.save(tmp.name)
+        tmp_path = tmp.name
 
-                # OCR実行
-                text = ocr_image_paddle(img_path)
-                await message.channel.send(f"📸 OCR結果:\n```\n{text}\n```")
+    # OCR解析
+    result = ocr.ocr(tmp_path, cls=True)
+    os.remove(tmp_path)
 
-                # TODO: OCR結果からサーバー番号や時間を抽出する処理を入れる
-                # 仮テスト用
-                server_num = "s1281"
-                ocr_time = "02:38:18"
-                screenshot_timestamp_jst = datetime.now()
-                await process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst)
+    # OCR結果から時間パターンを検索
+    detected_text = " ".join(word_info[1][0] for line in result for word_info in line)
+    time_match = re.search(r"(\d{1,2}:\d{2})", detected_text)
+    if not time_match:
+        await ctx.send("❌ OCRで時間が見つからなかったよ")
+        return
 
-    # テキストコマンドでもテスト可
-    if message.content.startswith("テスト"):
-        server_num = "s1281"
-        ocr_time = "02:38:18"
-        screenshot_timestamp_jst = datetime.now()
-        await process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst)
+    base_time_str = time_match.group(1)
+    base_time = parse_time_string(base_time_str)
+    add = parse_time_string(add_time)
 
-client.run(TOKEN)
+    if not add:
+        await ctx.send("❌ 追加時間は HH:MM 形式で入力してね")
+        return
+
+    result_time = add_times(base_time, add)
+    await ctx.send(f"🖼 OCRで検出した時間: `{base_time_str}`\n➕ 追加 `{add_time}`\n➡ **{result_time}**")
+
+if __name__ == "__main__":
+    # ✅ ヘルスチェックHTTPサーバーをバックグラウンド起動
+    threading.Thread(target=run_healthcheck, daemon=True).start()
+    # ✅ Discord BOT起動
+    bot.run(TOKEN)
