@@ -27,14 +27,12 @@ client = discord.Client(intents=intents)
 
 reader = None
 
-# 画像の座標設定（必要に応じて調整）
 base_y = 1095
 row_height = 310
 crop_height = 140
 num_box_x  = (270, 400)
 time_box_x = (400, 630)
 
-# EasyOCR Reader 初期化
 def get_reader():
     global reader
     if reader is None:
@@ -42,35 +40,47 @@ def get_reader():
         reader = easyocr.Reader(['en'], gpu=False)
     return reader
 
-# === 番号欄OCR → 数字だけ ===
 def ocr_number_only(image_path):
     r = get_reader()
     result = r.readtext(image_path, allowlist="0123456789", detail=0)
     return "".join(result)
 
-# === 時間欄OCR（通常） ===
 def ocr_easyocr(image_path):
     r = get_reader()
-    result = r.readtext(image_path, detail=0)
-    return " ".join(result)
+    result = r.readtext(image_path, allowlist="0123456789:", detail=0)
+    return "".join(result)
 
-# 数字抽出の後処理
-def extract_number(text):
-    # 数字がなければ "?" を返す
-    return text if text.isdigit() and text != "" else "?"
+def clean_number(text):
+    m = re.search(r"\d{3,6}", text)
+    return m.group(0) if m else "?"
 
-def extract_time(text):
-    # 09:31:07 / 093107 などをキャッチ
-    m = re.search(r"\d{1,2}[:：]?\d{2}[:：]?\d{2}", text)
-    if m:
-        val = m.group(0).replace("：", ":")
-        # 6桁の数字のみ → HH:MM:SS に整形
-        if len(val) == 6 and ":" not in val:
-            val = f"{val[0:2]}:{val[2:4]}:{val[4:6]}"
-        return val
+# ✅ 時間補正ロジック
+def clean_time(text):
+    digits = re.sub(r"\D", "", text)
+
+    # --- 8桁パターン (前4桁+後ろ2桁)
+    if len(digits) == 8:
+        return f"{digits[0:2]}:{digits[2:4]}:{digits[4:6]}"
+
+    # --- 7桁パターン → 前2桁 + 次2桁 + 残り2桁
+    if len(digits) == 7:
+        return f"{digits[0:2]}:{digits[2:4]}:{digits[4:6]}"
+
+    # --- 6桁パターン → 普通の時間
+    if len(digits) == 6:
+        return f"{digits[0:2]}:{digits[2:4]}:{digits[4:6]}"
+
+    # --- 4桁 (mm:ss)
+    if len(digits) == 4:
+        return f"00:{digits[0:2]}:{digits[2:4]}"
+
+    # --- 5桁や9桁以上は前から6桁を取る
+    if len(digits) > 6:
+        raw = digits[:6]
+        return f"{raw[0:2]}:{raw[2:4]}:{raw[4:6]}"
+
     return "開戦済"
 
-# === クロップして番号OCRは数字専用、時間は通常OCR ===
 def crop_and_ocr_easyocr(img_path):
     img = Image.open(img_path)
     lines = []
@@ -81,17 +91,17 @@ def crop_and_ocr_easyocr(img_path):
         if i == 2: y1 -= 200
         y2 = y1 + crop_height
 
-        # 番号欄 → 数字専用OCR
+        # 番号欄
         num_crop = f"/tmp/num_{i+1}.png"
         img.crop((num_box_x[0], y1, num_box_x[1], y2)).save(num_crop)
         raw_num = ocr_number_only(num_crop)
-        number = extract_number(raw_num)
+        number = clean_number(raw_num)
 
-        # 時間欄 → 通常OCR
+        # 時間欄
         time_crop = f"/tmp/time_{i+1}.png"
         img.crop((time_box_x[0], y1, time_box_x[1], y2)).save(time_crop)
         raw_time = ocr_easyocr(time_crop)
-        time_val = extract_time(raw_time)
+        time_val = clean_time(raw_time)
 
         lines.append({
             "raw_num": raw_num,
