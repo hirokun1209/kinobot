@@ -15,3 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY bot.py /app/
 
 CMD ["python", "bot.py"]
+
+# EasyOCR モデルを事前ダウンロード（初回起動時のOOM対策）
+RUN python3 -c "import easyocr; easyocr.Reader(['en'], gpu=False)"
