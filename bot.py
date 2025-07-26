@@ -3,38 +3,32 @@ import discord
 import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from PIL import Image
-import pytesseract
+from paddleocr import PaddleOCR
 
-# ====== .env 読み込み ======
+# ====== .env から読み込み ======
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID"))
 
-# ====== Discord 初期化 ======
+# ====== Discord 設定 ======
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# ====== OCR関数 ======
-def extract_text_from_image(image_path: str) -> str:
-    """画像からOCRで文字を読み取る"""
-    img = Image.open(image_path)
-    text = pytesseract.image_to_string(img, lang="eng+jpn")  # 日本語・英語両方
-    return text
+# ====== PaddleOCR モデル初期化 ======
+ocr_model = PaddleOCR(use_angle_cls=True, lang="japan")
 
-def parse_server_number(ocr_text: str) -> str:
-    """OCR結果から sxxxx 形式のサーバー番号を抽出"""
-    import re
-    match = re.search(r"s\d{3,4}", ocr_text)
-    return match.group(0) if match else "unknown"
+# ====== OCR処理関数 ======
+def ocr_image_paddle(image_path: str) -> str:
+    """画像ファイルから文字を抽出"""
+    result = ocr_model.ocr(image_path, cls=True)
+    text_list = []
+    for line in result:
+        for word_info in line:
+            text_list.append(word_info[1][0])
+    return "\n".join(text_list)
 
-def parse_event_time(ocr_text: str) -> str:
-    """OCR結果から 00:00:00 形式の時刻を抽出"""
-    import re
-    match = re.search(r"\d{2}:\d{2}:\d{2}", ocr_text)
-    return match.group(0) if match else None
-
+# ====== 時刻処理 ======
 def parse_time_to_timedelta(time_str: str) -> timedelta:
     """OCRの時刻(02:38:18) → timedeltaに変換"""
     h, m, s = map(int, time_str.split(":"))
@@ -53,7 +47,7 @@ async def schedule_notification(mode, server_num, event_time):
     diff = (event_time - now).total_seconds()
 
     if diff <= 0:
-        return  # すでに過ぎていたら何もしない
+        return  # すでに過ぎていたらスキップ
 
     # 5分前通知
     if diff > 300:
@@ -77,11 +71,10 @@ async def process_ocr_result(message, server_num, ocr_time, screenshot_timestamp
         real_event_time = screenshot_timestamp_jst + delta
         real_event_str = real_event_time.strftime("%H:%M:%S")
 
-        # s1281なら防衛、それ以外は奪取
         mode = "防衛" if server_num == "s1281" else "奪取"
         final_message = f"{mode}-{server_num}-{real_event_str}"
 
-        # スクショ投稿チャンネルにも送る
+        # スクショ投稿チャンネルに送信
         await message.channel.send(final_message)
 
         # 通知専用チャンネルに 5分前＆15秒前通知をスケジュール
@@ -97,43 +90,33 @@ async def on_ready():
     print(f"✅ ログイン完了: {client.user}")
 
 @client.event
-async def on_message(message: discord.Message):
+async def on_message(message):
     if message.author.bot:
         return
 
-    # テキストだけならテスト動作
+    # 添付画像がある場合OCR
+    if message.attachments:
+        for attachment in message.attachments:
+            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg")):
+                img_path = f"/tmp/{attachment.filename}"
+                await attachment.save(img_path)
+
+                # OCR実行
+                text = ocr_image_paddle(img_path)
+                await message.channel.send(f"📸 OCR結果:\n```\n{text}\n```")
+
+                # TODO: OCR結果からサーバー番号や時間を抽出する処理を入れる
+                # 仮テスト用
+                server_num = "s1281"
+                ocr_time = "02:38:18"
+                screenshot_timestamp_jst = datetime.now()
+                await process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst)
+
+    # テキストコマンドでもテスト可
     if message.content.startswith("テスト"):
         server_num = "s1281"
         ocr_time = "02:38:18"
         screenshot_timestamp_jst = datetime.now()
         await process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst)
-        return
 
-    # 画像が添付されてたらOCRする
-    if message.attachments:
-        for attachment in message.attachments:
-            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg")):
-                # 一時保存
-                save_path = f"/tmp/{attachment.filename}"
-                await attachment.save(save_path)
-
-                # OCR読み取り
-                ocr_text = extract_text_from_image(save_path)
-                print("📸 OCR結果:\n", ocr_text)
-
-                # サーバー番号・時間を抽出
-                server_num = parse_server_number(ocr_text)
-                ocr_time = parse_event_time(ocr_text)
-
-                if not ocr_time:
-                    await message.channel.send("⚠ 時刻が読み取れませんでした")
-                    return
-
-                # スクショが撮られた時間 (Discordのメッセージ投稿時刻を使用)
-                screenshot_timestamp_jst = message.created_at.astimezone()
-
-                # 処理 & 通知スケジュール
-                await process_ocr_result(message, server_num, ocr_time, screenshot_timestamp_jst)
-
-# ====== 実行 ======
 client.run(TOKEN)
