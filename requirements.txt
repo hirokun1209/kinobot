@@ -1,6 +1,6 @@
 discord.py==2.3.2
-paddleocr==2.7.0.3 --no-deps
 paddlepaddle==2.5.2
+paddleocr==2.7.0.3
 opencv-python-headless==4.8.0.74
 numpy<2.0.0
 python-dotenv
