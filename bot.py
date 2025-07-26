@@ -2,10 +2,8 @@ import os
 import threading
 from flask import Flask
 import discord
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image
 import easyocr
-import cv2
-import numpy as np
 import re
 
 # === Flask Health Check HTTPサーバー ===
@@ -29,14 +27,14 @@ client = discord.Client(intents=intents)
 
 reader = None
 
-# クロップ領域
+# 画像の座標設定（必要に応じて調整）
 base_y = 1095
 row_height = 310
 crop_height = 140
 num_box_x  = (270, 400)
 time_box_x = (400, 630)
 
-# === EasyOCR Reader 初期化 ===
+# EasyOCR Reader 初期化
 def get_reader():
     global reader
     if reader is None:
@@ -44,86 +42,55 @@ def get_reader():
         reader = easyocr.Reader(['en'], gpu=False)
     return reader
 
-# === 画像前処理（精度UP用） ===
-def preprocess_image(image_path):
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # ガウシアンでノイズ除去
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    # 適応的二値化
-    thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 31, 15
-    )
-    # 反転して白文字黒背景に
-    inverted = cv2.bitwise_not(thresh)
-    tmp_path = "/tmp/preprocessed.png"
-    cv2.imwrite(tmp_path, inverted)
-    return tmp_path
-
-# === EasyOCRでテキスト認識 ===
-def ocr_easyocr(image_path):
-    processed = preprocess_image(image_path)
+# === 番号欄OCR → 数字だけ ===
+def ocr_number_only(image_path):
     r = get_reader()
-    result = r.readtext(processed, detail=1)
+    result = r.readtext(image_path, allowlist="0123456789", detail=0)
+    return "".join(result)
 
-    # bbox, text, conf の順序で戻るので正しく解釈する
-    filtered = [text for (bbox, text, conf) in result if conf >= 0.5]
+# === 時間欄OCR（通常） ===
+def ocr_easyocr(image_path):
+    r = get_reader()
+    result = r.readtext(image_path, detail=0)
+    return " ".join(result)
 
-    # 信頼度0.5未満しか無いならfallbackで全部連結
-    if not filtered:
-        filtered = [text for (_, text, _) in result]
-
-    return " ".join(filtered)
-
-# === 番号抽出（1〜12の数字） ===
+# 数字抽出の後処理
 def extract_number(text):
-    m = re.search(r"\b([1-9]|1[0-2])\b", text)
-    return m.group(1) if m else "?"
+    # 数字がなければ "?" を返す
+    return text if text.isdigit() and text != "" else "?"
 
-# === 時刻抽出（hh:mm:ss or 4桁以上の数字） ===
 def extract_time(text):
-    # まずhh:mm:ss形式
-    m = re.search(r"\d{1,2}[:：]?\d{1,2}[:：]?\d{1,2}", text)
+    # 09:31:07 / 093107 などをキャッチ
+    m = re.search(r"\d{1,2}[:：]?\d{2}[:：]?\d{2}", text)
     if m:
         val = m.group(0).replace("：", ":")
+        # 6桁の数字のみ → HH:MM:SS に整形
         if len(val) == 6 and ":" not in val:
             val = f"{val[0:2]}:{val[2:4]}:{val[4:6]}"
         return val
-
-    # 4桁以上の数字がある場合（例: 5027）
-    m2 = re.search(r"\d{4,}", text)
-    if m2:
-        return m2.group(0)
-
     return "開戦済"
 
-# === クロップして行ごとOCR ===
+# === クロップして番号OCRは数字専用、時間は通常OCR ===
 def crop_and_ocr_easyocr(img_path):
     img = Image.open(img_path)
     lines = []
     for i in range(3):
         y1 = base_y + i * row_height
-        # 行ごとの微調整
         if i == 0: y1 -= 5
         if i == 1: y1 -= 100
         if i == 2: y1 -= 200
         y2 = y1 + crop_height
 
-        # 番号領域クロップ
+        # 番号欄 → 数字専用OCR
         num_crop = f"/tmp/num_{i+1}.png"
         img.crop((num_box_x[0], y1, num_box_x[1], y2)).save(num_crop)
+        raw_num = ocr_number_only(num_crop)
+        number = extract_number(raw_num)
 
-        # 時間領域クロップ
+        # 時間欄 → 通常OCR
         time_crop = f"/tmp/time_{i+1}.png"
         img.crop((time_box_x[0], y1, time_box_x[1], y2)).save(time_crop)
-
-        # OCR実行
-        raw_num = ocr_easyocr(num_crop)
         raw_time = ocr_easyocr(time_crop)
-
-        # パターン抽出
-        number = extract_number(raw_num)
         time_val = extract_time(raw_time)
 
         lines.append({
@@ -134,7 +101,6 @@ def crop_and_ocr_easyocr(img_path):
         })
     return lines
 
-# === Discordイベント ===
 @client.event
 async def on_ready():
     print(f"✅ EasyOCR Discord BOT起動: {client.user}")
@@ -143,19 +109,16 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
-
     if message.attachments:
         await message.channel.send("✅ EasyOCR(CPUモード)で番号＆免戦時間を解析中…")
         for attachment in message.attachments:
             file_path = f"/tmp/{attachment.filename}"
             await attachment.save(file_path)
             lines = crop_and_ocr_easyocr(file_path)
-
             result_msg = ""
             for idx, line in enumerate(lines, start=1):
                 result_msg += f"行{idx} → 番号OCR: \"{line['raw_num']}\" → 抽出: {line['number']}\n"
                 result_msg += f"　　　 → 時間OCR: \"{line['raw_time']}\" → 抽出: {line['time_val']}\n\n"
-
             await message.channel.send(result_msg)
 
 client.run(TOKEN)
