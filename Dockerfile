@@ -1,25 +1,38 @@
+# ベースイメージ（軽量な Python3.10）
 FROM python:3.10-slim
 
-WORKDIR /app
+# 環境変数設定
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
 
-# OpenCV と PaddleOCR の依存ライブラリ
+# 依存ライブラリをインストール（OpenCV 用に libGL など必須）
 RUN apt-get update && apt-get install -y \
-    libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 libgomp1 \
- && apt-get clean
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# ✅ まず numpy を PaddleOCR と互換性のある 1.26 系に固定
+# numpy は 2.x ではなく 1.26.4 に固定する（ABIエラー防止）
 RUN pip install --no-cache-dir numpy==1.26.4
 
-# ✅ numpy 1.x に合わせて OpenCV & PaddleOCR をインストール
+# OpenCV と PaddleOCR をインストール
+# OpenCV は古い安定版を使う（4.6.0.66 は numpy1.x と相性が良い）
 RUN pip install --no-cache-dir \
     opencv-python==4.6.0.66 \
+    opencv-contrib-python==4.6.0.66 \
     paddlepaddle==2.5.2 \
     paddleocr==2.7.0.3
 
-# その他の必要ライブラリ
+# Flask や Discord BOT の依存パッケージ
 RUN pip install --no-cache-dir flask discord.py
 
-# アプリ本体
+# BOT のコードをコピー
+WORKDIR /app
 COPY bot.py /app/
 
-CMD ["python3", "bot.py"]
+# Flask サーバー起動ポート
+EXPOSE 8080
+
+# 起動コマンド
+CMD ["python", "bot.py"]
