@@ -1,6 +1,5 @@
-flask
 discord.py==2.3.2
 paddleocr==2.7.0.3
 paddlepaddle==2.5.2
-opencv-python-headless
-pillow
+opencv-python-headless==4.8.0.74
+numpy<2.0.0   # imgaug互換のためNumPy 1系
