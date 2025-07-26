@@ -4,3 +4,5 @@ paddlepaddle==2.5.2
 opencv-python-headless==4.8.0.74
 numpy<2.0.0   # imgaug互換のためNumPy 1系
 python-dotenv
+
+# ✅ PDF OCRしないので PyMuPDF は不要
