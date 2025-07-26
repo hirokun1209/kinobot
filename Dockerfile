@@ -1,31 +1,16 @@
 FROM python:3.10-slim
 
-# --- 追加: PaddleOCR に必要なライブラリをインストール ---
+# 依存パッケージ
 RUN apt-get update && apt-get install -y \
-    libglib2.0-0 \
     libgl1-mesa-glx \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \ 
-    && apt-get clean \
+    libglib2.0-0 \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# --- 作業ディレクトリ設定 ---
+# Pythonパッケージ
+RUN pip install --no-cache-dir paddleocr==2.7.0.3 paddlepaddle==2.5.2 discord.py Pillow
+
 WORKDIR /app
+COPY bot.py /app/
 
-# --- 依存関係をコピーしてインストール ---
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
-
-# --- Numpy のバージョンを PaddleOCR 互換に固定 ---
-RUN pip install --no-cache-dir "numpy<2.0"
-
-# --- アプリケーション本体をコピー ---
-COPY . /app
-
-# --- PaddleOCR のキャッシュを先に生成（初回メモリ節約のため） ---
-RUN python3 -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en')"
-
-# --- 実行コマンド ---
 CMD ["python3", "bot.py"]
