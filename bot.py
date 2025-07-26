@@ -2,9 +2,11 @@ import os
 import threading
 from flask import Flask
 import discord
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 import easyocr
 import re
+import cv2
+import numpy as np
 
 # === Flask Health Check HTTPサーバー ===
 app = Flask(__name__)
@@ -37,25 +39,52 @@ def get_reader():
     global reader
     if reader is None:
         print("⏳ EasyOCR Reader初期化中…")
-        reader = easyocr.Reader(['en'], gpu=False)
+        # 英数字専用モデルで精度UP
+        reader = easyocr.Reader(['en'], gpu=False, recog_network='english_g2')
     return reader
 
+def preprocess_image(image_path):
+    """OCR前に画像を前処理して精度UP"""
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    # コントラスト調整
+    img = cv2.convertScaleAbs(img, alpha=1.5, beta=0)
+    # 二値化
+    _, img = cv2.threshold(img, 160, 255, cv2.THRESH_BINARY)
+    processed_path = image_path.replace(".png", "_proc.png")
+    cv2.imwrite(processed_path, img)
+    return processed_path
+
 def ocr_easyocr(image_path):
+    processed = preprocess_image(image_path)
     r = get_reader()
-    result = r.readtext(image_path, detail=0)
-    return " ".join(result)
+    result = r.readtext(processed, detail=1)
+    # 信頼度50%以上の結果だけ採用
+    filtered = [text for (text, conf, bbox) in result if conf >= 0.5]
+    return " ".join(filtered)
 
 def extract_number(text):
-    m = re.search(r"\b([1-9]|1[0-2])\b", text)
-    return m.group(1) if m else "?"
+    # 数字だけ抽出
+    digits = re.findall(r"\d+", text)
+    if not digits:
+        return "?"
+    # 最後の数字を採用
+    number = digits[-1]
+    # 長すぎる場合は末尾4桁に制限
+    if len(number) > 4:
+        number = number[-4:]
+    return number
 
 def extract_time(text):
-    m = re.search(r"\d{1,2}[:：]?\d{1,2}[:：]?\d{1,2}", text)
-    if m:
-        val = m.group(0).replace("：", ":")
-        if len(val) == 6 and ":" not in val:
-            val = f"{val[0:2]}:{val[2:4]}:{val[4:6]}"
-        return val
+    # 数字だけ連結
+    digits = "".join(re.findall(r"\d", text))
+    if len(digits) >= 6:
+        # hh:mm:ss に変換
+        return f"{digits[0:2]}:{digits[2:4]}:{digits[4:6]}"
+    elif len(digits) >= 4:
+        # hh:mm:00 とみなす
+        return f"{digits[0:2]}:{digits[2:4]}:00"
+    elif len(digits) >= 2:
+        return f"{digits[0:2]}:00:00"
     return "開戦済"
 
 def crop_and_ocr_easyocr(img_path):
@@ -67,14 +96,20 @@ def crop_and_ocr_easyocr(img_path):
         if i == 1: y1 -= 100
         if i == 2: y1 -= 200
         y2 = y1 + crop_height
+
+        # 番号部分
         num_crop = f"/tmp/num_{i+1}.png"
         img.crop((num_box_x[0], y1, num_box_x[1], y2)).save(num_crop)
         raw_num = ocr_easyocr(num_crop)
+
+        # 時間部分
         time_crop = f"/tmp/time_{i+1}.png"
         img.crop((time_box_x[0], y1, time_box_x[1], y2)).save(time_crop)
         raw_time = ocr_easyocr(time_crop)
+
         number = extract_number(raw_num)
         time_val = extract_time(raw_time)
+
         lines.append({
             "raw_num": raw_num,
             "number": number,
@@ -92,7 +127,7 @@ async def on_message(message):
     if message.author.bot:
         return
     if message.attachments:
-        await message.channel.send("✅ EasyOCR(CPUモード)で番号＆免戦時間を解析中…")
+        await message.channel.send("✅ 精度UP版 EasyOCR(CPUモード)で番号＆免戦時間を解析中…")
         for attachment in message.attachments:
             file_path = f"/tmp/{attachment.filename}"
             await attachment.save(file_path)
