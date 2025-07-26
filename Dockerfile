@@ -1,22 +1,25 @@
-# ベースイメージ
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# 必要パッケージのインストール
+# 環境変数を設定（Pythonの出力を即時表示）
+ENV PYTHONUNBUFFERED=1
+
+# 必要なライブラリのインストール
 RUN apt-get update && apt-get install -y \
-    libgl1 libglib2.0-0 libgomp1 wget git curl \
+    tesseract-ocr \
+    libtesseract-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 作業ディレクトリ作成
+# 作業ディレクトリ
 WORKDIR /app
 
-# Python依存パッケージをインストール
+# requirements.txt を先にコピー（キャッシュ効かせる）
 COPY requirements.txt .
+
+# 依存関係インストール
 RUN pip install --no-cache-dir -r requirements.txt
 
-# BOTコードをコピー
-COPY bot.py /app/
+# アプリのソースコードをコピー
+COPY . .
 
-# BOT起動コマンド
+# 起動コマンド
 CMD ["python", "bot.py"]
-
-pip install discord.py python-dotenv pillow pytesseract
