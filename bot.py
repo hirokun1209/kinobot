@@ -1,111 +1,85 @@
-import os
-import re
-import io
 import discord
-from discord.ext import commands
-from PIL import Image
+import asyncio
+import re
+from datetime import timedelta
 from paddleocr import PaddleOCR
 
-# === Discord トークン ===
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+# 🔑 Discord BOT のトークンを設定
+TOKEN = "YOUR_DISCORD_BOT_TOKEN"
 
-# === PaddleOCR 初期化 ===
-ocr = PaddleOCR(use_angle_cls=False, lang='en')
-
-# === Discord Bot 設定 ===
+# Discord の Intents 設定
 intents = discord.Intents.default()
-intents.messages = True
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+client = discord.Client(intents=intents)
 
-# =========================================
-# OCR解析 → サーバー番号/番号/時間を抽出
-# =========================================
-def parse_ocr_results(ocr_lines):
-    parsed_results = []
-    current_server = None  # 現在のサーバー番号
+# PaddleOCR 初期化（英語、日本語両対応なら lang='japan' も可）
+ocr = PaddleOCR(use_angle_cls=True, lang='en')
 
-    for line in ocr_lines:
-        text = line.strip()
+# 時間抽出用正規表現（例: 02:34:56）
+time_pattern = re.compile(r'(\d{1,2}:\d{2}:\d{2})')
 
-        # サーバー番号行 → sXXXX 形式
-        server_match = re.match(r's\d+', text)
-        if server_match:
-            current_server = server_match.group(0)
-            continue
+# サーバー番号抽出用（例: s1281）
+server_pattern = re.compile(r's\d{3,4}')
 
-        # 番号 + 時間行 → "6 02:38:18" 形式
-        match = re.match(r'(\d+)\s+(\d{2}:\d{2}:\d{2})', text)
-        if match and current_server:
-            number = match.group(1)
-            time = match.group(2)
+def parse_time_to_timedelta(time_str: str) -> timedelta:
+    """OCR で取得した HH:MM:SS を timedelta に変換"""
+    h, m, s = map(int, time_str.split(":"))
+    return timedelta(hours=h, minutes=m, seconds=s)
 
-            # s1281 → 防衛, それ以外 → 奪取
-            prefix = "防衛" if current_server == "s1281" else "奪取"
+@client.event
+async def on_ready():
+    print(f"✅ Logged in as {client.user}")
 
-            parsed_results.append(f"{prefix} {current_server}-{number}-{time}")
-
-    return parsed_results
-
-# =========================================
-# OCR実行関数 (画像→文字列リスト)
-# =========================================
-def run_ocr_on_image(image_bytes):
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    result = ocr.ocr(image, cls=False)
-    extracted_lines = []
-
-    for res in result[0]:
-        text = res[1][0]
-        extracted_lines.append(text)
-
-    return extracted_lines
-
-# =========================================
-# 画像が送られたら自動でOCR & パース
-# =========================================
-@bot.event
+@client.event
 async def on_message(message):
-    # Bot自身のメッセージは無視
+    # BOT のメッセージは無視
     if message.author.bot:
         return
 
-    # 添付画像がある場合のみ処理
+    # メッセージに画像が含まれている場合のみ処理
     if message.attachments:
         for attachment in message.attachments:
-            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg")):
-                await message.channel.send("⏳ 画像をOCR解析中…")
+            # 画像を一時保存
+            img_path = f"/tmp/{attachment.filename}"
+            await attachment.save(img_path)
 
-                # 画像データを取得
-                image_bytes = await attachment.read()
+            # PaddleOCR でテキスト抽出
+            result = ocr.ocr(img_path, cls=True)
+            extracted_text = " ".join([line[1][0] for block in result for line in block])
+            print("📜 OCR結果:", extracted_text)
 
-                # OCR実行
-                ocr_lines = run_ocr_on_image(image_bytes)
-                if not ocr_lines:
-                    await message.channel.send("⚠️ OCRで文字が読み取れませんでした。")
-                    return
+            # サーバー番号を取得
+            server_match = server_pattern.search(extracted_text)
+            server_num = server_match.group() if server_match else "???"
 
-                # OCR結果をパースして 防衛/奪取メッセージに変換
-                parsed_results = parse_ocr_results(ocr_lines)
+            # 時間を取得
+            time_match = time_pattern.search(extracted_text)
+            ocr_time = time_match.group() if time_match else None
 
-                if parsed_results:
-                    final_msg = "\n".join(parsed_results)
-                    await message.channel.send(f"✅ 解析結果:\n```\n{final_msg}\n```")
-                else:
-                    await message.channel.send("⚠️ サーバー番号や時間が抽出できませんでした。")
+            # スクリーンショットのアップロード時刻（UTC → JST）
+            screenshot_timestamp = attachment.created_at.replace(tzinfo=None)
+            screenshot_timestamp_jst = screenshot_timestamp + timedelta(hours=9)
 
-    # 他のコマンドも処理する
-    await bot.process_commands(message)
+            # デフォルトメッセージ
+            final_message = "❌ 時間が読み取れませんでした"
 
-# =========================================
-# 起動時メッセージ
-# =========================================
-@bot.event
-async def on_ready():
-    print(f"✅ Botログイン成功: {bot.user}")
+            if ocr_time:
+                # OCR 時刻を timedelta に変換
+                delta = parse_time_to_timedelta(ocr_time)
 
-# =========================================
-# Bot起動
-# =========================================
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+                # スクショ時刻 + OCR時間 → 実際のイベント発生時刻
+                real_event_time = screenshot_timestamp_jst + delta
+
+                # ✅ 月日を削除して、HH:MM:SS のみ
+                real_event_str = real_event_time.strftime("%H:%M:%S")
+
+                # サーバー番号が s1281 の場合は「防衛」、それ以外は「奪取」
+                mode = "防衛" if server_num == "s1281" else "奪取"
+
+                # 形式: 奪取-s1281-14:30:39
+                final_message = f"{mode}-{server_num}-{real_event_str}"
+
+            await message.channel.send(final_message)
+
+# BOT 実行
+client.run(TOKEN)
