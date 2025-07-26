@@ -1,37 +1,31 @@
+# ベースイメージ
 FROM python:3.10-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
-
-# システム依存ライブラリ
+# 必要なシステムライブラリをインストール
 RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    libgomp1 \
-    build-essential \
+    libglib2.0-0 libsm6 libxrender1 libxext6 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ✅ NumPy は 1.26.x に固定（2.0 は絶対インストールしない）
-RUN pip install --no-cache-dir "numpy<2.0,>=1.26.4"
+# 作業ディレクトリ
+WORKDIR /app
 
-# ✅ imgaug は古い 0.4.0 に固定（np.sctypes 対応）
-RUN pip install --no-cache-dir "imgaug==0.4.0"
+# まず NumPy 1.26.4 をインストール（imgaug が NumPy 2.0 に未対応のため）
+RUN pip install --no-cache-dir numpy==1.26.4
 
-# ✅ OpenCV は numpy1.x 互換バージョン
-RUN pip install --no-cache-dir \
-    opencv-python==4.6.0.66 \
-    opencv-contrib-python==4.6.0.66
-
-# ✅ PaddleOCR & PaddlePaddle の安定バージョン
+# その後 PaddleOCR 関連ライブラリをインストール
 RUN pip install --no-cache-dir \
     paddlepaddle==2.5.2 \
-    paddleocr==2.7.0.3
+    paddleocr==2.7.0.3 \
+    opencv-python==4.6.0.66 \
+    opencv-contrib-python==4.6.0.66 \
+    imgaug==0.4.0
 
-# ✅ Flask & Discord BOT
-RUN pip install --no-cache-dir flask discord.py
+# さらに他の必要ライブラリもまとめてインストール
+RUN pip install --no-cache-dir \
+    flask discord.py requests
 
-WORKDIR /app
+# アプリケーションファイルをコピー
 COPY bot.py /app/
 
-EXPOSE 8080
-CMD ["python", "bot.py"]
+# コンテナ起動時に Flask（または必要なスクリプト）を実行
+CMD ["python3", "bot.py"]
