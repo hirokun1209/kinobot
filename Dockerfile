@@ -1,44 +1,41 @@
 FROM python:3.10-slim
 
-# 環境変数設定（ロケールなど）
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PYTHONUNBUFFERED=1
 
-# ---- 依存パッケージをインストール ----
+# ---- 必要ライブラリ（PyMuPDF / PaddleOCR / OCR依存） ----
 RUN apt-get update && apt-get install -y \
-    # Cビルドに必要な基本ツール
     build-essential \
     cmake \
     pkg-config \
-    # paddleocr / PyMuPDF に必要なライブラリ
+    swig \
+    git \
+    wget \
+    curl \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxrender1 \
     libxext6 \
-    # PyMuPDF のビルドに必要
-    swig \
-    # 追加ツール
-    git wget curl \
+    libjpeg-dev \
+    zlib1g-dev \
+    libopenjp2-7-dev \
+    libtiff-dev \
+    libfreetype6-dev \
+    libharfbuzz-dev \
+    libjbig2dec0-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- pip 最新化 ----
+# ---- pip最新化 ----
 RUN pip install --upgrade pip setuptools wheel
 
-# ---- PaddlePaddle (CPU版) ----
-RUN pip install --no-cache-dir paddlepaddle==2.5.2
-
-# ---- PaddleOCR ----
-RUN pip install --no-cache-dir paddleocr==2.7.0.3
-
-# (オプション) 日本語OCRのため追加モデルもダウンロードしたいなら
-# RUN paddleocr --lang jp
+# ---- 依存パッケージ（まとめてrequirements.txtから） ----
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # ---- 作業ディレクトリ ----
 WORKDIR /app
+COPY bot.py /app/bot.py
 
-# (必要ならソースコードをコピー)
-# COPY . .
-
-CMD ["python3"]
+CMD ["python3", "bot.py"]
