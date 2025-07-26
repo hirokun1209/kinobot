@@ -1,4 +1,6 @@
-discord.py
-pillow==9.5.0
-easyocr==1.7.0
 flask
+discord.py==2.3.2
+paddleocr==2.7.0.3
+paddlepaddle==2.5.2
+opencv-python-headless
+pillow
