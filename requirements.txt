@@ -1,6 +1,7 @@
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
+torchaudio==2.5.1+cpu
+easyocr==1.7.0
 discord.py
 pillow
-easyocr==1.7.0
-torch==2.5.1   # ← 軽量版CPU対応
-torchvision==0.20.1
-torchaudio==2.5.1
+opencv-python-headless
