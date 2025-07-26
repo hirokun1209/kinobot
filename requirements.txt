@@ -1,0 +1,6 @@
+discord.py
+pillow
+easyocr
+torch
+torchvision
+torchaudio
