@@ -2,12 +2,11 @@ import os
 import threading
 from flask import Flask
 import discord
+from PIL import Image
 from paddleocr import PaddleOCR
-from PIL import Image, ImageDraw, ImageFont
-import io
 import re
 
-# === Flask Health Check HTTPサーバー ===
+# === Flaskヘルスチェック ===
 app = Flask(__name__)
 
 @app.route('/')
@@ -19,90 +18,124 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 
-# === Discord BOT ===
+# === Discord BOT 設定 ===
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# === PaddleOCR 初期化（安定版 2.7対応） ===
+# === PaddleOCR 初期化（CPU版） ===
 print("⏳ PaddleOCR 初期化中…")
-ocr = PaddleOCR(use_angle_cls=False, lang='en')  # ✅ show_log削除＆旧バージョン互換OK
+ocr = PaddleOCR(use_angle_cls=False, lang='en')
 
-# === 時間補正ロジック ===
-def correct_time_str(digits: str) -> str:
-    """OCR誤認識補正: 6桁以内の数字をhh:mm:ssに近い形に補正"""
-    digits = re.sub(r'\D', '', digits)  # 数字以外除去
-    if len(digits) <= 4:  # 4桁なら mm:ss
-        mm = int(digits[:2])
-        ss = int(digits[2:4]) if len(digits) >= 4 else 0
-        return f"{mm:02}:{ss:02}"
-    elif len(digits) == 5:  # 5桁なら mmm:ss だと仮定
-        mm = int(digits[:3]) % 60
-        ss = int(digits[3:5])
-        return f"{mm:02}:{ss:02}"
-    elif len(digits) >= 6:  # 6桁以上なら hh:mm:ss
-        hh = int(digits[:2]) % 6  # 6時間超えない補正
-        mm = int(digits[2:4]) % 60
-        ss = int(digits[4:6]) % 60
-        return f"{hh:02}:{mm:02}:{ss:02}"
-    return "??:??"
+# === OCRの座標設定 ===
+base_y = 1095
+row_height = 310
+crop_height = 140
+num_box_x  = (270, 400)
+time_box_x = (400, 630)
 
-# === PaddleOCRでOCRする関数 ===
+# === OCR実行 ===
 def ocr_paddle(image_path):
     result = ocr.ocr(image_path, cls=False)
-    texts = []
-    if result and isinstance(result[0], list):
-        for line in result[0]:
-            txt = line[1][0]
-            texts.append(txt)
-    return " ".join(texts)
+    if not result or not result[0]:
+        return ""
+    # テキストだけ抽出
+    return " ".join([line[1][0] for line in result[0]])
 
-# === OCR結果を画像にオーバーレイ表示する ===
-def draw_ocr_overlay(image_path, ocr_texts):
-    img = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
+# === 数字抽出（番号用） ===
+def extract_number(text):
+    m = re.search(r"\d+", text)
+    return m.group(0) if m else "?"
 
-    y_offset = 10
-    for line in ocr_texts:
-        draw.text((10, y_offset), line, fill=(255, 0, 0), font=font)
-        y_offset += 20
+# === 時刻補正ロジック ===
+def correct_time_str(digits):
+    # 数字だけ取り出す
+    d = re.sub(r"\D", "", digits)
+    if len(d) < 4:
+        return "開戦済"
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    # 2桁ずつ区切る
+    parts = [d[i:i+2] for i in range(0, len(d), 2)]
+    # 時分秒の候補（3つあれば使う）
+    hh = int(parts[0])
+    mm = int(parts[1]) if len(parts) > 1 else 0
+    ss = int(parts[2]) if len(parts) > 2 else 0
 
-# === Discordメッセージ処理 ===
+    # 制限：06:00:00以上は存在しないので補正
+    if hh >= 6:
+        # 4桁なら mm:ss とみなす
+        if len(d) == 4:
+            mm, ss = int(d[:2]), int(d[2:])
+            return f"{mm:02}:{ss:02}"
+        # 6桁以上の場合は末尾3つを採用
+        d = d[-6:]
+        hh = int(d[:2])
+        mm = int(d[2:4])
+        ss = int(d[4:6])
+
+    # 秒が60超えなら補正
+    if ss > 59: ss = 59
+    if mm > 59: mm = 59
+
+    return f"{hh:02}:{mm:02}:{ss:02}"
+
+def extract_time(text):
+    digits = re.sub(r"\D", "", text)
+    return correct_time_str(digits)
+
+# === 画像を3行クロップしてOCR ===
+def crop_and_ocr_paddle(img_path):
+    img = Image.open(img_path)
+    lines = []
+    for i in range(3):
+        y1 = base_y + i * row_height
+        if i == 0: y1 -= 5
+        if i == 1: y1 -= 100
+        if i == 2: y1 -= 200
+        y2 = y1 + crop_height
+
+        # 番号
+        num_crop = f"/tmp/num_{i+1}.png"
+        img.crop((num_box_x[0], y1, num_box_x[1], y2)).save(num_crop)
+        raw_num = ocr_paddle(num_crop)
+
+        # 時刻
+        time_crop = f"/tmp/time_{i+1}.png"
+        img.crop((time_box_x[0], y1, time_box_x[1], y2)).save(time_crop)
+        raw_time = ocr_paddle(time_crop)
+
+        number = extract_number(raw_num)
+        time_val = extract_time(raw_time)
+
+        lines.append({
+            "raw_num": raw_num,
+            "number": number,
+            "raw_time": raw_time,
+            "time_val": time_val
+        })
+    return lines
+
+# === Discord イベント ===
 @client.event
 async def on_ready():
-    print(f"✅ PaddleOCR Discord BOT起動: {client.user}")
+    print(f"✅ PaddleOCR Discord BOT 起動: {client.user}")
 
 @client.event
 async def on_message(message):
     if message.author.bot:
         return
     if message.attachments:
-        await message.channel.send("✅ PaddleOCRで解析中…")
+        await message.channel.send("✅ PaddleOCR(CPU)で番号＆時間を解析中…")
         for attachment in message.attachments:
             file_path = f"/tmp/{attachment.filename}"
             await attachment.save(file_path)
-
-            raw_text = ocr_paddle(file_path)
-            print("OCR RAW:", raw_text)
-
-            # 数字だけ抽出
-            digits_only = re.findall(r'\d+', raw_text)
-            times = [correct_time_str(d) for d in digits_only]
-
-            reply = "📖 OCR結果\n"
-            for d, t in zip(digits_only, times):
-                reply += f"  数字: `{d}` → 時間補正: **{t}**\n"
-
-            # 画像にOCR結果を描画
-            overlay_img = draw_ocr_overlay(file_path, digits_only)
-            await message.channel.send(reply, file=discord.File(overlay_img, "ocr_result.png"))
+            lines = crop_and_ocr_paddle(file_path)
+            result_msg = ""
+            for idx, line in enumerate(lines, start=1):
+                result_msg += f"行{idx} → 番号OCR: \"{line['raw_num']}\" → 抽出: {line['number']}\n"
+                result_msg += f"　　　 → 時間OCR: \"{line['raw_time']}\" → 抽出: {line['time_val']}\n\n"
+            await message.channel.send(result_msg)
 
 client.run(TOKEN)
