@@ -1,15 +1,14 @@
 import os
 import threading
-import time
-import re
 from flask import Flask
 import discord
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 import easyocr
+import re
+import numpy as np
+import cv2
 
-# =========================
-# Flask Health Check HTTPサーバー
-# =========================
+# === Flask Health Check HTTPサーバー ===
 app = Flask(__name__)
 
 @app.route('/')
@@ -20,19 +19,26 @@ def run_health_server():
     print("✅ Flaskヘルスチェックサーバー起動")
     app.run(host="0.0.0.0", port=8080)
 
-# =========================
-# Discord BOT設定
-# =========================
+threading.Thread(target=run_health_server, daemon=True).start()
+
+# === Discord BOT ===
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# =========================
-# EasyOCR 初期化 (メモリ節約のため1回だけ作る)
-# =========================
 reader = None
+
+base_y = 1095
+row_height = 310
+crop_height = 140
+num_box_x  = (270, 400)
+time_box_x = (400, 630)
+
+# =======================
+# OCR Reader初期化
+# =======================
 def get_reader():
     global reader
     if reader is None:
@@ -40,92 +46,106 @@ def get_reader():
         reader = easyocr.Reader(['en'], gpu=False)
     return reader
 
-# =========================
+# =======================
 # OCR前の画像前処理
-# =========================
-def preprocess_image(img_path):
-    img = Image.open(img_path).convert("L")  # グレースケール
-    img = img.filter(ImageFilter.SHARPEN)
+# =======================
+def preprocess_image(image_path):
+    img = Image.open(image_path).convert("L")  # グレースケール
+    img = img.filter(ImageFilter.SHARPEN)  # シャープ化
     enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.0)  # コントラスト強調
+    img = enhancer.enhance(2.0)  # コントラストアップ
     tmp_path = "/tmp/preprocessed.png"
     img.save(tmp_path)
     return tmp_path
 
-# =========================
-# OCR実行
-# =========================
+# =======================
+# OCR本体（フォーマット安全化）
+# =======================
 def ocr_easyocr(image_path):
     r = get_reader()
     img_path = preprocess_image(image_path)
-    result = r.readtext(img_path, detail=1)  # [(text, confidence, bbox), ...]
-    # 信頼度フィルタリング
-    filtered = [text for (text, conf, bbox) in result if conf >= 0.3]
-    joined = " ".join(filtered)
+    result = r.readtext(img_path, detail=1)
+
+    filtered_texts = []
+
+    for item in result:
+        # EasyOCRは環境によって戻り値が異なるので安全に判定する
+        if isinstance(item, (tuple, list)) and len(item) == 3:
+            # パターン1: (bbox, text, conf)
+            if isinstance(item[1], str) and isinstance(item[2], (float, int)):
+                text, conf = item[1], float(item[2])
+            # パターン2: (text, conf, bbox)
+            elif isinstance(item[0], str) and isinstance(item[1], (float, int)):
+                text, conf = item[0], float(item[1])
+            else:
+                continue
+            if conf >= 0.3:
+                filtered_texts.append(text)
+        elif isinstance(item, str):
+            # detail=0の場合は文字列だけ
+            filtered_texts.append(item)
+
+    joined = " ".join(filtered_texts)
     print(f"🔍 OCR結果: {joined}")
     return joined
 
-# =========================
-# 数字抽出 (番号用)
-# =========================
+# =======================
+# 数字抽出
+# =======================
 def extract_number(text):
-    m = re.search(r"\d{3,6}", text)  # 3～6桁の数字
+    m = re.search(r"\d{2,6}", text)
     return m.group(0) if m else "?"
 
-# =========================
+# =======================
 # 時間補正ロジック
-# =========================
-def extract_time(raw_text):
-    # 数字だけにする
-    digits = re.sub(r"[^0-9]", "", raw_text)
+# =======================
+def correct_time_str(raw_digits):
+    """
+    OCR誤認識の数列を「hh:mm:ss」形式に補正する
+    - 6時間以上は存在しないので最大 05:59:59 まで
+    """
+    # 数字だけ残す
+    digits = re.sub(r"\D", "", raw_digits)
     if len(digits) < 4:
         return "開戦済"
 
-    # 長すぎる場合は末尾から6桁 or 8桁を取る
-    if len(digits) > 8:
-        digits = digits[-8:]
-
-    # 4桁なら mm:ss
-    if len(digits) == 4:
-        mm = digits[:2]
-        ss = digits[2:]
-        return f"00:{mm}:{ss}"
-
-    # 6桁なら hh:mm:ss
-    if len(digits) == 6:
-        hh = digits[:2]
-        mm = digits[2:4]
-        ss = digits[4:]
-    else:
-        # 8桁なら先頭2桁は無視して後ろ6桁だけ使う
+    # 6桁に切る
+    if len(digits) > 6:
+        # 後ろ6桁を優先（誤認識ノイズ前提）
         digits = digits[-6:]
-        hh = digits[:2]
-        mm = digits[2:4]
-        ss = digits[4:]
 
-    # 数値補正ルール
-    h, m, s = int(hh), int(mm), int(ss)
+    # 分割
+    hh = int(digits[0:2])
+    mm = int(digits[2:4])
+    ss = int(digits[4:6])
 
-    # 06:00:00 以上は存在しないので補正
-    if h > 6:
-        h = h % 6
+    # 補正（6時間以上は無いので繰り下げ）
+    if hh >= 6:
+        # 6時間以上なら後ろ4桁を mm:ss とみなして、頭は 00
+        hh = 0
+        mm = int(digits[0:2])
+        ss = int(digits[2:4])
 
-    if m > 59:
-        m = m % 60
-    if s > 59:
-        s = s % 60
+    # 分秒補正
+    if mm >= 60:
+        mm = mm % 60
+    if ss >= 60:
+        ss = ss % 60
 
-    return f"{h:02}:{m:02}:{s:02}"
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
-# =========================
-# 画像から番号と時間を抽出するメイン処理
-# =========================
-base_y = 1095
-row_height = 310
-crop_height = 140
-num_box_x  = (270, 400)
-time_box_x = (400, 630)
+# =======================
+# OCR → 時間抽出
+# =======================
+def extract_time(text):
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return "開戦済"
+    return correct_time_str(digits)
 
+# =======================
+# 画像クロップしてOCR
+# =======================
 def crop_and_ocr_easyocr(img_path):
     img = Image.open(img_path)
     lines = []
@@ -140,12 +160,13 @@ def crop_and_ocr_easyocr(img_path):
         num_crop = f"/tmp/num_{i+1}.png"
         img.crop((num_box_x[0], y1, num_box_x[1], y2)).save(num_crop)
         raw_num = ocr_easyocr(num_crop)
-        number = extract_number(raw_num)
 
         # 時間領域
         time_crop = f"/tmp/time_{i+1}.png"
         img.crop((time_box_x[0], y1, time_box_x[1], y2)).save(time_crop)
         raw_time = ocr_easyocr(time_crop)
+
+        number = extract_number(raw_num)
         time_val = extract_time(raw_time)
 
         lines.append({
@@ -156,49 +177,39 @@ def crop_and_ocr_easyocr(img_path):
         })
     return lines
 
-# =========================
-# Discord BOT イベント
-# =========================
+# =======================
+# Discord BOTイベント
+# =======================
 @client.event
 async def on_ready():
-    print(f"✅ EasyOCR Discord BOT起動完了: {client.user}")
+    print(f"✅ EasyOCR Discord BOT起動: {client.user}")
 
 @client.event
 async def on_message(message):
     if message.author.bot:
         return
-
     if message.attachments:
-        await message.channel.send("✅ 画像解析中… (CPUモード)")
-
+        await message.channel.send("✅ EasyOCR(CPUモード)で番号＆免戦時間を解析中…")
         for attachment in message.attachments:
             file_path = f"/tmp/{attachment.filename}"
             await attachment.save(file_path)
-
             lines = crop_and_ocr_easyocr(file_path)
             result_msg = ""
-
             for idx, line in enumerate(lines, start=1):
                 result_msg += f"行{idx} → 番号OCR: \"{line['raw_num']}\" → 抽出: {line['number']}\n"
                 result_msg += f"　　　 → 時間OCR: \"{line['raw_time']}\" → 抽出: {line['time_val']}\n\n"
-
             await message.channel.send(result_msg)
 
-# =========================
-# 起動処理 (Koyebで落ちないように)
-# =========================
-def run_discord_bot():
-    if not TOKEN:
-        print("❌ DISCORD_TOKENが設定されていません！環境変数を確認してください。")
-        while True:
-            time.sleep(60)  # トークンが無い場合も終了しないように待機
-    else:
-        print("🔄 Discord BOT接続開始…")
+# =======================
+# 終了しないようループ待機
+# =======================
+def keep_alive_loop():
+    try:
         client.run(TOKEN)
+    except Exception as e:
+        print(f"❌ BOT実行エラー: {e}")
+        # 再起動ループ
+        keep_alive_loop()
 
-if __name__ == "__main__":
-    # Flaskヘルスチェックサーバー起動
-    threading.Thread(target=run_health_server, daemon=True).start()
-
-    # Discord BOT起動
-    run_discord_bot()
+# BOT開始
+keep_alive_loop()
