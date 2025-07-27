@@ -1,50 +1,59 @@
-import discord
-import asyncio
 import os
+import discord
 from paddleocr import PaddleOCR
-from io import BytesIO
 
-TOKEN = os.environ.get("DISCORD_TOKEN")  # 環境変数から取得
+# === Discord トークン（Koyeb の環境変数で設定する） ===
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-if not TOKEN:
-    print("❌ ERROR: DISCORD_TOKEN が設定されていません")
-    exit(1)
-
+# === OCR 初期化（日本語対応） ===
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
+# === Discord クライアント設定 ===
 intents = discord.Intents.default()
-intents.message_content = True
+intents.messages = True
+intents.message_content = True  # メッセージ本文取得
 client = discord.Client(intents=intents)
 
-async def run_ocr(image_bytes: bytes):
-    image_stream = BytesIO(image_bytes)
-    result = ocr.ocr(image_stream, cls=True)
-    texts = []
-    for line in result[0]:
-        detected_text = line[1][0]
-        texts.append(detected_text)
-    return texts
-
+# === 起動時のログ ===
 @client.event
 async def on_ready():
     print(f"✅ ログイン完了: {client.user}")
 
+# === メッセージ受信時の処理 ===
 @client.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
+async def on_message(message):
+    # BOT自身のメッセージは無視
+    if message.author == client.user:
         return
+
+    # 添付ファイルがあるか確認
     if message.attachments:
         for attachment in message.attachments:
-            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                await message.channel.send("📸 画像を解析中です…")
-                img_bytes = await attachment.read()
-                texts = await asyncio.to_thread(run_ocr, img_bytes)
+            # 対応する画像形式のみ処理
+            if any(attachment.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg"]):
+                img_path = f"/tmp/{attachment.filename}"
+
+                # 画像を一時保存
+                await attachment.save(img_path)
+                print(f"📥 画像保存: {img_path}")
+
+                # OCRで文字認識
+                result = ocr.ocr(img_path, cls=True)
+
+                # 文字列だけ抽出
+                texts = [word_info[1][0] for line in result for word_info in line]
+
+                # 結果をDiscordに送信
                 if texts:
                     reply = "✅ 読み取れた文字:\n```\n" + "\n".join(texts) + "\n```"
                 else:
-                    reply = "⚠️ 文字が読み取れませんでした"
+                    reply = "⚠️ 文字が認識できませんでした"
+
                 await message.channel.send(reply)
 
+# === BOT起動 ===
 if __name__ == "__main__":
-    print("🚀 BOTを起動します...")
-    client.run(TOKEN)
+    if TOKEN is None:
+        print("❌ DISCORD_TOKEN が設定されていません！")
+    else:
+        client.run(TOKEN)
