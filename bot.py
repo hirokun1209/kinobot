@@ -29,9 +29,9 @@ def add_time(base_time_str: str, duration_str: str) -> str:
         return None
 
     parts = duration_str.strip().split(":")
-    if len(parts) == 3:
+    if len(parts) == 3:  # HH:MM:SS
         h, m, s = map(int, parts)
-    elif len(parts) == 2:
+    elif len(parts) == 2:  # MM:SS → 0時間扱い
         h = 0
         m, s = map(int, parts)
     else:
@@ -55,26 +55,35 @@ def extract_text_from_image(img: np.ndarray):
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
 
+def extract_server_number(center_texts):
+    """OCR結果からサーバー番号(s1234形式)を抽出"""
+    for t in center_texts:
+        # 例: [s1245], s1245, S1245 などに対応
+        match = re.search(r"[sS]\d{3,4}", t)
+        if match:
+            return match.group(0).lower().replace("s", "")  # 数字だけ返す
+    return None
+
 def parse_multiple_places(center_texts, top_time_texts):
     """
     中央エリアのOCR結果から複数の駐騎場番号と免戦時間を取得し、
     右上の基準時間を足して結果リストを返す
-    戻り値: [(datetime, "警備 1281-2-18:30:00"), ...], ["開戦済…"]
+    戻り値: [(datetime, "警備 1281-2-18:30:00"), ...], ["奪取 1245-7-開戦済", ...]
     """
     results = []
     no_time_places = []
 
-    # ✅ 右上の時間を取得
+    # ✅ 右上の基準時間を取得
     top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
     if not top_time:
         return [], ["⚠️ 右上の時間が取得できませんでした"]
 
-    # ✅ サーバー番号
-    server_raw = next((t for t in center_texts if re.match(r"^[sS]\d{4}$", t)), None)
-    if not server_raw:
+    # ✅ サーバー番号を柔軟に取得
+    server_num = extract_server_number(center_texts)
+    if not server_num:
         return [], ["⚠️ サーバー番号が取得できませんでした"]
 
-    server_num = server_raw.lower().replace("s", "")
+    # ✅ モード判定（1281だけ警備、それ以外は奪取）
     mode = "警備" if server_num == "1281" else "奪取"
 
     current_place = None
@@ -109,11 +118,11 @@ async def on_message(message):
         return
 
     if message.attachments:
-        # 🔄 解析中のメッセージを一旦送る
+        # 🔄 解析中メッセージ
         processing_msg = await message.channel.send("🔄 画像解析中…")
 
         all_results = []  # 時間付き結果
-        all_no_time = []  # 開戦済 or エラー
+        all_no_time = []  # 開戦済み or エラー
 
         for attachment in message.attachments:
             img_bytes = await attachment.read()
@@ -143,6 +152,7 @@ async def on_message(message):
         else:
             final_msg = "⚠️ 必要な情報が読み取れませんでした"
 
+        # 解析結果を更新
         await processing_msg.edit(content=final_msg)
 
 # ✅ Bot起動
