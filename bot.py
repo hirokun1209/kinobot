@@ -1,92 +1,101 @@
-import os
 import discord
-from discord.ext import commands
-from paddleocr import PaddleOCR
+import os
+import re
+from io import BytesIO
 from PIL import Image
+from paddleocr import PaddleOCR
+from datetime import timedelta
 
-# === Discord Bot Token ===
-TOKEN = os.getenv("DISCORD_TOKEN")  # Koyebでは環境変数に設定
+# 環境変数からトークン取得（Koyebでもそのまま動く）
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-# === PaddleOCRの初期化（日本語対応） ===
+# Discordクライアント設定
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+client = discord.Client(intents=intents)
+
+# PaddleOCR 初期化（日本語対応）
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
-# === Discord Intents設定 ===
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+@client.event
+async def on_ready():
+    print(f'✅ ログイン成功: {client.user}')
 
-# === 中央30%だけ残すトリミング関数 ===
-def crop_image_center(image_path):
-    img = Image.open(image_path)
-    w, h = img.size
-
-    # 上35%をカット、下35%をカット → 残るのは中央30%
-    top = int(h * 0.35)
-    bottom = int(h * 0.65)
-
-    cropped = img.crop((0, top, w, bottom))
-
-    cropped_path = "/tmp/cropped_image.jpg"
-    cropped.save(cropped_path)
-    return cropped_path
-
-# === OCR結果から必要な情報を抽出 ===
-def extract_info(texts):
-    server_name = None
-    results = []
-
-    for text in texts:
-        # サーバー名抽出 [sXXXX]
-        if "[s" in text or "[S" in text:
-            server_name = text.strip()
-
-        # 免戦中 + 時間
-        if "免戦中" in text:
-            results.append(text.strip())
-
-        # 越域駐騎場 + 番号
-        if "越域駐騎場" in text:
-            results.append(text.strip())
-
-    return server_name, results
-
-# === 画像メッセージイベント ===
-@bot.event
+@client.event
 async def on_message(message):
+    # BOT自身のメッセージは無視
     if message.author.bot:
         return
 
-    # 添付画像があるか確認
+    # 画像が添付されているメッセージだけ処理
     if message.attachments:
         for attachment in message.attachments:
-            # 一時ファイルに保存
-            img_path = "/tmp/input_image.jpg"
-            await attachment.save(img_path)
+            # jpg/png/jpegのみ対応
+            if any(attachment.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg']):
+                # 画像を読み込み
+                img_bytes = await attachment.read()
+                image = Image.open(BytesIO(img_bytes))
 
-            # 1️⃣ 中央30%だけトリミング
-            cropped_path = crop_image_center(img_path)
+                # ======== 中央30%だけ残すトリミング ========
+                w, h = image.size
+                top = int(h * 0.35)
+                bottom = int(h * 0.65)
+                cropped = image.crop((0, top, w, bottom))
 
-            # 2️⃣ OCR実行
-            ocr_result = ocr.ocr(cropped_path, cls=True)
-            texts = [line[1][0] for block in ocr_result for line in block]
+                # トリミング後の画像をバッファに保存
+                buf = BytesIO()
+                cropped.save(buf, format="JPEG")
+                buf.seek(0)
 
-            # 3️⃣ 必要情報を抽出
-            server_name, extracted = extract_info(texts)
+                # ======== OCR実行 ========
+                result = ocr.ocr(cropped, cls=True)
+                extracted_text = [line[1][0] for res in result for line in res]
 
-            # 4️⃣ 返信用テキスト作成
-            reply_text = "✅ **OCR結果**\n"
-            if server_name:
-                reply_text += f"📡 サーバー: `{server_name}`\n"
-            if extracted:
-                reply_text += "\n".join(f"- {t}" for t in extracted)
-            else:
-                reply_text += "⚠️ 必要な情報が見つかりませんでした。"
+                # テキストまとめ
+                all_text = " ".join(extracted_text)
 
-            # 5️⃣ Discordへ返信（トリミング画像も送る）
-            await message.channel.send(reply_text, file=discord.File(cropped_path))
+                # ======== サーバー番号を抽出 (例: [S1245]) ========
+                server_match = re.search(r'\[?S\d+\]?', all_text)
+                server_num = server_match.group(0).replace("[","").replace("]","") if server_match else "UNKNOWN"
 
-    # 他のコマンドも処理できるように
-    await bot.process_commands(message)
+                # ======== 越域駐騎場の番号だけ抽出 ========
+                spot_nums = re.findall(r'越域駐騎場(\d+)', all_text)
 
-# === Bot起動 ===
-bot.run(TOKEN)
+                # ======== 免戦中の時間 (MM:SS 形式) ========
+                times = re.findall(r'免戦中(\d{1,2}:\d{2})', all_text)
+
+                # ======== Discordメッセージの送信時間 (JSTに変換) ========
+                base_time = message.created_at + timedelta(hours=9)
+
+                combined = []
+                for i in range(min(len(spot_nums), len(times))):
+                    raw_time = times[i]
+
+                    # 免戦時間を timedelta に変換
+                    parts = raw_time.split(":")
+                    if len(parts) == 2:
+                        mins = int(parts[0])
+                        secs = int(parts[1])
+                        delta = timedelta(minutes=mins, seconds=secs)
+                    else:
+                        delta = timedelta(seconds=0)
+
+                    # 終了時刻を計算 (JST)
+                    end_time = (base_time + delta).strftime("%H:%M:%S")
+
+                    # 例: S1245-7-42:20 → 終了 18:12:20
+                    combined.append(f"{server_num}-{spot_nums[i]}-{raw_time} → 終了 {end_time}")
+
+                # ======== 結果メッセージ作成 ========
+                if combined:
+                    reply = f"✅ **OCR結果**\n📡 サーバー: `{server_num}`\n" + "\n".join(f"- {c}" for c in combined)
+                else:
+                    reply = "❌ 必要な情報が見つかりませんでした…"
+
+                # トリミング画像と一緒に返信
+                file = discord.File(buf, filename="cropped.jpg")
+                await message.channel.send(reply, file=file)
+
+# ======== BOT起動 ========
+client.run(TOKEN)
