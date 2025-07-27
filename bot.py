@@ -43,7 +43,7 @@ def add_time(base_time_str: str, duration_str: str) -> str:
 def crop_top_right(img: np.ndarray) -> np.ndarray:
     """右上20%の領域をトリミング"""
     h, w, _ = img.shape
-    return img[0:int(h * 0.2), int(w * 0.8):w]  # 上20% & 右20%
+    return img[0:int(h * 0.2), int(w * 0.7):w]  # 上20% & 右20%
 
 def crop_center_area(img: np.ndarray) -> np.ndarray:
     """上下35%をカットして中央エリアをトリミング"""
