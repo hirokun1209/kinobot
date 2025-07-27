@@ -1,63 +1,73 @@
-import os
 import discord
 from discord.ext import commands
 from paddleocr import PaddleOCR
 from datetime import datetime, timedelta
 import re
+import requests
+from io import BytesIO
+from PIL import Image
 
-TOKEN = os.getenv("DISCORD_TOKEN")  # Koyebの環境変数で設定
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+TOKEN = "YOUR_DISCORD_BOT_TOKEN"
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# OCR初期化（日本語＋英語対応）
-ocr = PaddleOCR(use_angle_cls=True, lang="japan")
+ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
-# 右上の時間フォーマット例: 12:34 とか 23:59
-time_pattern = re.compile(r"(\d{1,2}):(\d{2})")
+def extract_times(ocr_text):
+    current_time = None
+    shield_times = []
 
-def calc_future_time(base_time_str, add_minutes):
-    """右上時間にOCR抽出時間を加算"""
-    base = datetime.strptime(base_time_str, "%H:%M")
-    new_time = base + timedelta(minutes=add_minutes)
-    return new_time.strftime("%H:%M")
+    for text in ocr_text:
+        # 現在時刻 (hh:mm:ss)
+        if re.match(r"\d{2}:\d{2}:\d{2}", text):
+            current_time = text
+        
+        # 免戦時間 (mm:ss or hh:mm)
+        elif re.match(r"\d{1,2}:\d{2}", text):
+            shield_times.append(text)
+
+    return current_time, shield_times
+
+def calculate_end_times(current_time_str, shield_times):
+    now = datetime.strptime(current_time_str, "%H:%M:%S")
+    end_times = []
+    for t in shield_times:
+        parts = t.split(":")
+        if len(parts) == 2:
+            minutes, seconds = int(parts[0]), int(parts[1])
+            delta = timedelta(minutes=minutes, seconds=seconds)
+        elif len(parts) == 3:
+            hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
+            delta = timedelta(hours=hours, minutes=minutes, seconds=seconds)
+        else:
+            continue
+        end_times.append((t, (now + delta).strftime("%H:%M:%S")))
+    return end_times
 
 @bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+async def on_message(message):
+    if message.attachments:
+        for attachment in message.attachments:
+            if attachment.filename.lower().endswith(("png", "jpg", "jpeg")):
+                # 画像をダウンロード
+                img_data = await attachment.read()
+                img = Image.open(BytesIO(img_data))
 
-@bot.command()
-async def ocrtime(ctx):
-    """画像の文字をOCRして、右上時間＋OCR内の時間を計算"""
-    if not ctx.message.attachments:
-        return await ctx.send("画像を添付してください！")
+                # OCR実行
+                result = ocr.ocr(img, cls=True)
+                texts = [line[1][0] for line in result[0]]
 
-    attachment = ctx.message.attachments[0]
-    img_path = "/tmp/input.jpg"
-    await attachment.save(img_path)
+                # 時間抽出
+                current_time, shield_times = extract_times(texts)
 
-    # OCR実行
-    result = ocr.ocr(img_path, cls=True)
-    text_blocks = [line[1][0] for line in result[0]]
-    all_text = "\n".join(text_blocks)
-    await ctx.send(f"📖 OCR結果:\n```\n{all_text}\n```")
+                if current_time:
+                    end_times = calculate_end_times(current_time, shield_times)
+                    reply = f"現在時刻: {current_time}\n"
+                    for st, end in end_times:
+                        reply += f"免戦 {st} → 終了 {end}\n"
+                else:
+                    reply = "現在時刻が見つかりませんでした…"
 
-    # 右上時間を抽出
-    top_time_match = time_pattern.search(all_text)
-    if not top_time_match:
-        return await ctx.send("右上の時間が見つかりませんでした。")
+                await message.channel.send(reply)
 
-    base_time = f"{top_time_match.group(1).zfill(2)}:{top_time_match.group(2)}"
-    await ctx.send(f"🕒 右上時間: {base_time}")
-
-    # OCR結果から加算すべき時間（分数）を探す例: "免戦時間 30分"
-    add_minutes = 0
-    for line in text_blocks:
-        m = re.search(r"(\d{1,3})分", line)
-        if m:
-            add_minutes = int(m.group(1))
-            break
-
-    if add_minutes > 0:
-        new_time = calc_future_time(base_time, add_minutes)
-        await ctx.send(f"⏩ {add_minutes}分後の時間は **{new_time}** です！")
-    else:
-        await ctx.send("加算する時間が見つかりませんでした。")
+bot.run(TOKEN)
