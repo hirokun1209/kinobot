@@ -12,16 +12,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- 先に numpy はアンインストール ----
+# ---- numpy は一度削除 ----
 RUN pip uninstall -y numpy || true
 
 # ---- OpenCV (wheel 高速版) ----
 RUN pip install --no-cache-dir opencv-python-headless==4.7.0.72
 
-# ---- PaddleOCR と Discord Bot 依存 ----
-RUN pip install --no-cache-dir paddleocr==2.7.0.3 discord.py
+# ---- PaddleOCR 依存ライブラリ ----
+RUN pip install --no-cache-dir paddlepaddle==2.5.2 -i https://mirror.baidu.com/pypi/simple \
+    && pip install --no-cache-dir paddleocr==2.7.0.3
 
-# ---- numpy を最後に再インストール（ABI mismatch防止）----
+# ---- Discord Bot 依存 ----
+RUN pip install --no-cache-dir discord.py
+
+# ---- numpy を最後に固定（ABI mismatch防止）----
 RUN pip uninstall -y numpy || true && \
     pip install --no-cache-dir numpy==1.23.5
 
