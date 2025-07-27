@@ -12,14 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- numpy は一度削除 ----
+# ---- numpy は一度削除（ABI mismatch防止）----
 RUN pip uninstall -y numpy || true
 
 # ---- OpenCV (wheel 高速版) ----
 RUN pip install --no-cache-dir opencv-python-headless==4.7.0.72
 
-# ---- PaddleOCR 依存ライブラリ ----
-# ✅ PaddleOCR が対応している CPU 版 PaddlePaddle の安定版は 2.4.2
+# ---- PaddleOCR の依存ライブラリ ----
+# ✅ paddlepaddle の CPU版で安定する 2.4.2 を使う
 RUN pip install --no-cache-dir paddlepaddle==2.4.2 \
     && pip install --no-cache-dir paddleocr==2.7.0.3
 
