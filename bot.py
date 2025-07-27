@@ -1,73 +1,50 @@
 import discord
-from discord.ext import commands
+import asyncio
+import os
 from paddleocr import PaddleOCR
-from datetime import datetime, timedelta
-import re
-import requests
 from io import BytesIO
-from PIL import Image
 
-TOKEN = "YOUR_DISCORD_BOT_TOKEN"
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+TOKEN = os.environ.get("DISCORD_TOKEN")  # 環境変数から取得
+
+if not TOKEN:
+    print("❌ ERROR: DISCORD_TOKEN が設定されていません")
+    exit(1)
 
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
-def extract_times(ocr_text):
-    current_time = None
-    shield_times = []
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
 
-    for text in ocr_text:
-        # 現在時刻 (hh:mm:ss)
-        if re.match(r"\d{2}:\d{2}:\d{2}", text):
-            current_time = text
-        
-        # 免戦時間 (mm:ss or hh:mm)
-        elif re.match(r"\d{1,2}:\d{2}", text):
-            shield_times.append(text)
+async def run_ocr(image_bytes: bytes):
+    image_stream = BytesIO(image_bytes)
+    result = ocr.ocr(image_stream, cls=True)
+    texts = []
+    for line in result[0]:
+        detected_text = line[1][0]
+        texts.append(detected_text)
+    return texts
 
-    return current_time, shield_times
+@client.event
+async def on_ready():
+    print(f"✅ ログイン完了: {client.user}")
 
-def calculate_end_times(current_time_str, shield_times):
-    now = datetime.strptime(current_time_str, "%H:%M:%S")
-    end_times = []
-    for t in shield_times:
-        parts = t.split(":")
-        if len(parts) == 2:
-            minutes, seconds = int(parts[0]), int(parts[1])
-            delta = timedelta(minutes=minutes, seconds=seconds)
-        elif len(parts) == 3:
-            hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
-            delta = timedelta(hours=hours, minutes=minutes, seconds=seconds)
-        else:
-            continue
-        end_times.append((t, (now + delta).strftime("%H:%M:%S")))
-    return end_times
-
-@bot.event
-async def on_message(message):
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
     if message.attachments:
         for attachment in message.attachments:
-            if attachment.filename.lower().endswith(("png", "jpg", "jpeg")):
-                # 画像をダウンロード
-                img_data = await attachment.read()
-                img = Image.open(BytesIO(img_data))
-
-                # OCR実行
-                result = ocr.ocr(img, cls=True)
-                texts = [line[1][0] for line in result[0]]
-
-                # 時間抽出
-                current_time, shield_times = extract_times(texts)
-
-                if current_time:
-                    end_times = calculate_end_times(current_time, shield_times)
-                    reply = f"現在時刻: {current_time}\n"
-                    for st, end in end_times:
-                        reply += f"免戦 {st} → 終了 {end}\n"
+            if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                await message.channel.send("📸 画像を解析中です…")
+                img_bytes = await attachment.read()
+                texts = await asyncio.to_thread(run_ocr, img_bytes)
+                if texts:
+                    reply = "✅ 読み取れた文字:\n```\n" + "\n".join(texts) + "\n```"
                 else:
-                    reply = "現在時刻が見つかりませんでした…"
-
+                    reply = "⚠️ 文字が読み取れませんでした"
                 await message.channel.send(reply)
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    print("🚀 BOTを起動します...")
+    client.run(TOKEN)
