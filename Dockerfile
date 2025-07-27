@@ -1,19 +1,12 @@
-# ========================================
-# ベースイメージ
-# ========================================
 FROM python:3.10-slim
 
-# 環境変数
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DISCORD_TOKEN=""
 
-# 作業ディレクトリ
 WORKDIR /app
 
-# ========================================
-# 必要パッケージのインストール
-# ========================================
+# ---- 基本ライブラリのインストール ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
@@ -23,30 +16,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
-# ========================================
-# 先にnumpyを安全なバージョンでインストール
-# PaddleOCRのABI不整合を防ぐため
-# ========================================
-RUN pip install --no-cache-dir --force-reinstall "numpy==1.23.5"
+# ---- まず完全にnumpy削除 ----
+RUN pip uninstall -y numpy || true
 
-# ========================================
-# OpenCVもnumpyに合わせて再インストール
-# ========================================
-RUN pip install --no-cache-dir --force-reinstall opencv-python==4.7.0.72
+# ---- numpyを古い安定版に固定 (ABI互換確保) ----
+RUN pip install --no-cache-dir numpy==1.23.5
 
-# ========================================
-# 残りのライブラリ
-# ========================================
-RUN pip install --no-cache-dir \
-    paddleocr==2.7.0.3 \
-    discord.py==2.3.2
+# ---- numpyに合わせてopencvをインストール ----
+RUN pip install --no-cache-dir --no-binary opencv-python-headless==4.7.0.72
 
-# ========================================
-# BOTコードをコピー
-# ========================================
+# ---- PaddleOCRとその他ライブラリ ----
+RUN pip install --no-cache-dir paddleocr==2.7.0.3 discord.py==2.3.2
+
 COPY bot.py /app/bot.py
 
-# ========================================
-# エントリーポイント
-# ========================================
 CMD ["python", "bot.py"]
