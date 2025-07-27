@@ -146,7 +146,7 @@ async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: 
     if unlock_dt <= now:
         return
 
-    # デバッグモードの場合は時間帯制限を無視
+    # デバッグモードなら時間帯制限を無視
     if text.startswith("奪取") and (debug or not should_skip_notification(unlock_dt)):
         notify_time_2min = unlock_dt - timedelta(minutes=2)
         notify_time_15sec = unlock_dt - timedelta(seconds=15)
@@ -158,41 +158,6 @@ async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: 
         if notify_time_15sec > datetime.now():
             await asyncio.sleep((notify_time_15sec - datetime.now()).total_seconds())
             await notify_channel.send(f"⏰ {text} **15秒前です！！**")
-
-async def send_schedule_summary(channel: discord.TextChannel):
-    """pending_places から奪取・警備・開戦済を分類して通知"""
-    if not pending_places:
-        return
-
-    opened, takes, guards = [], [], []
-
-    for dt, txt, server in pending_places.values():
-        if dt == datetime.min:
-            opened.append(txt)
-        elif txt.startswith("奪取"):
-            takes.append((dt, txt))
-        else:
-            guards.append((dt, txt))
-
-    takes.sort(key=lambda x: x[0])
-    guards.sort(key=lambda x: x[0])
-
-    lines = []
-    if opened:
-        lines.append("⚠️ 開戦済")
-        lines.extend(opened)
-        lines.append("")
-    if takes or guards:
-        lines.append("⏳ スケジュール")
-        if takes:
-            lines.append("【奪取】")
-            lines.extend(txt for _, txt in takes)
-        if guards:
-            lines.append("【警備】")
-            lines.extend(txt for _, txt in guards)
-
-    final_msg = "📢奪取&警備スケジュールのお知らせ📢\n2分前 & 15秒前に通知します\n\n" + "\n".join(lines)
-    await channel.send(final_msg)
 
 # =======================
 #  イベント処理
@@ -243,16 +208,14 @@ async def on_message(message):
 
             # OCR結果の登録
             for dt, txt, server in parsed_results:
-                key = txt
-                if txt.startswith("奪取"):
-                    pending_places[key] = (dt, txt, server)
-                    if notify_channel:
+                if txt not in pending_places:  # 通知チャンネルでは重複除外
+                    pending_places[txt] = (dt, txt, server)
+                    if txt.startswith("奪取") and notify_channel:
                         asyncio.create_task(schedule_notification(dt, txt, notify_channel))
-                else:
-                    pending_places[key] = (dt, txt, server)
 
             for txt in no_time_places:
-                pending_places[txt] = (datetime.min, txt, "")
+                if txt not in pending_places:  # 開戦済も重複除外
+                    pending_places[txt] = (datetime.min, txt, "")
 
         # ==== メッセージ返信 ====
         opened = [txt for dt, txt, _ in pending_places.values() if dt == datetime.min]
@@ -264,25 +227,12 @@ async def on_message(message):
 
         msg_lines = []
         if opened:
-            msg_lines.append("⚠️ 開戦済")
             msg_lines.extend(opened)
-            msg_lines.append("")
-        if takes or guards:
-            msg_lines.append("⏳ スケジュール")
-            if takes:
-                msg_lines.append("【奪取】")
-                msg_lines.extend(txt for _, txt in takes)
-            if guards:
-                msg_lines.append("【警備】")
-                msg_lines.extend(txt for _, txt in guards)
+        msg_lines.extend(txt for _, txt in takes)
+        msg_lines.extend(txt for _, txt in guards)
 
         reply_msg = "\n".join(msg_lines) if msg_lines else "⚠️ 情報が見つかりませんでした"
         await processing_msg.edit(content=reply_msg)
-
-        # ==== 1〜12が揃ったら通知チャンネルにまとめ送信 ====
-        places_found = {txt.split("-")[1] for _, txt, _ in pending_places.values() if "-" in txt}
-        if len(places_found) >= 12 and notify_channel:
-            await send_schedule_summary(notify_channel)
 
 # =======================
 #  BOT起動
