@@ -10,7 +10,7 @@ RUN apt-get update && \
     libsm6 \
     libxrender1 \
     libxext6 \
-    libgomp1 \   # ← これが追加ポイント
+    libgomp1 \
     wget \
     git \
     && rm -rf /var/lib/apt/lists/*
