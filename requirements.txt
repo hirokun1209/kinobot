@@ -1,14 +1,5 @@
-# numpyはpaddleとcv2に必須なので先に固定
-numpy==1.26.4
-
-# PaddleOCR のバックエンド
-paddlepaddle==2.5.2
-
-# OCR本体
-paddleocr==2.7.0.3
-
-# 画像処理(OpenCVは4.6以下)
-opencv-python<=4.6.0.66
-
-# Discord BOT
-discord.py==2.3.2
+discord.py
+paddleocr
+opencv-python-headless
+pillow
+numpy
