@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # BOT本体コピー
-COPY discord_ocr_bot.py .
+COPY bot.py .
 
 # 環境変数（ここではデフォルト、Koyeb側で上書きする）
 ENV DISCORD_TOKEN=""
