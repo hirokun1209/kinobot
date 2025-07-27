@@ -18,9 +18,11 @@ RUN pip uninstall -y numpy || true
 # ---- OpenCV (wheel 高速版) ----
 RUN pip install --no-cache-dir opencv-python-headless==4.7.0.72
 
-# ---- PaddleOCR の依存ライブラリ ----
-# ✅ paddlepaddle の CPU版で安定する 2.4.2 を使う
-RUN pip install --no-cache-dir paddlepaddle==2.4.2 \
+# ---- PaddleOCR 依存ライブラリ ----
+# ✅ paddlepaddle は CPU wheel を中国公式から取得
+RUN pip install --no-cache-dir paddlepaddle==2.5.2 -i https://mirror.baidu.com/pypi/simple \
+    || pip install --no-cache-dir paddlepaddle==2.5.2 -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    || pip install --no-cache-dir paddlepaddle==2.5.2 -f https://www.paddlepaddle.org.cn/whl/cpu/mkl/avx/stable.html \
     && pip install --no-cache-dir paddleocr==2.7.0.3
 
 # ---- Discord Bot 依存 ----
