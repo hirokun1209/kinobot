@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# 必須ライブラリを追加（OpenCV, PaddleOCRに必要なもの全部）
+# OpenCV & PaddleOCRに必要なライブラリ
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -20,5 +20,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # BOTコードをコピー
 COPY bot.py .
 
-# 起動
+# 起動コマンド
 CMD ["python", "bot.py"]
