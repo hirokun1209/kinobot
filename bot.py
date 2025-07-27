@@ -2,6 +2,7 @@ import os
 import discord
 import io
 import cv2
+import re
 import numpy as np
 from paddleocr import PaddleOCR
 from datetime import datetime, timedelta
@@ -25,23 +26,22 @@ def add_time(base_time_str: str, duration_str: str) -> str:
     try:
         base_time = datetime.strptime(base_time_str, "%H:%M:%S")
     except ValueError:
-        return base_time_str  # 読み取り失敗時はそのまま返す
+        return None
 
     parts = duration_str.strip().split(":")
-    if len(parts) == 3:  # HH:MM:SS
+    if len(parts) == 3:
         h, m, s = map(int, parts)
-    elif len(parts) == 2:  # MM:SS → 0時間扱い
+    elif len(parts) == 2:
         h = 0
         m, s = map(int, parts)
     else:
-        return base_time_str  # 想定外 → 右上時間そのまま返す
+        return None
 
     delta = timedelta(hours=h, minutes=m, seconds=s)
-    new_time = (base_time + delta).time()
-    return new_time.strftime("%H:%M:%S")
+    return (base_time + delta).strftime("%H:%M:%S")
 
 def crop_top_right(img: np.ndarray) -> np.ndarray:
-    """右上20%の領域をトリミング"""
+    """右上30%の領域をトリミング"""
     h, w, _ = img.shape
     return img[0:int(h * 0.2), int(w * 0.7):w]  # 上20% & 右30%
 
@@ -55,47 +55,49 @@ def extract_text_from_image(img: np.ndarray):
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
 
-def parse_info(center_texts, top_time_texts):
-    """OCR結果から必要な情報を抽出 & 整形"""
-    # ✅ 右上の時間（必ず HH:MM:SS）
-    top_time = next((t for t in top_time_texts if ":" in t and len(t.split(":")) == 3), None)
+def parse_multiple_places(center_texts, top_time_texts):
+    """
+    中央エリアのOCR結果から複数の駐騎場番号と免戦時間を取得し、
+    右上の基準時間を足して結果リストを返す
+    戻り値: [(datetime, "警備 1281-2-18:30:00"), ...], ["開戦済…"]
+    """
+    results = []
+    no_time_places = []
 
-    # ✅ サーバー番号 / 駐騎場番号 / 免戦時間を抽出
-    server = None
-    place_num = None
-    duration = None
+    # ✅ 右上の時間を取得
+    top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
+    if not top_time:
+        return [], ["⚠️ 右上の時間が取得できませんでした"]
+
+    # ✅ サーバー番号
+    server_raw = next((t for t in center_texts if re.match(r"^[sS]\d{4}$", t)), None)
+    if not server_raw:
+        return [], ["⚠️ サーバー番号が取得できませんでした"]
+
+    server_num = server_raw.lower().replace("s", "")
+    mode = "警備" if server_num == "1281" else "奪取"
+
+    current_place = None
 
     for t in center_texts:
-        # サーバー番号 (例: s1281)
-        if t.startswith("s") and t[1:].isdigit():
-            server = t
-        # 駐騎場番号 (数字だけ)
-        elif t.isdigit():
-            place_num = t
-        # 免戦時間 (HH:MM:SS or MM:SS)
-        elif ":" in t:
-            duration = t
+        # 駐騎場番号を取得
+        place_match = re.search(r"越域駐騎場(\d+)", t)
+        if place_match:
+            current_place = place_match.group(1)
 
-    # ✅ 必要な情報が揃わない場合は None
-    if not (server and place_num and duration and top_time):
-        return None
+        # 免戦中の時間
+        duration_match = re.search(r"免戦中(\d{1,2}:\d{2}(?::\d{2})?)", t)
+        if duration_match and current_place:
+            duration = duration_match.group(1)
+            unlock_time = add_time(top_time, duration)
+            if unlock_time:
+                unlock_dt = datetime.strptime(unlock_time, "%H:%M:%S")
+                results.append((unlock_dt, f"{mode} {server_num}-{current_place}-{unlock_time}"))
+            else:
+                no_time_places.append(f"{mode} {server_num}-{current_place}-開戦済")
+            current_place = None  # リセット
 
-    # ✅ モード判定（s1281は警備、それ以外は奪取）
-    mode = "警備" if server == "s1281" else "奪取"
-
-    # ✅ 解除時刻計算
-    new_time = add_time(top_time, duration)
-
-    # ✅ 出力フォーマット → `警備 s1281-3-20:14:54`
-    return f"{mode} {server}-{place_num}-{new_time}"
-
-def np_to_discord_file(np_img, filename="image.png"):
-    """OpenCV画像(np.ndarray)をDiscord送信用のFileに変換"""
-    img_pil = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
-    buf = io.BytesIO()
-    img_pil.save(buf, format="PNG")
-    buf.seek(0)
-    return discord.File(buf, filename=filename)
+    return results, no_time_places
 
 @client.event
 async def on_ready():
@@ -103,53 +105,47 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # ✅ Bot自身のメッセージは無視
     if message.author.bot:
         return
 
-    # ✅ 画像が添付されたメッセージのみ処理
     if message.attachments:
+        # 🔄 解析中のメッセージを一旦送る
+        processing_msg = await message.channel.send("🔄 画像解析中…")
+
+        all_results = []  # 時間付き結果
+        all_no_time = []  # 開戦済 or エラー
+
         for attachment in message.attachments:
             img_bytes = await attachment.read()
 
-            # Pillowで画像を開き、OpenCV形式に変換
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-            # 右上 & 中央部分をトリミング
+            # トリミングしてOCR
             top_img = crop_top_right(img_np)
             center_img = crop_center_area(img_np)
 
-            # OCR結果
             top_texts = extract_text_from_image(top_img)
             center_texts = extract_text_from_image(center_img)
 
-            # ✅ OCR結果を文字列化（デバッグ用に見せる）
-            ocr_debug_msg = (
-                "**🔍 OCR結果プレビュー**\n"
-                f"📍 **右上エリア** → `{', '.join(top_texts) if top_texts else 'なし'}`\n"
-                f"📍 **中央エリア** → `{', '.join(center_texts) if center_texts else 'なし'}`\n"
-            )
+            # 複数免戦時間解析
+            parsed_results, no_time_places = parse_multiple_places(center_texts, top_texts)
+            all_results.extend(parsed_results)
+            all_no_time.extend(no_time_places)
 
-            # 必要情報をパース
-            info = parse_info(center_texts, top_texts)
+        # ✅ 時間でソート
+        all_results.sort(key=lambda x: x[0])
+        sorted_texts = [text for _, text in all_results]
 
-            # ✅ メッセージ生成
-            if info:
-                result_msg = f"✅ **抽出結果:** `{info}`\n\n{ocr_debug_msg}"
-            else:
-                result_msg = f"⚠️ 必要な情報が読み取れませんでした\n\n{ocr_debug_msg}"
+        # ✅ 最終結果メッセージ
+        if sorted_texts or all_no_time:
+            final_msg = "\n".join(sorted_texts + all_no_time)
+        else:
+            final_msg = "⚠️ 必要な情報が読み取れませんでした"
 
-            # ✅ トリミング画像もDiscordに添付
-            top_file = np_to_discord_file(top_img, filename="top_area.png")
-            center_file = np_to_discord_file(center_img, filename="center_area.png")
+        await processing_msg.edit(content=final_msg)
 
-            await message.channel.send(
-                result_msg,
-                files=[top_file, center_file]
-            )
-
-# ✅ Bot起動（エラー時はメッセージを表示）
+# ✅ Bot起動
 if __name__ == "__main__":
     try:
         client.run(TOKEN)
