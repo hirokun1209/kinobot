@@ -1,9 +1,8 @@
 FROM python:3.10-slim
 
-# 作業ディレクトリ
 WORKDIR /app
 
-# 必要なライブラリを全部インストール
+# 必要なライブラリ
 RUN apt-get update && \
     apt-get install -y \
     libglib2.0-0 \
@@ -16,12 +15,13 @@ RUN apt-get update && \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# 依存パッケージをインストール
+# numpy を最初に 1.26.4 に固定して入れる
+RUN pip install --no-cache-dir numpy==1.26.4
+
+# その後に requirements.txt の残りをインストール
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# BOT本体コピー
 COPY bot.py .
 
-# 起動コマンド
 CMD ["python", "bot.py"]
