@@ -5,19 +5,22 @@ from paddleocr import PaddleOCR
 from PIL import Image
 import io
 
-TOKEN = os.getenv("DISCORD_TOKEN")  # ← 環境変数から読み込む
-
+# Discordトークンを環境変数から読み込み
+TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = "!"
-ocr = PaddleOCR(lang='japan')
 
+# PaddleOCR初期化（GPU無効化で安定化）
+ocr = PaddleOCR(lang='japan', use_angle_cls=False, use_gpu=False)
+
+# Discord Bot 初期化
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 def crop_and_ocr(image_bytes):
+    """画像を3種類のトリミングでOCRして結果を返す"""
     img = Image.open(io.BytesIO(image_bytes))
     w, h = img.size
-    
     results = {}
 
     # 1. 上下35%削り
@@ -47,10 +50,15 @@ def crop_and_ocr(image_bytes):
     return results
 
 @bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+
+@bot.event
 async def on_message(message):
     if message.author.bot:
         return
-    
+
+    # 画像が送られたらOCR
     if message.attachments:
         await message.channel.send("📸 画像を受け取りました！OCR解析中…")
 
@@ -66,4 +74,5 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+# BOT起動
 bot.run(TOKEN)
