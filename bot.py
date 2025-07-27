@@ -130,22 +130,74 @@ def parse_multiple_places(center_texts, top_time_texts):
 def should_skip_notification(dt: datetime):
     return SKIP_NOTIFY_START <= dt.hour < SKIP_NOTIFY_END
 
+# =======================
+#  デバッグ付き通知スケジューラー
+# =======================
 async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: discord.TextChannel, debug=False):
     now = datetime.now()
+    log_msg = f"[DEBUG] schedule_notification開始: {text}, unlock_dt={unlock_dt.strftime('%H:%M:%S')}, now={now.strftime('%H:%M:%S')}"
+    print(log_msg)
+    if notify_channel:
+        await notify_channel.send(log_msg)
+
     if unlock_dt <= now:
+        skip_msg = "[DEBUG] 解除時刻が現在より過去なのでスキップ"
+        print(skip_msg)
+        if notify_channel:
+            await notify_channel.send(skip_msg)
         return
 
     if text.startswith("奪取") and (debug or not should_skip_notification(unlock_dt)):
         notify_time_2min = unlock_dt - timedelta(minutes=2)
         notify_time_15sec = unlock_dt - timedelta(seconds=15)
 
+        # 2分前通知
         if notify_time_2min > now:
-            await asyncio.sleep((notify_time_2min - now).total_seconds())
-            await notify_channel.send(f"⏰ {text} **2分前です！！**")
+            wait_sec = (notify_time_2min - now).total_seconds()
+            dbg = f"[DEBUG] 2分前通知まで {wait_sec:.1f}秒待機予定"
+            print(dbg)
+            if notify_channel:
+                await notify_channel.send(dbg)
 
-        if notify_time_15sec > datetime.now():
-            await asyncio.sleep((notify_time_15sec - datetime.now()).total_seconds())
+            await asyncio.sleep(wait_sec)
+
+            dbg_send = f"[DEBUG] 2分前通知送信: {text}"
+            print(dbg_send)
+            if notify_channel:
+                await notify_channel.send(dbg_send)
+            await notify_channel.send(f"⏰ {text} **2分前です！！**")
+        else:
+            msg = "[DEBUG] 2分前通知はすでに過ぎてる"
+            print(msg)
+            if notify_channel:
+                await notify_channel.send(msg)
+
+        # 15秒前通知
+        now2 = datetime.now()
+        if notify_time_15sec > now2:
+            wait_sec = (notify_time_15sec - now2).total_seconds()
+            dbg2 = f"[DEBUG] 15秒前通知まで {wait_sec:.1f}秒待機予定"
+            print(dbg2)
+            if notify_channel:
+                await notify_channel.send(dbg2)
+
+            await asyncio.sleep(wait_sec)
+
+            dbg_send2 = f"[DEBUG] 15秒前通知送信: {text}"
+            print(dbg_send2)
+            if notify_channel:
+                await notify_channel.send(dbg_send2)
             await notify_channel.send(f"⏰ {text} **15秒前です！！**")
+        else:
+            msg2 = "[DEBUG] 15秒前通知はすでに過ぎてる"
+            print(msg2)
+            if notify_channel:
+                await notify_channel.send(msg2)
+    else:
+        skip_cond = "[DEBUG] 通知スキップ条件に該当 (奪取以外 or 時間帯スキップ)"
+        print(skip_cond)
+        if notify_channel:
+            await notify_channel.send(skip_cond)
 
 # =======================
 #  イベント
@@ -174,13 +226,14 @@ async def on_message(message):
             # ✅ pending_places に登録
             pending_places[txt] = (dt, txt, server_num, datetime.now())
 
-            # ✅ デバッグ登録メッセージを送信チャンネルに送る
-            await message.channel.send(f"✅ デバッグ登録: {txt}")
+            # ✅ デバッグ登録メッセージ
+            dbg = f"[DEBUG] デバッグ登録: {txt} (now={datetime.now().strftime('%H:%M:%S')})"
+            print(dbg)
+            await message.channel.send(f"✅ {dbg}")
 
             # ✅ 通知チャンネルにも同じ内容を送る
             if notify_channel:
-                await notify_channel.send(f"✅ デバッグ登録: {txt}")
-                # デバッグは時間帯無視して通知予約
+                await notify_channel.send(f"✅ {dbg}")
                 asyncio.create_task(schedule_notification(dt, txt, notify_channel, debug=True))
             return
 
