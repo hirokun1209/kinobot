@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxrender1 \
     libxext6 \
-    libgl1 \            # ← これを追加（libGL.so.1 対応）
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
+# ↑ libGL.so.1 対応のため libgl1 を追加
 
 # ---- numpy を削除して再インストール（ABI mismatch 防止）----
 RUN pip uninstall -y numpy || true
