@@ -19,7 +19,8 @@ RUN pip uninstall -y numpy || true
 RUN pip install --no-cache-dir opencv-python-headless==4.7.0.72
 
 # ---- PaddleOCR 依存ライブラリ ----
-RUN pip install --no-cache-dir paddlepaddle==2.5.2 -i https://mirror.baidu.com/pypi/simple \
+# ✅ PaddleOCR が対応している CPU 版 PaddlePaddle の安定版は 2.4.2
+RUN pip install --no-cache-dir paddlepaddle==2.4.2 \
     && pip install --no-cache-dir paddleocr==2.7.0.3
 
 # ---- Discord Bot 依存 ----
