@@ -21,12 +21,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-def add_time(base_time_str: str, duration_str: str) -> str:
-    """右上の時間 + 免戦時間を計算して解除時刻を返す"""
+def add_time(base_time_str: str, duration_str: str):
+    """右上の時間 + 免戦時間 → (datetime, 計算後の時刻文字列)"""
     try:
         base_time = datetime.strptime(base_time_str, "%H:%M:%S")
     except ValueError:
-        return None
+        return None, None
 
     parts = duration_str.strip().split(":")
     if len(parts) == 3:  # HH:MM:SS
@@ -35,10 +35,11 @@ def add_time(base_time_str: str, duration_str: str) -> str:
         h = 0
         m, s = map(int, parts)
     else:
-        return None
+        return None, None
 
     delta = timedelta(hours=h, minutes=m, seconds=s)
-    return (base_time + delta).strftime("%H:%M:%S")
+    unlock_dt = base_time + delta
+    return unlock_dt, unlock_dt.strftime("%H:%M:%S")
 
 def crop_top_right(img: np.ndarray) -> np.ndarray:
     """右上30%の領域をトリミング"""
@@ -58,33 +59,38 @@ def extract_text_from_image(img: np.ndarray):
 def extract_server_number(center_texts):
     """OCR結果からサーバー番号(s1234形式)を抽出"""
     for t in center_texts:
-        # 例: [s1245], s1245, S1245 などに対応
         match = re.search(r"[sS]\d{3,4}", t)
         if match:
-            return match.group(0).lower().replace("s", "")  # 数字だけ返す
+            return match.group(0).lower().replace("s", "")
     return None
 
 def parse_multiple_places(center_texts, top_time_texts):
     """
-    中央エリアのOCR結果から複数の駐騎場番号と免戦時間を取得し、
-    右上の基準時間を足して結果リストを返す
-    戻り値: [(datetime, "警備 1281-2-18:30:00"), ...], ["奪取 1245-7-開戦済", ...]
+    OCR結果から複数駐騎場の免戦時間を解析
+    戻り値:
+      results: [(datetime, "奪取 1245-7-20:06:18"), ...]
+      no_time_places: ["奪取 1245-8-開戦済", ...]
+      debug_lines: 計算過程ログ
     """
     results = []
     no_time_places = []
+    debug_lines = []
 
-    # ✅ 右上の基準時間を取得
+    # ✅ 右上の時間
     top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
     if not top_time:
-        return [], ["⚠️ 右上の時間が取得できませんでした"]
+        return [], ["⚠️ 右上の時間が取得できませんでした"], []
 
-    # ✅ サーバー番号を柔軟に取得
+    # ✅ サーバー番号
     server_num = extract_server_number(center_texts)
     if not server_num:
-        return [], ["⚠️ サーバー番号が取得できませんでした"]
+        return [], ["⚠️ サーバー番号が取得できませんでした"], []
 
-    # ✅ モード判定（1281だけ警備、それ以外は奪取）
+    # ✅ モード判定
     mode = "警備" if server_num == "1281" else "奪取"
+
+    debug_lines.append(f"📌 サーバー番号: {server_num} ({mode})")
+    debug_lines.append(f"📌 右上基準時間: {top_time}\n")
 
     current_place = None
 
@@ -98,15 +104,19 @@ def parse_multiple_places(center_texts, top_time_texts):
         duration_match = re.search(r"免戦中(\d{1,2}:\d{2}(?::\d{2})?)", t)
         if duration_match and current_place:
             duration = duration_match.group(1)
-            unlock_time = add_time(top_time, duration)
-            if unlock_time:
-                unlock_dt = datetime.strptime(unlock_time, "%H:%M:%S")
+            debug_lines.append(f"✅ 越域駐騎場{current_place} → 免戦中{duration}")
+
+            unlock_dt, unlock_time = add_time(top_time, duration)
+            if unlock_dt:
+                debug_lines.append(f"   → {top_time} + {duration} = {unlock_time}\n")
                 results.append((unlock_dt, f"{mode} {server_num}-{current_place}-{unlock_time}"))
             else:
+                debug_lines.append(f"   → 計算できず → 開戦済\n")
                 no_time_places.append(f"{mode} {server_num}-{current_place}-開戦済")
-            current_place = None  # リセット
 
-    return results, no_time_places
+            current_place = None
+
+    return results, no_time_places, debug_lines
 
 @client.event
 async def on_ready():
@@ -118,11 +128,11 @@ async def on_message(message):
         return
 
     if message.attachments:
-        # 🔄 解析中メッセージ
         processing_msg = await message.channel.send("🔄 画像解析中…")
 
-        all_results = []  # 時間付き結果
-        all_no_time = []  # 開戦済み or エラー
+        all_results = []     # 計算済み結果
+        all_no_time = []     # 開戦済など
+        all_debug_lines = [] # 計算ログ
 
         for attachment in message.attachments:
             img_bytes = await attachment.read()
@@ -130,29 +140,28 @@ async def on_message(message):
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-            # トリミングしてOCR
+            # トリミング & OCR
             top_img = crop_top_right(img_np)
             center_img = crop_center_area(img_np)
-
             top_texts = extract_text_from_image(top_img)
             center_texts = extract_text_from_image(center_img)
 
-            # 複数免戦時間解析
-            parsed_results, no_time_places = parse_multiple_places(center_texts, top_texts)
+            # 複数解析
+            parsed_results, no_time_places, debug_lines = parse_multiple_places(center_texts, top_texts)
             all_results.extend(parsed_results)
             all_no_time.extend(no_time_places)
+            all_debug_lines.extend(debug_lines)
 
         # ✅ 時間でソート
         all_results.sort(key=lambda x: x[0])
         sorted_texts = [text for _, text in all_results]
 
-        # ✅ 最終結果メッセージ
-        if sorted_texts or all_no_time:
-            final_msg = "\n".join(sorted_texts + all_no_time)
-        else:
-            final_msg = "⚠️ 必要な情報が読み取れませんでした"
+        # ✅ 最終結果
+        debug_part = "\n".join(all_debug_lines)
+        result_part = "\n".join(sorted_texts + all_no_time) if (sorted_texts or all_no_time) else "⚠️ 必要な情報が読み取れませんでした"
 
-        # 解析結果を更新
+        final_msg = f"{debug_part}\n\n📌 時間順:\n{result_part}"
+
         await processing_msg.edit(content=final_msg)
 
 # ✅ Bot起動
