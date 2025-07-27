@@ -11,17 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
-# ↑ libGL.so.1 対応のため libgl1 を追加
 
-# ---- numpy を削除して再インストール（ABI mismatch 防止）----
+# ---- 先に numpy はアンインストール ----
 RUN pip uninstall -y numpy || true
-RUN pip install --no-cache-dir numpy==1.23.5
 
 # ---- OpenCV (wheel 高速版) ----
 RUN pip install --no-cache-dir opencv-python-headless==4.7.0.72
 
 # ---- PaddleOCR と Discord Bot 依存 ----
 RUN pip install --no-cache-dir paddleocr==2.7.0.3 discord.py
+
+# ---- numpy を最後に再インストール（ABI mismatch防止）----
+RUN pip uninstall -y numpy || true && \
+    pip install --no-cache-dir numpy==1.23.5
 
 # ---- Bot のコードをコピー ----
 WORKDIR /app
