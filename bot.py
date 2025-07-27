@@ -159,9 +159,7 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # まず古いデータを削除
     cleanup_old_entries()
-
     notify_channel = client.get_channel(NOTIFY_CHANNEL_ID) if NOTIFY_CHANNEL_ID else None
 
     # ==== デバッグ用 "!1234-7-12:34:56" ====
@@ -172,9 +170,17 @@ async def on_message(message):
             mode = "警備" if server_num == "1281" else "奪取"
             txt = f"{mode} {server_num}-{place_num}-{unlock_time}"
             dt = datetime.strptime(unlock_time, "%H:%M:%S")
+
+            # ✅ pending_places に登録
             pending_places[txt] = (dt, txt, server_num, datetime.now())
+
+            # ✅ デバッグ登録メッセージを送信チャンネルに送る
             await message.channel.send(f"✅ デバッグ登録: {txt}")
+
+            # ✅ 通知チャンネルにも同じ内容を送る
             if notify_channel:
+                await notify_channel.send(f"✅ デバッグ登録: {txt}")
+                # デバッグは時間帯無視して通知予約
                 asyncio.create_task(schedule_notification(dt, txt, notify_channel, debug=True))
             return
 
@@ -194,7 +200,6 @@ async def on_message(message):
 
             parsed_results, no_time_places, debug_lines = parse_multiple_places(center_texts, top_texts)
 
-            # 結果登録 (重複除外)
             for dt, txt, server in parsed_results:
                 if txt not in pending_places:
                     pending_places[txt] = (dt, txt, server, datetime.now())
@@ -205,7 +210,6 @@ async def on_message(message):
                 if txt not in pending_places:
                     pending_places[txt] = (datetime.min, txt, "", datetime.now())
 
-        # 返信前にも古いデータを整理
         cleanup_old_entries()
 
         opened = [txt for dt, txt, _, _ in pending_places.values() if dt == datetime.min]
