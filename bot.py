@@ -13,7 +13,7 @@ from PIL import Image
 #  BOT設定
 # =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
-NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))  # 通知専用チャンネル
+NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
 
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
@@ -31,18 +31,25 @@ client = discord.Client(intents=intents)
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
 # =======================
-#  通知用管理
+#  通知管理 (登録時刻も保存)
 # =======================
-pending_places = {}  # key=place_id, value=(datetime, "奪取 1245-7-20:06:18", server_num)
+# key: txt, value: (解除予定時刻, テキスト, サーバー番号, 登録時刻)
+pending_places = {}
 
-SKIP_NOTIFY_START = 2   # 通知無効時間 2時～
-SKIP_NOTIFY_END = 14    # ～14時まで
+SKIP_NOTIFY_START = 2
+SKIP_NOTIFY_END = 14
 
 # =======================
-#  ユーティリティ関数
+#  ユーティリティ
 # =======================
+def cleanup_old_entries():
+    """6時間以上経過した古いデータを削除"""
+    now = datetime.now()
+    expired_keys = [k for k, v in pending_places.items() if (now - v[3]) > timedelta(hours=6)]
+    for k in expired_keys:
+        del pending_places[k]
+
 def add_time(base_time_str: str, duration_str: str):
-    """右上の時間 + 免戦時間 → (datetime, 計算後の時刻文字列)"""
     try:
         base_time = datetime.strptime(base_time_str, "%H:%M:%S")
     except ValueError:
@@ -62,22 +69,18 @@ def add_time(base_time_str: str, duration_str: str):
     return unlock_dt, unlock_dt.strftime("%H:%M:%S")
 
 def crop_top_right(img: np.ndarray) -> np.ndarray:
-    """右上30%の領域をトリミング"""
     h, w, _ = img.shape
     return img[0:int(h * 0.2), int(w * 0.7):w]
 
 def crop_center_area(img: np.ndarray) -> np.ndarray:
-    """上下35%をカットして中央エリアをトリミング"""
     h, w, _ = img.shape
     return img[int(h * 0.35):int(h * 0.65), 0:w]
 
 def extract_text_from_image(img: np.ndarray):
-    """OCRで文字認識"""
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
 
 def extract_server_number(center_texts):
-    """OCR結果からサーバー番号(s1234形式)を抽出"""
     for t in center_texts:
         match = re.search(r"[sS]\d{3,4}", t)
         if match:
@@ -85,22 +88,16 @@ def extract_server_number(center_texts):
     return None
 
 def parse_multiple_places(center_texts, top_time_texts):
-    """複数駐騎場番号と免戦時間を解析"""
-    results = []
-    no_time_places = []
-    debug_lines = []
+    results, no_time_places, debug_lines = [], [], []
 
-    # 右上の時間
     top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
     if not top_time:
         return [], ["⚠️ 右上の時間が取得できませんでした"], []
 
-    # サーバー番号
     server_num = extract_server_number(center_texts)
     if not server_num:
         return [], ["⚠️ サーバー番号が取得できませんでした"], []
 
-    # モード判定
     mode = "警備" if server_num == "1281" else "奪取"
     debug_lines.append(f"📌 サーバー番号: {server_num} ({mode})")
     debug_lines.append(f"📌 右上基準時間: {top_time}\n")
@@ -109,27 +106,21 @@ def parse_multiple_places(center_texts, top_time_texts):
     seen_places = set()
 
     for t in center_texts:
-        # 駐騎場番号
         place_match = re.search(r"越域駐騎場(\d+)", t)
         if place_match:
             current_place = place_match.group(1)
             seen_places.add(current_place)
 
-        # 免戦中の時間
         duration_match = re.search(r"免戦中(\d{1,2}:\d{2}(?::\d{2})?)", t)
         if duration_match and current_place:
             duration = duration_match.group(1)
-            debug_lines.append(f"✅ 越域駐騎場{current_place} → 免戦中{duration}")
             unlock_dt, unlock_time = add_time(top_time, duration)
             if unlock_dt:
-                debug_lines.append(f"   → {top_time} + {duration} = {unlock_time}\n")
                 results.append((unlock_dt, f"{mode} {server_num}-{current_place}-{unlock_time}", server_num))
             else:
-                debug_lines.append(f"   → 計算できず → 開戦済\n")
                 no_time_places.append(f"{mode} {server_num}-{current_place}-開戦済")
             current_place = None
 
-    # 免戦時間なし → 開戦済扱い
     for p in seen_places:
         if not any(f"-{p}-" in txt for _, txt, _ in results) and not any(f"-{p}-" in txt for txt in no_time_places):
             no_time_places.append(f"{mode} {server_num}-{p}-開戦済")
@@ -137,16 +128,13 @@ def parse_multiple_places(center_texts, top_time_texts):
     return results, no_time_places, debug_lines
 
 def should_skip_notification(dt: datetime):
-    """02:00～14:00は通知しない"""
     return SKIP_NOTIFY_START <= dt.hour < SKIP_NOTIFY_END
 
 async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: discord.TextChannel, debug=False):
-    """解除予定時刻の2分前・15秒前に通知"""
     now = datetime.now()
     if unlock_dt <= now:
         return
 
-    # デバッグモードなら時間帯制限を無視
     if text.startswith("奪取") and (debug or not should_skip_notification(unlock_dt)):
         notify_time_2min = unlock_dt - timedelta(minutes=2)
         notify_time_15sec = unlock_dt - timedelta(seconds=15)
@@ -160,7 +148,7 @@ async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: 
             await notify_channel.send(f"⏰ {text} **15秒前です！！**")
 
 # =======================
-#  イベント処理
+#  イベント
 # =======================
 @client.event
 async def on_ready():
@@ -170,6 +158,9 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
+
+    # まず古いデータを削除
+    cleanup_old_entries()
 
     notify_channel = client.get_channel(NOTIFY_CHANNEL_ID) if NOTIFY_CHANNEL_ID else None
 
@@ -181,10 +172,8 @@ async def on_message(message):
             mode = "警備" if server_num == "1281" else "奪取"
             txt = f"{mode} {server_num}-{place_num}-{unlock_time}"
             dt = datetime.strptime(unlock_time, "%H:%M:%S")
-
-            pending_places[txt] = (dt, txt, server_num)
+            pending_places[txt] = (dt, txt, server_num, datetime.now())
             await message.channel.send(f"✅ デバッグ登録: {txt}")
-
             if notify_channel:
                 asyncio.create_task(schedule_notification(dt, txt, notify_channel, debug=True))
             return
@@ -198,7 +187,6 @@ async def on_message(message):
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-            # トリミング & OCR
             top_img = crop_top_right(img_np)
             center_img = crop_center_area(img_np)
             top_texts = extract_text_from_image(top_img)
@@ -206,21 +194,23 @@ async def on_message(message):
 
             parsed_results, no_time_places, debug_lines = parse_multiple_places(center_texts, top_texts)
 
-            # OCR結果の登録
+            # 結果登録 (重複除外)
             for dt, txt, server in parsed_results:
-                if txt not in pending_places:  # 通知チャンネルでは重複除外
-                    pending_places[txt] = (dt, txt, server)
+                if txt not in pending_places:
+                    pending_places[txt] = (dt, txt, server, datetime.now())
                     if txt.startswith("奪取") and notify_channel:
                         asyncio.create_task(schedule_notification(dt, txt, notify_channel))
 
             for txt in no_time_places:
-                if txt not in pending_places:  # 開戦済も重複除外
-                    pending_places[txt] = (datetime.min, txt, "")
+                if txt not in pending_places:
+                    pending_places[txt] = (datetime.min, txt, "", datetime.now())
 
-        # ==== メッセージ返信 ====
-        opened = [txt for dt, txt, _ in pending_places.values() if dt == datetime.min]
-        takes = [(dt, txt) for dt, txt, _ in pending_places.values() if dt != datetime.min and txt.startswith("奪取")]
-        guards = [(dt, txt) for dt, txt, _ in pending_places.values() if dt != datetime.min and txt.startswith("警備")]
+        # 返信前にも古いデータを整理
+        cleanup_old_entries()
+
+        opened = [txt for dt, txt, _, _ in pending_places.values() if dt == datetime.min]
+        takes = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt != datetime.min and txt.startswith("奪取")]
+        guards = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt != datetime.min and txt.startswith("警備")]
 
         takes.sort(key=lambda x: x[0])
         guards.sort(key=lambda x: x[0])
