@@ -2,7 +2,7 @@ import discord
 import os
 import re
 from io import BytesIO
-from PIL import Image, ExifTags
+from PIL import Image
 from paddleocr import PaddleOCR
 from datetime import timedelta, datetime
 import numpy as np
@@ -16,19 +16,28 @@ client = discord.Client(intents=intents)
 
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
-def get_image_datetime(image: Image.Image):
-    """EXIFから撮影日時を取得（なければNone）"""
-    try:
-        exif_data = image._getexif()
-        if not exif_data:
-            return None
-        exif = {ExifTags.TAGS.get(k, k): v for k, v in exif_data.items()}
-        date_str = exif.get("DateTimeOriginal") or exif.get("DateTime")
-        if date_str:
-            # 例: "2025:07:27 06:12:34"
-            return datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
-    except Exception as e:
-        print(f"EXIF読み込み失敗: {e}")
+def crop_center_30(image: Image.Image):
+    """中央30%を残すトリミング"""
+    w, h = image.size
+    top = int(h * 0.35)
+    bottom = int(h * 0.65)
+    return image.crop((0, top, w, bottom))
+
+def crop_topright_time_area(image: Image.Image):
+    """右上(上20% × 右30%)をトリミング"""
+    w, h = image.size
+    top = 0
+    bottom = int(h * 0.2)
+    left = int(w * 0.7)
+    right = w
+    return image.crop((left, top, right, bottom))
+
+def extract_time_from_text(text: str):
+    """OCRテキストからHH:MM:SSを抽出"""
+    m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})", text)
+    if m:
+        h, m_, s = map(int, m.groups())
+        return datetime.now().replace(hour=h, minute=m_, second=s, microsecond=0)
     return None
 
 @client.event
@@ -49,22 +58,30 @@ async def on_message(message):
                 img_bytes = await attachment.read()
                 image = Image.open(BytesIO(img_bytes))
 
-                # ======== 撮影日時の取得（EXIF優先、無ければ投稿時刻） ========
-                base_time = get_image_datetime(image)
-                if base_time is None:
-                    # 撮影日時が無ければDiscord投稿時刻（UTC→JST）
+                # ======== 基準時間取得用の右上20%x30%トリミング ========
+                time_area_img = crop_topright_time_area(image)
+                time_np = np.array(time_area_img)
+                time_result = ocr.ocr(time_np, cls=True)
+                time_text = " ".join([line[1][0] for res in time_result for line in res])
+
+                # デバッグ: OCRで読み取った右上の文字
+                print("右上OCR結果:", time_text)
+
+                # 時間を抽出（例: 17:31:22）
+                base_time = extract_time_from_text(time_text)
+                if not base_time:
+                    # 取れなかったら投稿時刻
                     base_time = message.created_at + timedelta(hours=9)
 
-                # ======== 中央30%だけ残すトリミング ========
-                w, h = image.size
-                top = int(h * 0.35)
-                bottom = int(h * 0.65)
-                cropped = image.crop((0, top, w, bottom))
+                # ======== トリミング画像をDiscordへ送信 ========
+                buf = BytesIO()
+                time_area_img.save(buf, format="PNG")
+                buf.seek(0)
+                await message.channel.send("🖼 **基準時間領域**", file=discord.File(buf, "time_area.png"))
 
-                # OCR用にNumPy配列へ変換
-                cropped_np = np.array(cropped)
-
-                # ======== OCR実行 ========
+                # ======== 中央30%OCRで駐機情報を抽出 ========
+                cropped_main = crop_center_30(image)
+                cropped_np = np.array(cropped_main)
                 result = ocr.ocr(cropped_np, cls=True)
                 extracted_text = [line[1][0] for res in result for line in res]
 
@@ -72,7 +89,6 @@ async def on_message(message):
                 raw_debug_text = "\n".join(extracted_text)
                 await message.channel.send(f"📝 **OCR生データ**\n```\n{raw_debug_text}\n```")
 
-                # 解析用にまとめたテキスト
                 all_text = " ".join(extracted_text)
 
                 # ======== サーバー番号抽出 ========
@@ -82,12 +98,11 @@ async def on_message(message):
                 # ======== 越域駐騎場番号 ========
                 spot_nums = re.findall(r'越域駐騎場(\d+)', all_text)
 
-                # ======== 免戦中時間（なければ開戦済扱い） ========
+                # ======== 免戦中時間（無ければ開戦済） ========
                 times = re.findall(r'免戦中(\d{1,2}:\d{2})', all_text)
 
                 combined = []
                 for i, spot in enumerate(spot_nums):
-                    # 免戦時間があれば終了時間を計算
                     if i < len(times):
                         raw_time = times[i]
                         mins, secs = map(int, raw_time.split(":"))
@@ -95,7 +110,6 @@ async def on_message(message):
                         end_time = (base_time + delta).strftime("%H:%M:%S")
                         combined.append(f"{server_num}-{spot}-{end_time}")
                     else:
-                        # 時間がない場合は開戦済
                         combined.append(f"{server_num}-{spot}-開戦済")
 
                 # ======== 最終メッセージ ========
@@ -104,7 +118,6 @@ async def on_message(message):
                 else:
                     reply = "❌ 必要な駐機情報が見つかりませんでした…"
 
-                # 「解析中です…」メッセージを編集して結果を表示
                 await processing_msg.edit(content=reply)
 
 client.run(TOKEN)
