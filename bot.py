@@ -89,6 +89,14 @@ def parse_info(center_texts, top_time_texts):
     # ✅ 出力フォーマット → `警備 s1281-3-20:14:54`
     return f"{mode} {server}-{place_num}-{new_time}"
 
+def np_to_discord_file(np_img, filename="image.png"):
+    """OpenCV画像(np.ndarray)をDiscord送信用のFileに変換"""
+    img_pil = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
+    buf = io.BytesIO()
+    img_pil.save(buf, format="PNG")
+    buf.seek(0)
+    return discord.File(buf, filename=filename)
+
 @client.event
 async def on_ready():
     print(f"✅ ログイン成功！Bot名: {client.user}")
@@ -101,8 +109,6 @@ async def on_message(message):
 
     # ✅ 画像が添付されたメッセージのみ処理
     if message.attachments:
-        results = []
-
         for attachment in message.attachments:
             img_bytes = await attachment.read()
 
@@ -118,16 +124,30 @@ async def on_message(message):
             top_texts = extract_text_from_image(top_img)
             center_texts = extract_text_from_image(center_img)
 
+            # ✅ OCR結果を文字列化（デバッグ用に見せる）
+            ocr_debug_msg = (
+                "**🔍 OCR結果プレビュー**\n"
+                f"📍 **右上エリア** → `{', '.join(top_texts) if top_texts else 'なし'}`\n"
+                f"📍 **中央エリア** → `{', '.join(center_texts) if center_texts else 'なし'}`\n"
+            )
+
             # 必要情報をパース
             info = parse_info(center_texts, top_texts)
 
+            # ✅ メッセージ生成
             if info:
-                results.append(info)
+                result_msg = f"✅ **抽出結果:** `{info}`\n\n{ocr_debug_msg}"
             else:
-                results.append("⚠️ 必要な情報が読み取れませんでした")
+                result_msg = f"⚠️ 必要な情報が読み取れませんでした\n\n{ocr_debug_msg}"
 
-        # OCR結果をまとめて返信
-        await message.channel.send("\n".join(results))
+            # ✅ トリミング画像もDiscordに添付
+            top_file = np_to_discord_file(top_img, filename="top_area.png")
+            center_file = np_to_discord_file(center_img, filename="center_area.png")
+
+            await message.channel.send(
+                result_msg,
+                files=[top_file, center_file]
+            )
 
 # ✅ Bot起動（エラー時はメッセージを表示）
 if __name__ == "__main__":
