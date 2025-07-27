@@ -5,24 +5,24 @@ from paddleocr import PaddleOCR
 from PIL import Image
 
 # === Discord Bot Token ===
-TOKEN = os.getenv("DISCORD_TOKEN")  # Koyebなら環境変数に設定
+TOKEN = os.getenv("DISCORD_TOKEN")  # Koyebでは環境変数に設定
 
-# === PaddleOCRの初期化 ===
-ocr = PaddleOCR(use_angle_cls=True, lang='japan')  # 日本語OCR
+# === PaddleOCRの初期化（日本語対応） ===
+ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
 # === Discord Intents設定 ===
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# === 上下20%をトリミングする関数 ===
+# === 上下30%をトリミングする関数 ===
 def crop_image_center(image_path):
     img = Image.open(image_path)
     w, h = img.size
 
-    # トリミング範囲（上下20%カット → 中央60%残す）
-    top = int(h * 0.2)
-    bottom = int(h * 0.8)
+    # 上下30%カット → 中央40%だけ残す
+    top = int(h * 0.3)
+    bottom = int(h * 0.7)
     cropped = img.crop((0, top, w, bottom))
 
     cropped_path = "/tmp/cropped_image.jpg"
@@ -62,7 +62,7 @@ async def on_message(message):
             img_path = "/tmp/input_image.jpg"
             await attachment.save(img_path)
 
-            # 1️⃣ 上下20%をトリミング
+            # 1️⃣ 上下30%をトリミング
             cropped_path = crop_image_center(img_path)
 
             # 2️⃣ OCR実行
@@ -84,7 +84,7 @@ async def on_message(message):
             # 5️⃣ Discordへ返信（トリミング画像も送る）
             await message.channel.send(reply_text, file=discord.File(cropped_path))
 
-    # 他のコマンドにも対応
+    # 他のコマンドも処理できるように
     await bot.process_commands(message)
 
 # === Bot起動 ===
