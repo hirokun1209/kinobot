@@ -1,5 +1,12 @@
-discord.py
-paddleocr
-opencv-python-headless
-pillow
-numpy
+# Discord Bot 必須
+discord.py==2.3.2
+python-dotenv==1.0.1
+
+# OCR 関係（安定版固定）
+paddleocr==2.6.1
+paddlepaddle==2.5.2
+
+# 画像処理
+opencv-python==4.8.1.78
+numpy==1.24.4
+Pillow==9.5.0
