@@ -15,14 +15,21 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# === 上下30%をトリミングする関数 ===
+# === 上40%・下50%をトリミングする関数 ===
 def crop_image_center(image_path):
     img = Image.open(image_path)
     w, h = img.size
 
-    # 上下30%カット → 中央40%だけ残す
-    top = int(h * 0.3)
-    bottom = int(h * 0.7)
+    # 上40% → h * 0.4
+    # 下50% → 残るのは中央10%だけ
+    top = int(h * 0.4)
+    bottom = int(h * 0.5)  # 50%残すのではなく、50%削るのでh*0.5が終わり位置
+    # でも下50%削るなら残すのは上から50%、つまり bottom = h * (1 - 0.5) = h * 0.5
+    bottom = int(h * (1 - 0.5))  # 下50%削ると残るのは上から50%
+    # しかし上40%削った後にさらに下50%削ると残るのは中央10%だけ
+    # → 正しくは bottom = h * 0.5 のままでOK
+
+    # 実際には上40%削る→top=0.4h, 下50%削る→bottom=0.5h
     cropped = img.crop((0, top, w, bottom))
 
     cropped_path = "/tmp/cropped_image.jpg"
@@ -62,7 +69,7 @@ async def on_message(message):
             img_path = "/tmp/input_image.jpg"
             await attachment.save(img_path)
 
-            # 1️⃣ 上下30%をトリミング
+            # 1️⃣ 上40%・下50%をトリミング
             cropped_path = crop_image_center(img_path)
 
             # 2️⃣ OCR実行
