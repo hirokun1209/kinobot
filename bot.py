@@ -151,15 +151,27 @@ async def handle_new_event(dt, txt, channel):
         active_tasks.add(task)
         task.add_done_callback(lambda t: active_tasks.discard(t))
 
+def is_within_5_minutes_of_another(target_dt):
+    times = sorted([v[0] for v in pending_places.values()])
+    for dt in times:
+        if dt != target_dt and abs((dt - target_dt).total_seconds()) <= 300:
+            return True
+    return False
+
 async def schedule_notification(unlock_dt, text, channel):
     if unlock_dt <= now_jst(): return
     if text.startswith("奪取") and not (SKIP_NOTIFY_START <= unlock_dt.hour < SKIP_NOTIFY_END):
-        for offset, label in [(2, "2分前です！！"), (0.25, "15秒前です！！")]:
-            t = unlock_dt - timedelta(minutes=offset)
+        # 2分前通知（5分以内に別の予定がなければ）
+        if not is_within_5_minutes_of_another(unlock_dt):
+            t = unlock_dt - timedelta(minutes=2)
             if t > now_jst():
-                delay = (t - now_jst()).total_seconds()
-                await asyncio.sleep(delay)
-                await channel.send(f"⏰ {text} **{label}**")
+                await asyncio.sleep((t - now_jst()).total_seconds())
+                await channel.send(f"⏰ {text} **2分前です！！**")
+        # 15秒前通知（常に送信）
+        t15 = unlock_dt - timedelta(seconds=15)
+        if t15 > now_jst():
+            await asyncio.sleep((t15 - now_jst()).total_seconds())
+            await channel.send(f"⏰ {text} **15秒前です！！**")
 
 # =======================
 # リセット処理
@@ -202,6 +214,7 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
+    # ✅ 手動登録
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
         for server, place, t in manual:
@@ -222,6 +235,7 @@ async def on_message(message):
                     task2.add_done_callback(lambda t: active_tasks.discard(t))
         return
 
+    # ✅ OCR読み取り
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
         new_results = []
