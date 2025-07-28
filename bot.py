@@ -22,6 +22,12 @@ NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
 
+# ✅ 読み取り許可チャンネルを環境変数から読み込む（カンマ区切り）
+allowed_channels_env = os.getenv("ALLOWED_CHANNEL_IDS", "")
+READABLE_CHANNEL_IDS = [
+    int(x.strip()) for x in allowed_channels_env.split(",") if x.strip().isdigit()
+]
+
 # Discordクライアント
 intents = discord.Intents.default()
 intents.message_content = True
@@ -39,11 +45,6 @@ pending_places = {}   # key: txt, value: (dt, txt, server, 登録時間)
 summary_blocks = []   # [{ "events":[(dt,txt)], "min":dt, "max":dt, "msg":discord.Message or None }]
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
-
-# ✅ 読み取り許可チャンネル (OCR・コマンド受付OK)
-READABLE_CHANNEL_IDS = [
-    123456789012345678,  # ←ここに許可するチャンネルIDを追加
-]
 
 # =======================
 #  共通ユーティリティ
@@ -198,14 +199,16 @@ async def reset_all(message):
 @client.event
 async def on_ready():
     print("✅ ログイン成功！")
+    print(f"📌 通知チャンネル: {NOTIFY_CHANNEL_ID}")
+    print(f"📌 読み取り許可チャンネル: {READABLE_CHANNEL_IDS}")
 
 @client.event
 async def on_message(message):
-    if message.author.bot: return
+    if message.author.bot:
+        return
     
-    # ✅ 許可された読み取りチャンネルだけOCR・!コマンドを処理
+    # ✅ 許可された読み取りチャンネルだけOCR・コマンド受付
     if message.channel.id not in READABLE_CHANNEL_IDS:
-        # 許可外ではリセットコマンドやOCR等は無視する
         return
     
     cleanup_old_entries()
