@@ -147,7 +147,7 @@ async def schedule_block_summary(block, channel):
             try:
                 await block["msg"].edit(content=format_block_msg(block, False))
             except discord.NotFound:
-                pass
+                pass  # メッセージが削除されていた場合は無視
     except Exception as e:
         print(f"[ERROR] schedule_block_summary failed: {e}")
 
@@ -158,7 +158,10 @@ async def handle_new_event(dt, txt, channel):
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
     if block["msg"]:
-        await block["msg"].edit(content=format_block_msg(block, True))
+        try:
+            await block["msg"].edit(content=format_block_msg(block, True))
+        except discord.NotFound:
+            block["msg"] = await channel.send(format_block_msg(block, True))
     else:
         task = asyncio.create_task(schedule_block_summary(block, channel))
         active_tasks.add(task)
@@ -185,7 +188,6 @@ async def schedule_notification(unlock_dt, text, channel):
             sent_notifications.add((text, "15s"))
             await asyncio.sleep((t15 - now_jst()).total_seconds())
             await channel.send(f"⏰ {text} **15秒前です！！**")
-
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
