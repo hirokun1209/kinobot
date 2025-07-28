@@ -220,7 +220,7 @@ async def on_message(message):
         for server, place, t in manual:
             if len(server) == 3:
                 server = "1" + server
-            mode = "警備" if server == "1281" else "奪取"
+            mode = "警備" if server == "1268" else "奪取"
             txt = f"{mode} {server}-{place}-{t}"
             dt = datetime.combine(now_jst().date(), datetime.strptime(t, "%H:%M:%S").time(), tzinfo=JST)
             if txt not in pending_places:
