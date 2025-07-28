@@ -39,6 +39,7 @@ ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 pending_places = {}
 summary_blocks = []
 active_tasks = set()
+sent_notifications = set()
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
 
@@ -164,12 +165,14 @@ async def schedule_notification(unlock_dt, text, channel):
         # 2分前通知（5分以内に別の予定がなければ）
         if not is_within_5_minutes_of_another(unlock_dt):
             t = unlock_dt - timedelta(minutes=2)
-            if t > now_jst():
+            if t > now_jst() and (text, "2min") not in sent_notifications:
+                sent_notifications.add((text, "2min"))
                 await asyncio.sleep((t - now_jst()).total_seconds())
                 await channel.send(f"⏰ {text} **2分前です！！**")
         # 15秒前通知（常に送信）
         t15 = unlock_dt - timedelta(seconds=15)
-        if t15 > now_jst():
+        if t15 > now_jst() and (text, "15s") not in sent_notifications:
+            sent_notifications.add((text, "15s"))
             await asyncio.sleep((t15 - now_jst()).total_seconds())
             await channel.send(f"⏰ {text} **15秒前です！！**")
 
@@ -179,6 +182,7 @@ async def schedule_notification(unlock_dt, text, channel):
 async def reset_all(message):
     pending_places.clear()
     summary_blocks.clear()
+    sent_notifications.clear()
     for task in list(active_tasks):
         task.cancel()
     active_tasks.clear()
@@ -214,7 +218,6 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
-    # ✅ 手動登録
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
         for server, place, t in manual:
@@ -235,7 +238,6 @@ async def on_message(message):
                     task2.add_done_callback(lambda t: active_tasks.discard(t))
         return
 
-    # ✅ OCR読み取り
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
         new_results = []
