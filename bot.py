@@ -33,12 +33,17 @@ client = discord.Client(intents=intents)
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
 # =======================
-#  通知管理
+#  通知管理・ブロック管理
 # =======================
 pending_places = {}   # key: txt, value: (dt, txt, server, 登録時間)
 summary_blocks = []   # [{ "events":[(dt,txt)], "min":dt, "max":dt, "msg":discord.Message or None }]
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
+
+# ✅ 読み取り許可チャンネル (OCR・コマンド受付OK)
+READABLE_CHANNEL_IDS = [
+    123456789012345678,  # ←ここに許可するチャンネルIDを追加
+]
 
 # =======================
 #  共通ユーティリティ
@@ -197,6 +202,12 @@ async def on_ready():
 @client.event
 async def on_message(message):
     if message.author.bot: return
+    
+    # ✅ 許可された読み取りチャンネルだけOCR・!コマンドを処理
+    if message.channel.id not in READABLE_CHANNEL_IDS:
+        # 許可外ではリセットコマンドやOCR等は無視する
+        return
+    
     cleanup_old_entries()
     channel = client.get_channel(NOTIFY_CHANNEL_ID) if NOTIFY_CHANNEL_ID else None
 
