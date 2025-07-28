@@ -140,8 +140,29 @@ async def schedule_block_summary(block, channel):
     if block["msg"]:
         await block["msg"].edit(content=format_block_msg(block, False))
 
+
+# グローバルで編集待ちフラグを管理
+edit_pending = {}
+
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
+    block["events"].append((dt, txt))
+    block["min"] = min(block["min"], dt)
+    block["max"] = max(block["max"], dt)
+
+    block_id = id(block)
+    if block["msg"]:
+        # 重複編集防止
+        if block_id not in edit_pending:
+            edit_pending[block_id] = True
+            await asyncio.sleep(2)  # 連続編集防止のため遅延
+            await block["msg"].edit(content=format_block_msg(block, True))
+            del edit_pending[block_id]
+    else:
+        task = asyncio.create_task(schedule_block_summary(block, channel))
+        active_tasks.add(task)
+        task.add_done_callback(lambda t: active_tasks.discard(t))
+
     block["events"].append((dt, txt))
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
