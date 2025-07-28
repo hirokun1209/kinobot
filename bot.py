@@ -11,12 +11,12 @@ from datetime import datetime, timedelta, timezone
 from PIL import Image
 
 # =======================
-#  タイムゾーン設定
+# タイムゾーン設定
 # =======================
 JST = timezone(timedelta(hours=9))
 
 # =======================
-#  BOT設定
+# BOT設定
 # =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
@@ -29,20 +29,20 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 # =======================
-#  OCR初期化
+# OCR初期化
 # =======================
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
 # =======================
-#  管理用構造
+# 管理用構造
 # =======================
 pending_places = {}
-summary_blocks = []  # 各ブロックは {"events": [(dt, txt)], "min": dt, "max": dt, "msg": discord.Message}
+summary_blocks = []
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
 
 # =======================
-#  ユーティリティ
+# ユーティリティ
 # =======================
 def now_jst():
     return datetime.now(JST)
@@ -110,7 +110,7 @@ def parse_multiple_places(center_texts, top_time_texts):
     return res
 
 # =======================
-#  ブロック処理
+# ブロック処理
 # =======================
 def find_or_create_block(new_dt):
     for block in summary_blocks:
@@ -149,7 +149,7 @@ async def handle_new_event(dt, txt, channel):
         asyncio.create_task(schedule_block_summary(block, channel))
 
 # =======================
-#  通知
+# 通知処理（2分/15秒前）
 # =======================
 async def schedule_notification(unlock_dt, text, channel):
     if unlock_dt <= now_jst(): return
@@ -161,18 +161,18 @@ async def schedule_notification(unlock_dt, text, channel):
                 await channel.send(f"⏰ {text} **{label}**")
 
 # =======================
-#  リセット
+# リセット処理
 # =======================
 async def reset_all(message):
     pending_places.clear()
     summary_blocks.clear()
-    for task in asyncio.all_tasks():
+    for task in list(asyncio.all_tasks()):
         if task is not asyncio.current_task():
             task.cancel()
     await message.channel.send("✅ 全ての予定と通知をリセットしました")
 
 # =======================
-#  Discordイベント
+# Discordイベント処理
 # =======================
 @client.event
 async def on_ready():
@@ -201,7 +201,7 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
-    # ✅ 手動追加（例: 1234-7-12:34:56）
+    # ✅ 手動登録（例: 1234-7-12:34:56）
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
         for server, place, t in manual:
@@ -218,7 +218,7 @@ async def on_message(message):
                     asyncio.create_task(schedule_notification(dt, txt, channel))
         return
 
-    # ✅ OCR画像解析
+    # ✅ OCR画像処理
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
         new_results = []
@@ -244,7 +244,7 @@ async def on_message(message):
         ))
 
 # =======================
-#  起動
+# 起動
 # =======================
 if __name__ == "__main__":
     client.run(TOKEN)
