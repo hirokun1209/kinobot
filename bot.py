@@ -1,3 +1,4 @@
+# 略称：OCR BOT（スケジュール通知付き）
 import os
 import discord
 import io
@@ -19,14 +20,10 @@ JST = timezone(timedelta(hours=9))
 # =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
+allowed_channels_env = os.getenv("ALLOWED_CHANNEL_IDS", "")
+READABLE_CHANNEL_IDS = [int(x.strip()) for x in allowed_channels_env.split(",") if x.strip().isdigit()]
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
-
-# ✅ 読み取り許可チャンネルを環境変数から読み込む（カンマ区切り）
-allowed_channels_env = os.getenv("ALLOWED_CHANNEL_IDS", "")
-READABLE_CHANNEL_IDS = [
-    int(x.strip()) for x in allowed_channels_env.split(",") if x.strip().isdigit()
-]
 
 # Discordクライアント
 intents = discord.Intents.default()
@@ -39,7 +36,7 @@ client = discord.Client(intents=intents)
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
 # =======================
-#  通知管理・ブロック管理
+#  通知・ブロック管理
 # =======================
 pending_places = {}   # key: txt, value: (dt, txt, server, 登録時間)
 summary_blocks = []   # [{ "events":[(dt,txt)], "min":dt, "max":dt, "msg":discord.Message or None }]
@@ -112,7 +109,6 @@ def parse_multiple_places(center_texts, top_time_texts):
 #  ブロック管理
 # =======================
 def find_or_create_block(new_dt):
-    """45分以内なら既存ブロックにまとめる。超えたら新ブロック作成"""
     for block in summary_blocks:
         if new_dt <= block["max"] + timedelta(minutes=45):
             return block
@@ -134,17 +130,14 @@ def format_block_msg(block,with_footer=True):
     return "\n".join(lines)
 
 async def schedule_block_summary(block, channel):
-    """ブロック最小時間の30分前に通知→最小時間でフッター削除"""
     wait_sec = (block["min"] - timedelta(minutes=30) - now_jst()).total_seconds()
     if wait_sec < 0: wait_sec = 0
     await asyncio.sleep(wait_sec)
-    # 初回送信
     if not block["msg"]:
         txt = format_block_msg(block,with_footer=True)
         block["msg"] = await channel.send(txt)
     else:
         await block["msg"].edit(content=format_block_msg(block,with_footer=True))
-    # 最小時間でフッター削除
     delay = (block["min"] - now_jst()).total_seconds()
     if delay>0:
         await asyncio.sleep(delay)
@@ -152,16 +145,13 @@ async def schedule_block_summary(block, channel):
             await block["msg"].edit(content=format_block_msg(block,with_footer=False))
 
 async def handle_new_event(dt,txt,channel):
-    """新しい予定をブロックに追加して必要なら送信・編集"""
     block = find_or_create_block(dt)
     block["events"].append((dt,txt))
     block["min"] = min(block["min"],dt)
     block["max"] = max(block["max"],dt)
-    # すでに送信済みなら編集
     if block["msg"]:
         await block["msg"].edit(content=format_block_msg(block,with_footer=True))
     else:
-        # 通知前ならスケジュールセット
         asyncio.create_task(schedule_block_summary(block,channel))
 
 # =======================
@@ -187,7 +177,6 @@ async def reset_all(message):
     global pending_places, summary_blocks
     pending_places.clear()
     summary_blocks.clear()
-    # 全タスクキャンセル（現在の以外）
     for task in asyncio.all_tasks():
         if task is not asyncio.current_task():
             task.cancel()
@@ -206,55 +195,32 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
-    
-    # ✅ 許可された読み取りチャンネルだけOCR・コマンド受付
     if message.channel.id not in READABLE_CHANNEL_IDS:
         return
-    
+
     cleanup_old_entries()
     channel = client.get_channel(NOTIFY_CHANNEL_ID) if NOTIFY_CHANNEL_ID else None
 
-    # === リセット ===
-    if message.content.strip()=="!reset":
+    # === リセットコマンド ===
+    if message.content.strip() == "!reset":
         await reset_all(message)
         return
 
-    # === デバッグ "!1234-7-12:34:56" ===
-    if message.content.startswith("!"):
-        m = re.match(r"!([0-9]{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})", message.content)
-        if m:
-            server,place,t = m.groups()
-            if len(server)==3: server="1"+server
-            mode = "警備" if server=="1281" else "奪取"
-            txt = f"{mode} {server}-{place}-{t}"
-            dt = datetime.combine(now_jst().date(), datetime.strptime(t,"%H:%M:%S").time(), tzinfo=JST)
-            pending_places[txt]=(dt,txt,server,now_jst())
-            await message.channel.send(f"✅デバッグ登録:{txt}")
-            if channel:
-                asyncio.create_task(handle_new_event(dt,txt,channel))
-                asyncio.create_task(schedule_notification(dt,txt,channel))
+    # === デバッグ強制出力 ===
+    if message.content.strip() == "!debug":
+        if not pending_places:
+            await message.channel.send("⚠️ 登録された予定はありません")
+        else:
+            lines = ["✅ 現在の登録された予定:"]
+            for v in sorted(pending_places.values(), key=lambda x: x[0]):
+                lines.append(f"・{v[1]}")
+            await message.channel.send("\n".join(lines))
         return
 
-    # === 手動 "281-1-12:34:56" ===
-    manual = re.findall(r"(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})", message.content)
-    if manual:
-        for server,place,t in manual:
-            if len(server)==3: server="1"+server
-            mode = "警備" if server=="1281" else "奪取"
-            txt = f"{mode} {server}-{place}-{t}"
-            dt = datetime.combine(now_jst().date(), datetime.strptime(t,"%H:%M:%S").time(), tzinfo=JST)
-            if txt not in pending_places:
-                pending_places[txt]=(dt,txt,server,now_jst())
-                await message.channel.send(f"✅手動登録:{txt}")
-                if channel:
-                    asyncio.create_task(handle_new_event(dt,txt,channel))
-                    if txt.startswith("奪取"):
-                        asyncio.create_task(schedule_notification(dt,txt,channel))
-        return
-
-    # === OCR画像 ===
+    # === OCR画像処理 ===
     if message.attachments:
         processing = await message.channel.send("🔄解析中…")
+        new_results = []
         for a in message.attachments:
             b = await a.read()
             img = Image.open(io.BytesIO(b)).convert("RGB")
@@ -267,15 +233,20 @@ async def on_message(message):
             for dt,txt in parsed:
                 if txt not in pending_places:
                     pending_places[txt]=(dt,txt,"",now_jst())
+                    new_results.append(txt)
                     if channel:
                         asyncio.create_task(handle_new_event(dt,txt,channel))
                         if txt.startswith("奪取"):
                             asyncio.create_task(schedule_notification(dt,txt,channel))
         cleanup_old_entries()
-        await processing.edit(content="✅OCR処理完了")
+        if new_results:
+            reply = "✅ OCR読み取り完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results])
+        else:
+            reply = "⚠️ OCR処理完了しましたが、新しい予定は見つかりませんでした。"
+        await processing.edit(content=reply)
 
 # =======================
-#  BOT起動
+#  起動
 # =======================
 if __name__=="__main__":
     client.run(TOKEN)
