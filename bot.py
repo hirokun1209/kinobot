@@ -39,6 +39,7 @@ ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 #  通知管理
 # =======================
 pending_places = {}  # key: txt, value: (解除予定時刻, テキスト, サーバー番号, 登録時刻)
+already_notified_summary = set()  # 30分前まとめ通知済み
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
 summary_task = None  # 30分前まとめ通知タスク
@@ -55,6 +56,8 @@ def cleanup_old_entries():
     now = now_jst()
     expired_keys = [k for k, v in pending_places.items() if (now - v[3]) > timedelta(hours=6)]
     for k in expired_keys:
+        if k in already_notified_summary:
+            already_notified_summary.remove(k)
         del pending_places[k]
 
 def add_time(base_time_str: str, duration_str: str):
@@ -153,42 +156,45 @@ async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: 
             await notify_channel.send(f"⏰ {text} **15秒前です！！**")
 
 # =======================
-#  30分前まとめ通知管理
+#  30分前まとめ通知管理 (ループ防止版)
 # =======================
 async def schedule_30min_summary(notify_channel: discord.TextChannel, target_dt: datetime):
-    """未来の一番早い予定の30分前にまとめ通知"""
     now = now_jst()
-    notify_time = target_dt - timedelta(minutes=30)
-    wait_sec = (notify_time - now).total_seconds()
+    wait_sec = (target_dt - timedelta(minutes=30) - now).total_seconds()
     if wait_sec < 0:
-        wait_sec = 0  # 30分未満なら即送る
+        wait_sec = 0
 
     await asyncio.sleep(wait_sec)
 
     now2 = now_jst()
-    future_events = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt > now2]
+    # ✅ まだ通知してない予定だけ拾う
+    future_events = [(dt, txt) for dt, txt, _, _ in pending_places.values()
+                     if dt > now2 and txt not in already_notified_summary]
     future_events.sort(key=lambda x: x[0])
 
     if not future_events:
         return
 
-    # 最短予定の残り時間を計算
+    # 最短イベントとの差分
     earliest_dt = future_events[0][0]
-    remain_minutes = int((earliest_dt - now2).total_seconds() // 60)
+    diff_minutes = int((earliest_dt - now2).total_seconds() // 60)
 
     lines = ["⏰ スケジュールのお知らせ📢", ""]
     lines += [txt for _, txt in future_events]
     lines.append("")
-
-    if remain_minutes < 30:
-        lines.append(f"⚠️ {remain_minutes}分後に始まるよ⚠️")
+    if diff_minutes < 30:
+        lines.append(f"⚠️ {diff_minutes}分後に始まるよ⚠️")
     else:
         lines.append("⚠️ 30分後に始まるよ⚠️")
 
     msg = "\n".join(lines)
     await notify_channel.send(msg)
 
-    # 通知後、まだ予定が残っていれば次をセット
+    # ✅ 通知済みに登録して、次回除外
+    for _, txt in future_events:
+        already_notified_summary.add(txt)
+
+    # ✅ 残ってる未来予定があれば再スケジュール
     update_30min_summary_schedule(notify_channel)
 
 def update_30min_summary_schedule(notify_channel: discord.TextChannel):
@@ -196,8 +202,11 @@ def update_30min_summary_schedule(notify_channel: discord.TextChannel):
     global summary_task
 
     now = now_jst()
-    future_events = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt > now]
+    # ✅ まだ通知してない未来予定だけ
+    future_events = [(dt, txt) for dt, txt, _, _ in pending_places.values()
+                     if dt > now and txt not in already_notified_summary]
     if not future_events:
+        # 未来予定がない → タスク停止
         if summary_task and not summary_task.done():
             summary_task.cancel()
         summary_task = None
@@ -231,7 +240,7 @@ async def on_message(message):
         m = re.match(r"!([0-9]{3,4})-([0-9]+)-([0-9]{2}:\d{2}:\d{2})", message.content)
         if m:
             server_num, place_num, unlock_time = m.groups()
-            if len(server_num) == 3:  # 3桁なら先頭に1を補正
+            if len(server_num) == 3:  # 3桁なら補正
                 server_num = "1" + server_num
             mode = "警備" if server_num == "1281" else "奪取"
             txt = f"{mode} {server_num}-{place_num}-{unlock_time}"
@@ -247,11 +256,11 @@ async def on_message(message):
                 update_30min_summary_schedule(notify_channel)
             return
 
-    # ==== 手動追加 (例: 281-1-12:34:56 や 1281-3-09:50:00) ====
+    # ==== 手動追加 (281-1-12:34:56 など) ====
     manual_matches = re.findall(r"(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})", message.content)
     if manual_matches:
         for server_num, place_num, unlock_time in manual_matches:
-            if len(server_num) == 3:  # 3桁なら先頭に1補正
+            if len(server_num) == 3:
                 server_num = "1" + server_num
 
             mode = "警備" if server_num == "1281" else "奪取"
@@ -263,8 +272,9 @@ async def on_message(message):
             if txt not in pending_places:
                 pending_places[txt] = (unlock_dt, txt, server_num, now_jst())
                 await message.channel.send(f"✅ 手動登録: {txt}")
-                if notify_channel and txt.startswith("奪取"):
-                    asyncio.create_task(schedule_notification(unlock_dt, txt, notify_channel))
+                if notify_channel:
+                    if txt.startswith("奪取"):
+                        asyncio.create_task(schedule_notification(unlock_dt, txt, notify_channel))
 
         if notify_channel:
             update_30min_summary_schedule(notify_channel)
