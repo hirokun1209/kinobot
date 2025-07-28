@@ -147,9 +147,10 @@ async def schedule_block_summary(block, channel):
             try:
                 await block["msg"].edit(content=format_block_msg(block, False))
             except discord.NotFound:
-                pass  # メッセージが削除されていた場合は無視
+                pass
     except Exception as e:
         print(f"[ERROR] schedule_block_summary failed: {e}")
+
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
     if (dt, txt) not in block["events"]:
@@ -173,14 +174,12 @@ def is_within_5_minutes_of_another(target_dt):
 async def schedule_notification(unlock_dt, text, channel):
     if unlock_dt <= now_jst(): return
     if text.startswith("奪取") and not (SKIP_NOTIFY_START <= unlock_dt.hour < SKIP_NOTIFY_END):
-        # 2分前通知（5分以内に別の予定がなければ）
         if not is_within_5_minutes_of_another(unlock_dt):
             t = unlock_dt - timedelta(minutes=2)
             if t > now_jst() and (text, "2min") not in sent_notifications:
                 sent_notifications.add((text, "2min"))
                 await asyncio.sleep((t - now_jst()).total_seconds())
                 await channel.send(f"⏰ {text} **2分前です！！**")
-        # 15秒前通知（常に送信）
         t15 = unlock_dt - timedelta(seconds=15)
         if t15 > now_jst() and (text, "15s") not in sent_notifications:
             sent_notifications.add((text, "15s"))
@@ -188,7 +187,31 @@ async def schedule_notification(unlock_dt, text, channel):
             await channel.send(f"⏰ {text} **15秒前です！！**")
 
 # =======================
-# リセット処理
+# 自動リセット処理（毎日02:00）
+# =======================
+async def daily_reset_task():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        now = now_jst()
+        next_reset = datetime.combine(now.date(), datetime.strptime("02:00:00", "%H:%M:%S").time(), tzinfo=JST)
+        if now >= next_reset:
+            next_reset += timedelta(days=1)
+        await asyncio.sleep((next_reset - now).total_seconds())
+
+        # リセット処理
+        pending_places.clear()
+        summary_blocks.clear()
+        sent_notifications.clear()
+        for task in list(active_tasks):
+            task.cancel()
+        active_tasks.clear()
+
+        channel = client.get_channel(NOTIFY_CHANNEL_ID)
+        if channel:
+            await channel.send("🕑 自動日次リセットを実行しました")
+
+# =======================
+# コマンドベースのリセット
 # =======================
 async def reset_all(message):
     pending_places.clear()
@@ -207,6 +230,7 @@ async def on_ready():
     print("✅ ログイン成功！")
     print(f"📌 通知チャンネル: {NOTIFY_CHANNEL_ID}")
     print(f"📌 読み取り許可チャンネル: {READABLE_CHANNEL_IDS}")
+    asyncio.create_task(daily_reset_task())  # ✅ 自動リセットスケジューラー起動
 
 @client.event
 async def on_message(message):
