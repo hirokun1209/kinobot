@@ -6,8 +6,13 @@ import re
 import asyncio
 import numpy as np
 from paddleocr import PaddleOCR
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from PIL import Image
+
+# =======================
+#  タイムゾーン設定
+# =======================
+JST = timezone(timedelta(hours=9))  # 日本標準時
 
 # =======================
 #  BOT設定
@@ -33,8 +38,7 @@ ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 # =======================
 #  通知管理 (登録時刻も保存)
 # =======================
-# key: txt, value: (解除予定時刻, テキスト, サーバー番号, 登録時刻)
-pending_places = {}
+pending_places = {}  # key: txt, value: (解除予定時刻, テキスト, サーバー番号, 登録時刻)
 
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
@@ -42,16 +46,23 @@ SKIP_NOTIFY_END = 14
 # =======================
 #  ユーティリティ
 # =======================
+def now_jst():
+    """常にJSTの現在時刻を取得"""
+    return datetime.now(JST)
+
 def cleanup_old_entries():
     """6時間以上経過した古いデータを削除"""
-    now = datetime.now()
+    now = now_jst()
     expired_keys = [k for k, v in pending_places.items() if (now - v[3]) > timedelta(hours=6)]
     for k in expired_keys:
         del pending_places[k]
 
 def add_time(base_time_str: str, duration_str: str):
     try:
-        base_time = datetime.strptime(base_time_str, "%H:%M:%S")
+        # 基準時間もJSTとして扱う
+        today = now_jst().date()
+        base_time_only = datetime.strptime(base_time_str, "%H:%M:%S").time()
+        base_time = datetime.combine(today, base_time_only, tzinfo=JST)
     except ValueError:
         return None, None
 
@@ -131,11 +142,11 @@ def should_skip_notification(dt: datetime):
     return SKIP_NOTIFY_START <= dt.hour < SKIP_NOTIFY_END
 
 # =======================
-#  デバッグ付き通知スケジューラー
+#  デバッグ付き通知スケジューラー (JST)
 # =======================
 async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: discord.TextChannel, debug=False):
-    now = datetime.now()
-    log_msg = f"[DEBUG] schedule_notification開始: {text}, unlock_dt={unlock_dt.strftime('%H:%M:%S')}, now={now.strftime('%H:%M:%S')}"
+    now = now_jst()
+    log_msg = f"[DEBUG] schedule_notification開始(JST): {text}, unlock_dt={unlock_dt.strftime('%H:%M:%S')}, now={now.strftime('%H:%M:%S')}"
     print(log_msg)
     if notify_channel:
         await notify_channel.send(log_msg)
@@ -173,7 +184,7 @@ async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: 
                 await notify_channel.send(msg)
 
         # 15秒前通知
-        now2 = datetime.now()
+        now2 = now_jst()
         if notify_time_15sec > now2:
             wait_sec = (notify_time_15sec - now2).total_seconds()
             dbg2 = f"[DEBUG] 15秒前通知まで {wait_sec:.1f}秒待機予定"
@@ -221,20 +232,21 @@ async def on_message(message):
             server_num, place_num, unlock_time = m.groups()
             mode = "警備" if server_num == "1281" else "奪取"
             txt = f"{mode} {server_num}-{place_num}-{unlock_time}"
-            dt = datetime.strptime(unlock_time, "%H:%M:%S")
+
+            # 今日の日付のJSTに変換
+            today = now_jst().date()
+            unlock_dt = datetime.combine(today, datetime.strptime(unlock_time, "%H:%M:%S").time(), tzinfo=JST)
 
             # ✅ pending_places に登録
-            pending_places[txt] = (dt, txt, server_num, datetime.now())
+            pending_places[txt] = (unlock_dt, txt, server_num, now_jst())
 
-            # ✅ デバッグ登録メッセージ
-            dbg = f"[DEBUG] デバッグ登録: {txt} (now={datetime.now().strftime('%H:%M:%S')})"
+            dbg = f"[DEBUG] デバッグ登録(JST): {txt} (now={now_jst().strftime('%H:%M:%S')})"
             print(dbg)
             await message.channel.send(f"✅ {dbg}")
 
-            # ✅ 通知チャンネルにも同じ内容を送る
             if notify_channel:
                 await notify_channel.send(f"✅ {dbg}")
-                asyncio.create_task(schedule_notification(dt, txt, notify_channel, debug=True))
+                asyncio.create_task(schedule_notification(unlock_dt, txt, notify_channel, debug=True))
             return
 
     # ==== 画像が送られた場合 ====
@@ -255,19 +267,19 @@ async def on_message(message):
 
             for dt, txt, server in parsed_results:
                 if txt not in pending_places:
-                    pending_places[txt] = (dt, txt, server, datetime.now())
+                    pending_places[txt] = (dt, txt, server, now_jst())
                     if txt.startswith("奪取") and notify_channel:
                         asyncio.create_task(schedule_notification(dt, txt, notify_channel))
 
             for txt in no_time_places:
                 if txt not in pending_places:
-                    pending_places[txt] = (datetime.min, txt, "", datetime.now())
+                    pending_places[txt] = (datetime.min.replace(tzinfo=JST), txt, "", now_jst())
 
         cleanup_old_entries()
 
-        opened = [txt for dt, txt, _, _ in pending_places.values() if dt == datetime.min]
-        takes = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt != datetime.min and txt.startswith("奪取")]
-        guards = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt != datetime.min and txt.startswith("警備")]
+        opened = [txt for dt, txt, _, _ in pending_places.values() if dt == datetime.min.replace(tzinfo=JST)]
+        takes = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt != datetime.min.replace(tzinfo=JST) and txt.startswith("奪取")]
+        guards = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt != datetime.min.replace(tzinfo=JST) and txt.startswith("警備")]
 
         takes.sort(key=lambda x: x[0])
         guards.sort(key=lambda x: x[0])
