@@ -34,10 +34,11 @@ client = discord.Client(intents=intents)
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
 # =======================
-# 管理用構造
+# 管理構造
 # =======================
 pending_places = {}
 summary_blocks = []
+active_tasks = set()
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
 
@@ -110,7 +111,7 @@ def parse_multiple_places(center_texts, top_time_texts):
     return res
 
 # =======================
-# ブロック処理
+# ブロック・通知処理
 # =======================
 def find_or_create_block(new_dt):
     for block in summary_blocks:
@@ -146,18 +147,18 @@ async def handle_new_event(dt, txt, channel):
     if block["msg"]:
         await block["msg"].edit(content=format_block_msg(block, True))
     else:
-        asyncio.create_task(schedule_block_summary(block, channel))
+        task = asyncio.create_task(schedule_block_summary(block, channel))
+        active_tasks.add(task)
+        task.add_done_callback(lambda t: active_tasks.discard(t))
 
-# =======================
-# 通知処理（2分/15秒前）
-# =======================
 async def schedule_notification(unlock_dt, text, channel):
     if unlock_dt <= now_jst(): return
     if text.startswith("奪取") and not (SKIP_NOTIFY_START <= unlock_dt.hour < SKIP_NOTIFY_END):
         for offset, label in [(2, "2分前です！！"), (0.25, "15秒前です！！")]:
             t = unlock_dt - timedelta(minutes=offset)
             if t > now_jst():
-                await asyncio.sleep((t - now_jst()).total_seconds())
+                delay = (t - now_jst()).total_seconds()
+                await asyncio.sleep(delay)
                 await channel.send(f"⏰ {text} **{label}**")
 
 # =======================
@@ -166,13 +167,13 @@ async def schedule_notification(unlock_dt, text, channel):
 async def reset_all(message):
     pending_places.clear()
     summary_blocks.clear()
-    for task in list(asyncio.all_tasks()):
-        if task is not asyncio.current_task():
-            task.cancel()
+    for task in list(active_tasks):
+        task.cancel()
+    active_tasks.clear()
     await message.channel.send("✅ 全ての予定と通知をリセットしました")
 
 # =======================
-# Discordイベント処理
+# Discordイベント
 # =======================
 @client.event
 async def on_ready():
@@ -201,7 +202,6 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
-    # ✅ 手動登録（例: 1234-7-12:34:56）
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
         for server, place, t in manual:
@@ -213,12 +213,15 @@ async def on_message(message):
             if txt not in pending_places:
                 pending_places[txt] = (dt, txt, server, now_jst())
                 await message.channel.send(f"✅手動登録:{txt}")
-                asyncio.create_task(handle_new_event(dt, txt, channel))
+                task = asyncio.create_task(handle_new_event(dt, txt, channel))
+                active_tasks.add(task)
+                task.add_done_callback(lambda t: active_tasks.discard(t))
                 if txt.startswith("奪取"):
-                    asyncio.create_task(schedule_notification(dt, txt, channel))
+                    task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
+                    active_tasks.add(task2)
+                    task2.add_done_callback(lambda t: active_tasks.discard(t))
         return
 
-    # ✅ OCR画像処理
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
         new_results = []
@@ -235,9 +238,13 @@ async def on_message(message):
                 if txt not in pending_places:
                     pending_places[txt] = (dt, txt, "", now_jst())
                     new_results.append(txt)
-                    asyncio.create_task(handle_new_event(dt, txt, channel))
+                    task = asyncio.create_task(handle_new_event(dt, txt, channel))
+                    active_tasks.add(task)
+                    task.add_done_callback(lambda t: active_tasks.discard(t))
                     if txt.startswith("奪取"):
-                        asyncio.create_task(schedule_notification(dt, txt, channel))
+                        task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
+                        active_tasks.add(task2)
+                        task2.add_done_callback(lambda t: active_tasks.discard(t))
         await status.edit(content=(
             "✅ OCR読み取り完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results])
             if new_results else "⚠️ OCR処理完了しましたが、新しい予定は見つかりませんでした。"
