@@ -132,18 +132,24 @@ def format_block_msg(block, with_footer=True):
     return "\n".join(lines)
 
 async def schedule_block_summary(block, channel):
-    await asyncio.sleep(max(0, (block["min"] - timedelta(minutes=30) - now_jst()).total_seconds()))
-    if not block["msg"]:
-        block["msg"] = await channel.send(format_block_msg(block, True))
-    else:
-        await block["msg"].edit(content=format_block_msg(block, True))
-    await asyncio.sleep(max(0, (block["min"] - now_jst()).total_seconds()))
-    if block["msg"]:
-        await block["msg"].edit(content=format_block_msg(block, False))
+    try:
+        await asyncio.sleep(max(0, (block["min"] - timedelta(minutes=30) - now_jst()).total_seconds()))
+        if not block["msg"]:
+            block["msg"] = await channel.send(format_block_msg(block, True))
+        else:
+            try:
+                await block["msg"].edit(content=format_block_msg(block, True))
+            except discord.NotFound:
+                block["msg"] = await channel.send(format_block_msg(block, True))
 
-# 重複編集防止用フラグ
-edit_pending = {}
-
+        await asyncio.sleep(max(0, (block["min"] - now_jst()).total_seconds()))
+        if block["msg"]:
+            try:
+                await block["msg"].edit(content=format_block_msg(block, False))
+            except discord.NotFound:
+                pass  # メッセージが削除されていた場合は無視
+    except Exception as e:
+        print(f"[ERROR] schedule_block_summary failed: {e}")
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
     if (dt, txt) not in block["events"]:
