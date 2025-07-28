@@ -1,4 +1,4 @@
-# OCR BOT（スケジュール通知付き＋奪取35分前通知付き）
+# OCR BOT（スケジュール通知付き）
 import os
 import discord
 import io
@@ -20,7 +20,6 @@ JST = timezone(timedelta(hours=9))
 # =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
-DASSHU_CHANNEL_ID = int(os.getenv("DASSHU_CHANNEL_ID", "0"))
 READABLE_CHANNEL_IDS = [int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip().isdigit()]
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
@@ -110,7 +109,8 @@ def parse_multiple_places(center_texts, top_time_texts):
                 res.append((dt, f"{mode} {server}-{current}-{unlock}"))
             current = None
     return res
-    # =======================
+
+# =======================
 # ブロック・通知処理
 # =======================
 def find_or_create_block(new_dt):
@@ -139,19 +139,6 @@ async def schedule_block_summary(block, channel):
     if block["msg"]:
         await block["msg"].edit(content=format_block_msg(block, False))
 
-def is_within_5_minutes_of_another(target_dt):
-    times = sorted([v[0] for v in pending_places.values()])
-    for dt in times:
-        if dt != target_dt and abs((dt - target_dt).total_seconds()) <= 300:
-            return True
-    return False
-
-async def notify_dasshu_35min_before(dt, txt, dasshu_channel):
-    notify_time = dt - timedelta(minutes=35)
-    if notify_time > now_jst():
-        await asyncio.sleep((notify_time - now_jst()).total_seconds())
-    await dasshu_channel.send(f"🔴 {txt} **（35分前通知）**")
-
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
     block["events"].append((dt, txt))
@@ -164,12 +151,12 @@ async def handle_new_event(dt, txt, channel):
         active_tasks.add(task)
         task.add_done_callback(lambda t: active_tasks.discard(t))
 
-    # 奪取 → DASSHU_CHANNELに35分前個別通知
-    if txt.startswith("奪取"):
-        dasshu_channel = client.get_channel(DASSHU_CHANNEL_ID)
-        task = asyncio.create_task(notify_dasshu_35min_before(dt, txt, dasshu_channel))
-        active_tasks.add(task)
-        task.add_done_callback(lambda t: active_tasks.discard(t))
+def is_within_5_minutes_of_another(target_dt):
+    times = sorted([v[0] for v in pending_places.values()])
+    for dt in times:
+        if dt != target_dt and abs((dt - target_dt).total_seconds()) <= 300:
+            return True
+    return False
 
 async def schedule_notification(unlock_dt, text, channel):
     if unlock_dt <= now_jst(): return
@@ -205,7 +192,6 @@ async def on_ready():
     print("✅ ログイン成功！")
     print(f"📌 通知チャンネル: {NOTIFY_CHANNEL_ID}")
     print(f"📌 読み取り許可チャンネル: {READABLE_CHANNEL_IDS}")
-    print(f"📌 奪取チャンネル: {DASSHU_CHANNEL_ID}")
 
 @client.event
 async def on_message(message):
@@ -228,7 +214,7 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
-    # ✅ 手動登録（例: 1234-7-12:34:56）
+    # ✅ 手動登録
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
         for server, place, t in manual:
