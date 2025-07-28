@@ -124,7 +124,8 @@ def find_or_create_block(new_dt):
 
 def format_block_msg(block, with_footer=True):
     lines = ["⏰ スケジュールのお知らせ📢", ""]
-    lines += [f"{txt}  " for _, txt in sorted(block["events"], key=lambda x: x[0])]
+    unique_events = sorted(set(block["events"]), key=lambda x: x[0])
+    lines += [f"{txt}  " for _, txt in unique_events]
     if with_footer:
         diff = int((block["min"] - now_jst()).total_seconds() // 60)
         lines += ["", f"⚠️ {diff}分後に始まるよ⚠️" if diff < 30 else "⚠️ 30分後に始まるよ⚠️"]
@@ -140,30 +141,13 @@ async def schedule_block_summary(block, channel):
     if block["msg"]:
         await block["msg"].edit(content=format_block_msg(block, False))
 
-
-# グローバルで編集待ちフラグを管理
+# 重複編集防止用フラグ
 edit_pending = {}
 
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
-    block["events"].append((dt, txt))
-    block["min"] = min(block["min"], dt)
-    block["max"] = max(block["max"], dt)
-
-    block_id = id(block)
-    if block["msg"]:
-        # 重複編集防止
-        if block_id not in edit_pending:
-            edit_pending[block_id] = True
-            await asyncio.sleep(2)  # 連続編集防止のため遅延
-            await block["msg"].edit(content=format_block_msg(block, True))
-            del edit_pending[block_id]
-    else:
-        task = asyncio.create_task(schedule_block_summary(block, channel))
-        active_tasks.add(task)
-        task.add_done_callback(lambda t: active_tasks.discard(t))
-
-    block["events"].append((dt, txt))
+    if (dt, txt) not in block["events"]:
+        block["events"].append((dt, txt))
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
     if block["msg"]:
