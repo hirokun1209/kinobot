@@ -36,50 +36,24 @@ client = discord.Client(intents=intents)
 ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 
 # =======================
-#  通知管理
+#  通知ブロック管理
 # =======================
 pending_places = {}  # key: txt, value: (解除予定時刻, テキスト, サーバー番号, 登録時刻)
-already_notified_summary = set()  # 30分前まとめ通知済み
+summary_blocks = []  # [{ "events": [(dt, txt)], "min": dt, "max": dt, "msg": discord.Message or None }]
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
-summary_task = None  # 30分前まとめ通知タスク
 
 # =======================
 #  JSTユーティリティ
 # =======================
 def now_jst():
-    """常にJSTの現在時刻を取得"""
     return datetime.now(JST)
 
 def cleanup_old_entries():
-    """6時間以上経過した古いデータを削除"""
     now = now_jst()
-    expired_keys = [k for k, v in pending_places.items() if (now - v[3]) > timedelta(hours=6)]
-    for k in expired_keys:
-        if k in already_notified_summary:
-            already_notified_summary.remove(k)
+    expired = [k for k,v in pending_places.items() if (now - v[3]) > timedelta(hours=6)]
+    for k in expired:
         del pending_places[k]
-
-def add_time(base_time_str: str, duration_str: str):
-    try:
-        today = now_jst().date()
-        base_time_only = datetime.strptime(base_time_str, "%H:%M:%S").time()
-        base_time = datetime.combine(today, base_time_only, tzinfo=JST)
-    except ValueError:
-        return None, None
-
-    parts = duration_str.strip().split(":")
-    if len(parts) == 3:
-        h, m, s = map(int, parts)
-    elif len(parts) == 2:
-        h = 0
-        m, s = map(int, parts)
-    else:
-        return None, None
-
-    delta = timedelta(hours=h, minutes=m, seconds=s)
-    unlock_dt = base_time + delta
-    return unlock_dt, unlock_dt.strftime("%H:%M:%S")
 
 def crop_top_right(img: np.ndarray) -> np.ndarray:
     h, w, _ = img.shape
@@ -95,238 +69,180 @@ def extract_text_from_image(img: np.ndarray):
 
 def extract_server_number(center_texts):
     for t in center_texts:
-        match = re.search(r"[sS]\d{3,4}", t)
+        match = re.search(r"[sS](\d{3,4})", t)
         if match:
-            return match.group(0).lower().replace("s", "")
+            return match.group(1)
     return None
 
+def add_time(base_time_str, duration_str):
+    today = now_jst().date()
+    try:
+        base_time_only = datetime.strptime(base_time_str, "%H:%M:%S").time()
+    except ValueError:
+        return None, None
+    base_time = datetime.combine(today, base_time_only, tzinfo=JST)
+
+    parts = duration_str.split(":")
+    if len(parts)==3: h,m,s = map(int,parts)
+    elif len(parts)==2: h=0; m,s=map(int,parts)
+    else: return None,None
+
+    dt = base_time + timedelta(hours=h, minutes=m, seconds=s)
+    return dt, dt.strftime("%H:%M:%S")
+
 def parse_multiple_places(center_texts, top_time_texts):
-    results, debug_lines = [], []
-
+    res=[]
     top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
-    if not top_time:
-        return [], []
-
-    server_num = extract_server_number(center_texts)
-    if not server_num:
-        return [], []
-
-    mode = "警備" if server_num == "1281" else "奪取"
-    debug_lines.append(f"📌 サーバー番号: {server_num} ({mode})")
-    debug_lines.append(f"📌 右上基準時間: {top_time}\n")
-
-    current_place = None
+    if not top_time: return []
+    server = extract_server_number(center_texts)
+    if not server: return []
+    mode = "警備" if server=="1281" else "奪取"
+    current=None
     for t in center_texts:
-        place_match = re.search(r"越域駐騎場(\d+)", t)
-        if place_match:
-            current_place = place_match.group(1)
-
-        duration_match = re.search(r"免戦中(\d{1,2}:\d{2}(?::\d{2})?)", t)
-        if duration_match and current_place:
-            duration = duration_match.group(1)
-            unlock_dt, unlock_time = add_time(top_time, duration)
-            if unlock_dt:
-                results.append((unlock_dt, f"{mode} {server_num}-{current_place}-{unlock_time}", server_num))
-            current_place = None
-
-    return results, debug_lines
-
-def should_skip_notification(dt: datetime):
-    return SKIP_NOTIFY_START <= dt.hour < SKIP_NOTIFY_END
+        place_match = re.search(r"越域駐騎場(\d+)",t)
+        if place_match: current = place_match.group(1)
+        duration_match = re.search(r"免戦中(\d{1,2}:\d{2}(?::\d{2})?)",t)
+        if duration_match and current:
+            dt, unlock = add_time(top_time,duration_match.group(1))
+            if dt: res.append((dt,f"{mode} {server}-{current}-{unlock}"))
+            current=None
+    return res
 
 # =======================
-#  個別通知スケジューラー (JST)
+#  ブロック管理ロジック
 # =======================
-async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: discord.TextChannel, debug=False):
-    now = now_jst()
-    if unlock_dt <= now:
-        return
+def find_or_create_block(new_dt):
+    """45分以内なら既存ブロック、超えたら新規"""
+    for block in summary_blocks:
+        if new_dt <= block["max"] + timedelta(minutes=45):
+            return block
+    # 新規
+    b={"events":[],"min":new_dt,"max":new_dt,"msg":None}
+    summary_blocks.append(b)
+    return b
 
-    if text.startswith("奪取") and (debug or not should_skip_notification(unlock_dt)):
-        notify_time_2min = unlock_dt - timedelta(minutes=2)
-        notify_time_15sec = unlock_dt - timedelta(seconds=15)
-
-        if notify_time_2min > now:
-            await asyncio.sleep((notify_time_2min - now).total_seconds())
-            await notify_channel.send(f"⏰ {text} **2分前です！！**")
-
-        now2 = now_jst()
-        if notify_time_15sec > now2:
-            await asyncio.sleep((notify_time_15sec - now2).total_seconds())
-            await notify_channel.send(f"⏰ {text} **15秒前です！！**")
-
-# =======================
-#  30分前まとめ通知管理 (ループ防止版)
-# =======================
-async def schedule_30min_summary(notify_channel: discord.TextChannel, target_dt: datetime):
-    now = now_jst()
-    wait_sec = (target_dt - timedelta(minutes=30) - now).total_seconds()
-    if wait_sec < 0:
-        wait_sec = 0
-
-    await asyncio.sleep(wait_sec)
-
-    now2 = now_jst()
-    # ✅ まだ通知してない予定だけ拾う
-    future_events = [(dt, txt) for dt, txt, _, _ in pending_places.values()
-                     if dt > now2 and txt not in already_notified_summary]
-    future_events.sort(key=lambda x: x[0])
-
-    if not future_events:
-        return
-
-    # 最短イベントとの差分
-    earliest_dt = future_events[0][0]
-    diff_minutes = int((earliest_dt - now2).total_seconds() // 60)
-
-    lines = ["⏰ スケジュールのお知らせ📢", ""]
-    lines += [txt for _, txt in future_events]
+def format_block_msg(block):
+    lines=["⏰ スケジュールのお知らせ📢",""]
+    events=sorted(block["events"],key=lambda x:x[0])
+    lines += [txt+"  " for _,txt in events]
     lines.append("")
-    if diff_minutes < 30:
-        lines.append(f"⚠️ {diff_minutes}分後に始まるよ⚠️")
+    diff=int((block["min"]-now_jst()).total_seconds()//60)
+    if diff<30:
+        lines.append(f"⚠️ {diff}分後に始まるよ⚠️")
     else:
         lines.append("⚠️ 30分後に始まるよ⚠️")
+    return "\n".join(lines)
 
-    msg = "\n".join(lines)
-    await notify_channel.send(msg)
+async def schedule_block_summary(block,channel):
+    # wait until min_time -30min
+    wait_sec=(block["min"]-timedelta(minutes=30)-now_jst()).total_seconds()
+    if wait_sec<0: wait_sec=0
+    await asyncio.sleep(wait_sec)
+    # 送信または編集
+    if not block["msg"]:
+        msg_txt=format_block_msg(block)
+        block["msg"]=await channel.send(msg_txt)
+    else:
+        await block["msg"].edit(content=format_block_msg(block))
 
-    # ✅ 通知済みに登録して、次回除外
-    for _, txt in future_events:
-        already_notified_summary.add(txt)
+async def handle_new_event(dt,txt,channel):
+    block=find_or_create_block(dt)
+    block["events"].append((dt,txt))
+    block["min"]=min(block["min"],dt)
+    block["max"]=max(block["max"],dt)
 
-    # ✅ 残ってる未来予定があれば再スケジュール
-    update_30min_summary_schedule(notify_channel)
-
-def update_30min_summary_schedule(notify_channel: discord.TextChannel):
-    """未来予定があるなら30分前まとめ通知をセットする"""
-    global summary_task
-
-    now = now_jst()
-    # ✅ まだ通知してない未来予定だけ
-    future_events = [(dt, txt) for dt, txt, _, _ in pending_places.values()
-                     if dt > now and txt not in already_notified_summary]
-    if not future_events:
-        # 未来予定がない → タスク停止
-        if summary_task and not summary_task.done():
-            summary_task.cancel()
-        summary_task = None
-        return
-
-    earliest_dt = min(dt for dt, _ in future_events)
-
-    if summary_task and not summary_task.done():
-        summary_task.cancel()
-
-    loop = asyncio.get_event_loop()
-    summary_task = loop.create_task(schedule_30min_summary(notify_channel, earliest_dt))
+    # 通知前ならスケジュールセット
+    if dt>=block["min"]:
+        if block["msg"]:
+            # すでに通知済み→編集で追加
+            await block["msg"].edit(content=format_block_msg(block))
+        else:
+            # 最小時間30分前通知タスク
+            asyncio.create_task(schedule_block_summary(block,channel))
 
 # =======================
-#  イベント
+#  通知 (個別2分前/15秒前)
+# =======================
+async def schedule_notification(unlock_dt,text,channel):
+    now=now_jst()
+    if unlock_dt<=now: return
+    if text.startswith("奪取") and not (SKIP_NOTIFY_START<=unlock_dt.hour<SKIP_NOTIFY_END):
+        n2=unlock_dt - timedelta(minutes=2)
+        n15=unlock_dt - timedelta(seconds=15)
+        if n2>now:
+            await asyncio.sleep((n2-now).total_seconds())
+            await channel.send(f"⏰ {text} **2分前です！！**")
+        if n15>now_jst():
+            await asyncio.sleep((n15-now_jst()).total_seconds())
+            await channel.send(f"⏰ {text} **15秒前です！！**")
+
+# =======================
+#  イベント処理
 # =======================
 @client.event
 async def on_ready():
-    print(f"✅ ログイン成功！Bot名: {client.user}")
+    print("✅ ログイン成功！")
 
 @client.event
 async def on_message(message):
-    if message.author.bot:
-        return
-
+    if message.author.bot: return
     cleanup_old_entries()
-    notify_channel = client.get_channel(NOTIFY_CHANNEL_ID) if NOTIFY_CHANNEL_ID else None
+    channel=client.get_channel(NOTIFY_CHANNEL_ID) if NOTIFY_CHANNEL_ID else None
 
-    # ==== デバッグ用 "!1234-7-12:34:56" ====
+    # デバッグ "!1234-7-12:34:56"
     if message.content.startswith("!"):
-        m = re.match(r"!([0-9]{3,4})-([0-9]+)-([0-9]{2}:\d{2}:\d{2})", message.content)
+        m=re.match(r"!([0-9]{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})",message.content)
         if m:
-            server_num, place_num, unlock_time = m.groups()
-            if len(server_num) == 3:  # 3桁なら補正
-                server_num = "1" + server_num
-            mode = "警備" if server_num == "1281" else "奪取"
-            txt = f"{mode} {server_num}-{place_num}-{unlock_time}"
-
-            today = now_jst().date()
-            unlock_dt = datetime.combine(today, datetime.strptime(unlock_time, "%H:%M:%S").time(), tzinfo=JST)
-
-            pending_places[txt] = (unlock_dt, txt, server_num, now_jst())
-            await message.channel.send(f"✅ デバッグ登録: {txt}")
-
-            if notify_channel:
-                asyncio.create_task(schedule_notification(unlock_dt, txt, notify_channel, debug=True))
-                update_30min_summary_schedule(notify_channel)
-            return
-
-    # ==== 手動追加 (281-1-12:34:56 など) ====
-    manual_matches = re.findall(r"(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})", message.content)
-    if manual_matches:
-        for server_num, place_num, unlock_time in manual_matches:
-            if len(server_num) == 3:
-                server_num = "1" + server_num
-
-            mode = "警備" if server_num == "1281" else "奪取"
-            txt = f"{mode} {server_num}-{place_num}-{unlock_time}"
-
-            today = now_jst().date()
-            unlock_dt = datetime.combine(today, datetime.strptime(unlock_time, "%H:%M:%S").time(), tzinfo=JST)
-
-            if txt not in pending_places:
-                pending_places[txt] = (unlock_dt, txt, server_num, now_jst())
-                await message.channel.send(f"✅ 手動登録: {txt}")
-                if notify_channel:
-                    if txt.startswith("奪取"):
-                        asyncio.create_task(schedule_notification(unlock_dt, txt, notify_channel))
-
-        if notify_channel:
-            update_30min_summary_schedule(notify_channel)
+            server,place,t=m.groups()
+            if len(server)==3: server="1"+server
+            mode="警備" if server=="1281" else "奪取"
+            txt=f"{mode} {server}-{place}-{t}"
+            dt=datetime.combine(now_jst().date(),datetime.strptime(t,"%H:%M:%S").time(),tzinfo=JST)
+            pending_places[txt]=(dt,txt,server,now_jst())
+            await message.channel.send(f"✅デバッグ登録:{txt}")
+            if channel:
+                asyncio.create_task(handle_new_event(dt,txt,channel))
+                asyncio.create_task(schedule_notification(dt,txt,channel))
         return
 
-    # ==== 画像が送られた場合 ====
+    # 手動 "281-1-12:34:56"
+    manual=re.findall(r"(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})",message.content)
+    if manual:
+        for server,place,t in manual:
+            if len(server)==3: server="1"+server
+            mode="警備" if server=="1281" else "奪取"
+            txt=f"{mode} {server}-{place}-{t}"
+            dt=datetime.combine(now_jst().date(),datetime.strptime(t,"%H:%M:%S").time(),tzinfo=JST)
+            if txt not in pending_places:
+                pending_places[txt]=(dt,txt,server,now_jst())
+                await message.channel.send(f"✅手動登録:{txt}")
+                if channel:
+                    asyncio.create_task(handle_new_event(dt,txt,channel))
+                    if txt.startswith("奪取"):
+                        asyncio.create_task(schedule_notification(dt,txt,channel))
+        return
+
+    # 画像OCR
     if message.attachments:
-        processing_msg = await message.channel.send("🔄 画像解析中…")
-
-        for attachment in message.attachments:
-            img_bytes = await attachment.read()
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-            top_img = crop_top_right(img_np)
-            center_img = crop_center_area(img_np)
-            top_texts = extract_text_from_image(top_img)
-            center_texts = extract_text_from_image(center_img)
-
-            parsed_results, _ = parse_multiple_places(center_texts, top_texts)
-
-            for dt, txt, server in parsed_results:
+        processing=await message.channel.send("🔄解析中…")
+        for a in message.attachments:
+            b=await a.read()
+            img=Image.open(io.BytesIO(b)).convert("RGB")
+            np_img=cv2.cvtColor(np.array(img),cv2.COLOR_RGB2BGR)
+            top=crop_top_right(np_img)
+            center=crop_center_area(np_img)
+            top_txts=extract_text_from_image(top)
+            center_txts=extract_text_from_image(center)
+            parsed=parse_multiple_places(center_txts,top_txts)
+            for dt,txt in parsed:
                 if txt not in pending_places:
-                    pending_places[txt] = (dt, txt, server, now_jst())
-                    if txt.startswith("奪取") and notify_channel:
-                        asyncio.create_task(schedule_notification(dt, txt, notify_channel))
-
+                    pending_places[txt]=(dt,txt,"",now_jst())
+                    if channel:
+                        asyncio.create_task(handle_new_event(dt,txt,channel))
+                        if txt.startswith("奪取"):
+                            asyncio.create_task(schedule_notification(dt,txt,channel))
         cleanup_old_entries()
+        await processing.edit(content="✅OCR処理完了")
 
-        takes = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt > now_jst() and txt.startswith("奪取")]
-        guards = [(dt, txt) for dt, txt, _, _ in pending_places.values() if dt > now_jst() and txt.startswith("警備")]
-
-        takes.sort(key=lambda x: x[0])
-        guards.sort(key=lambda x: x[0])
-
-        msg_lines = []
-        msg_lines.extend(txt for _, txt in takes)
-        msg_lines.extend(txt for _, txt in guards)
-
-        reply_msg = "\n".join(msg_lines) if msg_lines else "⚠️ 情報が見つかりませんでした"
-        await processing_msg.edit(content=reply_msg)
-
-        if notify_channel:
-            update_30min_summary_schedule(notify_channel)
-
-# =======================
-#  BOT起動
-# =======================
-if __name__ == "__main__":
-    try:
-        client.run(TOKEN)
-    except discord.errors.LoginFailure:
-        print("❌ Discord トークンが無効です！")
-    except Exception as e:
-        print(f"❌ 予期しないエラー: {e}")
+if __name__=="__main__":
+    client.run(TOKEN)
