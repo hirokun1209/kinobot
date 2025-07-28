@@ -96,7 +96,7 @@ def parse_multiple_places(center_texts, top_time_texts):
     server = extract_server_number(center_texts)
     if not top_time or not server:
         return []
-    mode = "警備" if server == "1281" else "奪取"
+    mode = "警備" if server == "1268" else "奪取"
     current = None
     for t in center_texts:
         p = re.search(r"越域駐騎場(\d+)", t)
