@@ -158,9 +158,10 @@ async def schedule_notification(unlock_dt: datetime, text: str, notify_channel: 
 async def schedule_30min_summary(notify_channel: discord.TextChannel, target_dt: datetime):
     """未来の一番早い予定の30分前にまとめ通知"""
     now = now_jst()
-    wait_sec = (target_dt - timedelta(minutes=30) - now).total_seconds()
+    notify_time = target_dt - timedelta(minutes=30)
+    wait_sec = (notify_time - now).total_seconds()
     if wait_sec < 0:
-        wait_sec = 0
+        wait_sec = 0  # 30分未満なら即送る
 
     await asyncio.sleep(wait_sec)
 
@@ -171,10 +172,18 @@ async def schedule_30min_summary(notify_channel: discord.TextChannel, target_dt:
     if not future_events:
         return
 
+    # 最短予定の残り時間を計算
+    earliest_dt = future_events[0][0]
+    remain_minutes = int((earliest_dt - now2).total_seconds() // 60)
+
     lines = ["⏰ スケジュールのお知らせ📢", ""]
     lines += [txt for _, txt in future_events]
     lines.append("")
-    lines.append("⚠️ 30分後に始まるよ⚠️")
+
+    if remain_minutes < 30:
+        lines.append(f"⚠️ {remain_minutes}分後に始まるよ⚠️")
+    else:
+        lines.append("⚠️ 30分後に始まるよ⚠️")
 
     msg = "\n".join(lines)
     await notify_channel.send(msg)
@@ -254,9 +263,8 @@ async def on_message(message):
             if txt not in pending_places:
                 pending_places[txt] = (unlock_dt, txt, server_num, now_jst())
                 await message.channel.send(f"✅ 手動登録: {txt}")
-                if notify_channel:
-                    if txt.startswith("奪取"):
-                        asyncio.create_task(schedule_notification(unlock_dt, txt, notify_channel))
+                if notify_channel and txt.startswith("奪取"):
+                    asyncio.create_task(schedule_notification(unlock_dt, txt, notify_channel))
 
         if notify_channel:
             update_30min_summary_schedule(notify_channel)
