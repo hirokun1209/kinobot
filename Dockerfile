@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libxext6 \
     libgl1 \
+    libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- numpy は一度削除（ABI mismatch防止）----
