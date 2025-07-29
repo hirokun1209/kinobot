@@ -65,6 +65,35 @@ SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
 
 # =======================
+# 過去予定の自動削除
+# =======================
+EXPIRE_GRACE = timedelta(minutes=2)  # 終了から2分猶予してから削除
+
+def remove_expired_entries():
+    now = now_jst()
+
+    # 過去の pending_places を削除
+    for k, (dt, *_rest) in list(pending_places.items()):
+        if dt + EXPIRE_GRACE < now:
+            del pending_places[k]
+
+    # 過去の summary_blocks を整理
+    for block in list(summary_blocks):
+        block["events"] = [ev for ev in block["events"] if ev[0] + EXPIRE_GRACE >= now]
+        if not block["events"]:
+            summary_blocks.remove(block)
+
+    # 終了したタスクをキャンセル（失敗しても安全にスルー）
+    for task in list(active_tasks):
+        if task.done(): continue
+        try:
+            unlock_dt = task.get_coro().cr_frame.f_locals.get("unlock_dt")
+            if isinstance(unlock_dt, datetime) and unlock_dt + EXPIRE_GRACE < now:
+                task.cancel()
+        except:
+            pass
+            
+# =======================
 # ユーティリティ
 # =======================
 def now_jst():
