@@ -19,7 +19,6 @@ RUN pip uninstall -y numpy || true
 RUN pip install --no-cache-dir opencv-python-headless==4.7.0.72
 
 # ---- PaddleOCR 依存ライブラリ ----
-# ✅ paddlepaddle は CPU wheel を中国公式から取得
 RUN pip install --no-cache-dir paddlepaddle==2.5.2 -i https://mirror.baidu.com/pypi/simple \
     || pip install --no-cache-dir paddlepaddle==2.5.2 -i https://pypi.tuna.tsinghua.edu.cn/simple \
     || pip install --no-cache-dir paddlepaddle==2.5.2 -f https://www.paddlepaddle.org.cn/whl/cpu/mkl/avx/stable.html \
@@ -27,6 +26,9 @@ RUN pip install --no-cache-dir paddlepaddle==2.5.2 -i https://mirror.baidu.com/p
 
 # ---- Discord Bot 依存 ----
 RUN pip install --no-cache-dir discord.py
+
+# ✅ FastAPI + Uvicorn（ping用 HTTPサーバー）
+RUN pip install --no-cache-dir fastapi uvicorn
 
 # ---- numpy を最後に固定（ABI mismatch防止）----
 RUN pip uninstall -y numpy || true && \
@@ -36,4 +38,5 @@ RUN pip uninstall -y numpy || true && \
 WORKDIR /app
 COPY . /app
 
+# ---- 起動コマンド ----
 CMD ["python", "bot.py"]
