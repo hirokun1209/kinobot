@@ -1,7 +1,8 @@
 discord.py
-Pillow
-numpy==1.23.5
-paddleocr==2.6.1.3
-paddlepaddle==2.6.1
 fastapi
 uvicorn
+Pillow
+numpy==1.23.5
+paddleocr==2.7.0.3
+paddlepaddle==2.5.2
+opencv-python-headless==4.7.0.72
