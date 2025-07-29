@@ -41,9 +41,10 @@ def ping():
     return {"status": "ok"}
 
 def run_server():
-    port = int(os.environ.get("PORT", 8000))  # Koyebが提供するPORTを取得
+    import time
+    time.sleep(3)  # サービス安定のために3秒遅延
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
 # =======================
 # OCR初期化
 # =======================
