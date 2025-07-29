@@ -233,6 +233,15 @@ async def daily_reset_task():
             await channel.send("🕑 自動日次リセットを実行しました")
 
 # =======================
+# 過去予定の定期削除（1分ごと）
+# =======================
+async def periodic_cleanup_task():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        remove_expired_entries()
+        await asyncio.sleep(60)
+        
+# =======================
 # コマンドベースのリセット
 # =======================
 async def reset_all(message):
@@ -253,7 +262,8 @@ async def on_ready():
     print(f"📌 通知チャンネル: {NOTIFY_CHANNEL_ID}")
     print(f"📌 読み取り許可チャンネル: {READABLE_CHANNEL_IDS}")
     asyncio.create_task(daily_reset_task())  # ✅ 自動リセットスケジューラー起動
-
+    asyncio.create_task(periodic_cleanup_task())  # ✅ 過去予定の削除スケジューラー起動
+        
 @client.event
 async def on_message(message):
     if message.author.bot or message.channel.id not in READABLE_CHANNEL_IDS:
