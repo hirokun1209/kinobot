@@ -321,4 +321,8 @@ async def on_message(message):
 # 起動
 # =======================
 if __name__ == "__main__":
+    # FastAPI HTTP サーバーをスレッドで起動（UptimeRobot対策）
+    Thread(target=run_server).start()
+    
+    # Discord Bot 起動
     client.run(TOKEN)
