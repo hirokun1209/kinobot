@@ -320,9 +320,18 @@ async def on_message(message):
 # =======================
 # 起動
 # =======================
-if __name__ == "__main__":
-    # FastAPI HTTP サーバーをスレッドで起動（UptimeRobot対策）
-    Thread(target=run_server).start()
+import asyncio
+
+async def start_discord_bot():
+    await client.start(TOKEN)
+
+async def main():
+    # FastAPIをバックグラウンドで起動
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, run_server)
     
-    # Discord Bot 起動
-    client.run(TOKEN)
+    # Discord bot を開始（client.run ではなく start）
+    await start_discord_bot()
+
+if __name__ == "__main__":
+    asyncio.run(main())
