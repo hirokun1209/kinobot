@@ -1,4 +1,4 @@
-# OCR BOT（スケジュール通知付き）
+# OCR BOT（スケジュール通知付き + HTTPサーバーでUptimeRobot対応）
 import os
 import discord
 import io
@@ -9,6 +9,9 @@ import numpy as np
 from paddleocr import PaddleOCR
 from datetime import datetime, timedelta, timezone
 from PIL import Image
+from fastapi import FastAPI
+import uvicorn
+from threading import Thread
 
 # =======================
 # タイムゾーン設定
@@ -27,6 +30,18 @@ if not TOKEN:
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+
+# =======================
+# FastAPI HTTP サーバー（スリープ防止）
+# =======================
+app = FastAPI()
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+def run_server():
+    uvicorn.run(app, host="0.0.0.0", port=8080)
 
 # =======================
 # OCR初期化
@@ -141,13 +156,12 @@ async def schedule_block_summary(block, channel):
                 await block["msg"].edit(content=format_block_msg(block, True))
             except discord.NotFound:
                 block["msg"] = await channel.send(format_block_msg(block, True))
-
         await asyncio.sleep(max(0, (block["min"] - now_jst()).total_seconds()))
         if block["msg"]:
             try:
                 await block["msg"].edit(content=format_block_msg(block, False))
             except discord.NotFound:
-                pass  # メッセージが削除されていた場合は無視
+                pass
     except Exception as e:
         print(f"[ERROR] schedule_block_summary failed: {e}")
 
