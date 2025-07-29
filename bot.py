@@ -36,9 +36,13 @@ client = discord.Client(intents=intents)
 # =======================
 app = FastAPI()
 
+from fastapi.responses import JSONResponse
+
 @app.get("/")
+@app.get("/ping")
+@app.get("/ping/")
 def root():
-    return {"status": "ok"}
+    return JSONResponse(content={"status": "ok"})
 
 def run_server():
     import time
