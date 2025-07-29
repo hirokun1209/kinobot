@@ -36,8 +36,8 @@ client = discord.Client(intents=intents)
 # =======================
 app = FastAPI()
 
-@app.get("/ping")
-def ping():
+@app.get("/")
+def root():
     return {"status": "ok"}
 
 def run_server():
