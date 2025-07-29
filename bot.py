@@ -41,7 +41,7 @@ def ping():
     return {"status": "ok"}
 
 def run_server():
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 # =======================
 # OCR初期化
