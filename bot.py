@@ -24,6 +24,7 @@ JST = timezone(timedelta(hours=9))
 TOKEN = os.getenv("DISCORD_TOKEN")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
 READABLE_CHANNEL_IDS = [int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip().isdigit()]
+COPY_CHANNEL_ID = int(os.getenv("COPY_CHANNEL_ID", "0"))
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
 
@@ -172,6 +173,19 @@ def parse_multiple_places(center_texts, top_time_texts):
 # =======================
 # ブロック・通知処理
 # =======================
+async def send_to_copy_channel(dt, txt):
+    if COPY_CHANNEL_ID == 0:
+        return
+    channel = client.get_channel(COPY_CHANNEL_ID)
+    if not channel:
+        return
+    msg = await channel.send(f"{txt}")
+    await asyncio.sleep(max(0, (dt - now_jst()).total_seconds() + 120))  # 2分猶予で削除
+    try:
+        await msg.delete()
+    except:
+        pass
+        
 def find_or_create_block(new_dt):
     for block in summary_blocks:
         if new_dt <= block["max"] + timedelta(minutes=45):
@@ -212,6 +226,8 @@ async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
     if (dt, txt) not in block["events"]:
         block["events"].append((dt, txt))
+        # 通常通知チャンネルに加え、コピー専用にも送信
+        asyncio.create_task(send_to_copy_channel(dt, txt))
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
     if block["msg"]:
@@ -255,6 +271,7 @@ async def schedule_notification(unlock_dt, text, channel):
             msg = await channel.send(f"⏰ {text} **15秒前です！！**")
             await asyncio.sleep(120)
             await msg.delete()
+
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
