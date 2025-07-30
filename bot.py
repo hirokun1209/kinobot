@@ -69,21 +69,27 @@ SKIP_NOTIFY_END = 14
 # =======================
 EXPIRE_GRACE = timedelta(minutes=2)  # 終了から2分猶予してから削除
 
-def remove_expired_entries():
+async def remove_expired_entries():
     now = now_jst()
 
-    # 過去の pending_places を削除
+    # pending_placesの削除
     for k, (dt, *_rest) in list(pending_places.items()):
         if dt + EXPIRE_GRACE < now:
             del pending_places[k]
 
-    # 過去の summary_blocks を整理
+    # summary_blocksの削除と通知メッセージ削除
     for block in list(summary_blocks):
         block["events"] = [ev for ev in block["events"] if ev[0] + EXPIRE_GRACE >= now]
+        if block["msg"] and block["max"] + EXPIRE_GRACE < now:
+            try:
+                await block["msg"].delete()
+            except:
+                pass
+            block["msg"] = None
         if not block["events"]:
             summary_blocks.remove(block)
 
-    # 終了したタスクをキャンセル（失敗しても安全にスルー）
+    # タスクの削除
     for task in list(active_tasks):
         if task.done(): continue
         try:
@@ -131,6 +137,8 @@ def add_time(base_time_str, duration_str):
     except:
         return None, None
     base_dt = datetime.combine(today, base_time, tzinfo=JST)
+    if base_time < datetime.strptime("02:00:01", "%H:%M:%S").time():
+        base_dt += timedelta(days=1)  # 翌日扱い
     parts = duration_str.split(":")
     if len(parts) == 3:
         h, m, s = map(int, parts)
@@ -224,19 +232,29 @@ def is_within_5_minutes_of_another(target_dt):
     return False
 
 async def schedule_notification(unlock_dt, text, channel):
-    if unlock_dt <= now_jst(): return
-    if text.startswith("奪取") and not (SKIP_NOTIFY_START <= unlock_dt.hour < SKIP_NOTIFY_END):
+    if unlock_dt <= now_jst():
+        return
+    # 通知時間制限: 02:00〜08:00はスキップ
+    if not (8 <= unlock_dt.hour or unlock_dt.hour < 2):
+        return
+    if text.startswith("奪取"):
+        # 2分前通知
         if not is_within_5_minutes_of_another(unlock_dt):
             t = unlock_dt - timedelta(minutes=2)
             if t > now_jst() and (text, "2min") not in sent_notifications:
                 sent_notifications.add((text, "2min"))
                 await asyncio.sleep((t - now_jst()).total_seconds())
-                await channel.send(f"⏰ {text} **2分前です！！**")
+                msg = await channel.send(f"⏰ {text} **2分前です！！**")
+                await asyncio.sleep(120)
+                await msg.delete()
+        # 15秒前通知
         t15 = unlock_dt - timedelta(seconds=15)
         if t15 > now_jst() and (text, "15s") not in sent_notifications:
             sent_notifications.add((text, "15s"))
             await asyncio.sleep((t15 - now_jst()).total_seconds())
-            await channel.send(f"⏰ {text} **15秒前です！！**")
+            msg = await channel.send(f"⏰ {text} **15秒前です！！**")
+            await asyncio.sleep(120)
+            await msg.delete()
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
@@ -258,8 +276,6 @@ async def daily_reset_task():
         active_tasks.clear()
 
         channel = client.get_channel(NOTIFY_CHANNEL_ID)
-        if channel:
-            await channel.send("🕑 自動日次リセットを実行しました")
 
 # =======================
 # 過去予定の定期削除（1分ごと）
@@ -267,7 +283,7 @@ async def daily_reset_task():
 async def periodic_cleanup_task():
     await client.wait_until_ready()
     while not client.is_closed():
-        remove_expired_entries()
+        await remove_expired_entries()
         await asyncio.sleep(60)
         
 # =======================
