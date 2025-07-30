@@ -100,9 +100,38 @@ async def remove_expired_entries():
 # =======================
 # ユーティリティ
 # =======================
+# =======================
+# ユーティリティ関数群
+# =======================
+
+# 現在時刻（JST）
 def now_jst():
     return datetime.now(JST)
 
+# トップ右の時間部分の切り取り
+def crop_top_right(img):
+    h, w = img.shape[:2]
+    return img[0:int(h*0.2), int(w*0.7):]
+
+# 中央エリアの切り取り（越域駐騎場など）
+def crop_center_area(img):
+    h, w = img.shape[:2]
+    return img[int(h*0.35):int(h*0.65), :]
+
+# OCRでテキスト抽出
+def extract_text_from_image(img):
+    result = ocr.ocr(img, cls=True)
+    return [line[1][0] for line in result[0]] if result and result[0] else []
+
+# s1234 を抽出（サーバー番号）
+def extract_server_number(center_texts):
+    for t in center_texts:
+        m = re.search(r"[sS](\d{3,4})", t)
+        if m:
+            return m.group(1)
+    return None
+
+# 時間の加算（免戦時間に加算）
 def add_time(base_time_str, duration_str):
     today = now_jst().date()
     try:
@@ -110,8 +139,11 @@ def add_time(base_time_str, duration_str):
     except:
         return None, None
     base_dt = datetime.combine(today, base_time, tzinfo=JST)
+
+    # 00:00:00〜02:00:01 は翌日として扱う
     if base_time < datetime.strptime("02:00:01", "%H:%M:%S").time():
         base_dt += timedelta(days=1)
+
     parts = duration_str.split(":")
     if len(parts) == 3:
         h, m, s = map(int, parts)
@@ -121,7 +153,6 @@ def add_time(base_time_str, duration_str):
         return None, None
     dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
     return dt, dt.strftime("%H:%M:%S")
-
 # =======================
 # 通知処理（抜粋）
 # =======================
