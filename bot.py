@@ -121,6 +121,26 @@ def extract_text_from_image(img):
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
 
+def parse_multiple_places(center_texts, top_time_texts):
+    res = []
+    top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
+    server = extract_server_number(center_texts)
+    if not top_time or not server:
+        return []
+    mode = "警備" if server == "1268" else "奪取"
+    current = None
+    for t in center_texts:
+        p = re.search(r"越域駐騎場(\d+)", t)
+        if p:
+            current = p.group(1)
+        d = re.search(r"免戦中(\d{1,2}:\d{2}(?::\d{2})?)", t)
+        if d and current:
+            dt, unlock = add_time(top_time, d.group(1))
+            if dt:
+                res.append((dt, f"{mode} {server}-{current}-{unlock}"))
+            current = None
+    return res
+
 # s1234 を抽出（サーバー番号）
 def extract_server_number(center_texts):
     for t in center_texts:
