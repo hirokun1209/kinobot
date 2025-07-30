@@ -203,7 +203,6 @@ async def on_message(message):
     if message.author.bot or message.channel.id not in READABLE_CHANNEL_IDS:
         return
 
-    cleanup_old_entries()
     channel = client.get_channel(NOTIFY_CHANNEL_ID)
 
     if message.content.strip() == "!reset":
