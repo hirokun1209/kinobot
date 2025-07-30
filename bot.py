@@ -403,10 +403,10 @@ async def on_message(message):
                         task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
                         active_tasks.add(task2)
                         task2.add_done_callback(lambda t: active_tasks.discard(t))
-                (await status.edit(content=(
-                    "✅ 解析完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results])
-                    if new_results else "⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。実際と異なる場合は再送信してください。"
-                    ))
+                if new_results:
+                    await status.edit(content="✅ 解析完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results]))
+                        else:
+                    await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。実際と異なる場合は画像を再送信してください。")
 # =======================
 # 起動
 # =======================
