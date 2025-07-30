@@ -313,6 +313,19 @@ async def reset_all(message):
     for task in list(active_tasks):
         task.cancel()
     active_tasks.clear()
+
+    # 通知チャンネルとコピー用チャンネルのメッセージ削除
+    for cid in [NOTIFY_CHANNEL_ID, COPY_CHANNEL_ID]:
+        if cid != 0:
+            ch = client.get_channel(cid)
+            if ch:
+                try:
+                    async for msg in ch.history(limit=100):
+                        if msg.author == client.user:
+                            await msg.delete()
+                except:
+                    pass
+
     await message.channel.send("✅ 全ての予定と通知をリセットしました")
 
 # =======================
@@ -390,11 +403,10 @@ async def on_message(message):
                         task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
                         active_tasks.add(task2)
                         task2.add_done_callback(lambda t: active_tasks.discard(t))
-        await status.edit(content=(
-            "✅ OCR読み取り完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results])
-            if new_results else "⚠️ OCR処理完了しましたが、新しい予定は見つかりませんでした。"
-        ))
-
+                (await status.edit(content=(
+                    "✅ 解析完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results])
+                    if new_results else "⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。実際と異なる場合は再送信してください。"
+                    ))
 # =======================
 # 起動
 # =======================
