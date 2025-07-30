@@ -49,7 +49,6 @@ def run_server():
     time.sleep(3)  # サービス安定のために3秒遅延
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
 # =======================
 # OCR初期化
 # =======================
@@ -68,26 +67,23 @@ SKIP_NOTIFY_END = 14
 # =======================
 # 過去予定の自動削除
 # =======================
-EXPIRE_GRACE = timedelta(minutes=2)
+EXPIRE_GRACE = timedelta(minutes=2)  # 終了から2分猶予してから削除
 
-async def remove_expired_entries():
+def remove_expired_entries():
     now = now_jst()
-    # pending_placesの削除
+
+    # 過去の pending_places を削除
     for k, (dt, *_rest) in list(pending_places.items()):
         if dt + EXPIRE_GRACE < now:
             del pending_places[k]
-    # summary_blocksの削除と通知メッセージ削除
+
+    # 過去の summary_blocks を整理
     for block in list(summary_blocks):
         block["events"] = [ev for ev in block["events"] if ev[0] + EXPIRE_GRACE >= now]
-        if block["msg"] and block["max"] + EXPIRE_GRACE < now:
-            try:
-                await block["msg"].delete()
-            except:
-                pass
-            block["msg"] = None
         if not block["events"]:
             summary_blocks.remove(block)
-    # タスクの削除
+
+    # 終了したタスクをキャンセル（失敗しても安全にスルー）
     for task in list(active_tasks):
         if task.done(): continue
         try:
@@ -96,30 +92,54 @@ async def remove_expired_entries():
                 task.cancel()
         except:
             pass
-
-
+            
 # =======================
-# ユーティリティ関数群
+# ユーティリティ
 # =======================
-
-# 現在時刻（JST）
 def now_jst():
     return datetime.now(JST)
 
-# トップ右の時間部分の切り取り
+def cleanup_old_entries():
+    now = now_jst()
+    for k in list(pending_places):
+        if (now - pending_places[k][3]) > timedelta(hours=6):
+            del pending_places[k]
+
 def crop_top_right(img):
     h, w = img.shape[:2]
     return img[0:int(h*0.2), int(w*0.7):]
 
-# 中央エリアの切り取り（越域駐騎場など）
 def crop_center_area(img):
     h, w = img.shape[:2]
     return img[int(h*0.35):int(h*0.65), :]
 
-# OCRでテキスト抽出
 def extract_text_from_image(img):
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
+
+def extract_server_number(center_texts):
+    for t in center_texts:
+        m = re.search(r"[sS](\d{3,4})", t)
+        if m:
+            return m.group(1)
+    return None
+
+def add_time(base_time_str, duration_str):
+    today = now_jst().date()
+    try:
+        base_time = datetime.strptime(base_time_str, "%H:%M:%S").time()
+    except:
+        return None, None
+    base_dt = datetime.combine(today, base_time, tzinfo=JST)
+    parts = duration_str.split(":")
+    if len(parts) == 3:
+        h, m, s = map(int, parts)
+    elif len(parts) == 2:
+        h, m, s = 0, *map(int, parts)
+    else:
+        return None, None
+    dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
+    return dt, dt.strftime("%H:%M:%S")
 
 def parse_multiple_places(center_texts, top_time_texts):
     res = []
@@ -141,63 +161,84 @@ def parse_multiple_places(center_texts, top_time_texts):
             current = None
     return res
 
-# s1234 を抽出（サーバー番号）
-def extract_server_number(center_texts):
-    for t in center_texts:
-        m = re.search(r"[sS](\d{3,4})", t)
-        if m:
-            return m.group(1)
-    return None
+# =======================
+# ブロック・通知処理
+# =======================
+def find_or_create_block(new_dt):
+    for block in summary_blocks:
+        if new_dt <= block["max"] + timedelta(minutes=45):
+            return block
+    new_block = {"events": [], "min": new_dt, "max": new_dt, "msg": None}
+    summary_blocks.append(new_block)
+    return new_block
 
-# 時間の加算（免戦時間に加算）
-def add_time(base_time_str, duration_str):
-    today = now_jst().date()
+def format_block_msg(block, with_footer=True):
+    lines = ["⏰ スケジュールのお知らせ📢", ""]
+    unique_events = sorted(set(block["events"]), key=lambda x: x[0])
+    lines += [f"{txt}  " for _, txt in unique_events]
+    if with_footer:
+        diff = int((block["min"] - now_jst()).total_seconds() // 60)
+        lines += ["", f"⚠️ {diff}分後に始まるよ⚠️" if diff < 30 else "⚠️ 30分後に始まるよ⚠️"]
+    return "\n".join(lines)
+
+async def schedule_block_summary(block, channel):
     try:
-        base_time = datetime.strptime(base_time_str, "%H:%M:%S").time()
-    except:
-        return None, None
-    base_dt = datetime.combine(today, base_time, tzinfo=JST)
+        await asyncio.sleep(max(0, (block["min"] - timedelta(minutes=30) - now_jst()).total_seconds()))
+        if not block["msg"]:
+            block["msg"] = await channel.send(format_block_msg(block, True))
+        else:
+            try:
+                await block["msg"].edit(content=format_block_msg(block, True))
+            except discord.NotFound:
+                block["msg"] = await channel.send(format_block_msg(block, True))
+        await asyncio.sleep(max(0, (block["min"] - now_jst()).total_seconds()))
+        if block["msg"]:
+            try:
+                await block["msg"].edit(content=format_block_msg(block, False))
+            except discord.NotFound:
+                pass
+    except Exception as e:
+        print(f"[ERROR] schedule_block_summary failed: {e}")
 
-    # 00:00:00〜02:00:01 は翌日として扱う
-    if base_time < datetime.strptime("02:00:01", "%H:%M:%S").time():
-        base_dt += timedelta(days=1)
-
-    parts = duration_str.split(":")
-    if len(parts) == 3:
-        h, m, s = map(int, parts)
-    elif len(parts) == 2:
-        h, m, s = 0, *map(int, parts)
+async def handle_new_event(dt, txt, channel):
+    block = find_or_create_block(dt)
+    if (dt, txt) not in block["events"]:
+        block["events"].append((dt, txt))
+    block["min"] = min(block["min"], dt)
+    block["max"] = max(block["max"], dt)
+    if block["msg"]:
+        try:
+            await block["msg"].edit(content=format_block_msg(block, True))
+        except discord.NotFound:
+            block["msg"] = await channel.send(format_block_msg(block, True))
     else:
-        return None, None
-    dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
-    return dt, dt.strftime("%H:%M:%S")
-# =======================
-# 通知処理（抜粋）
-# =======================
+        task = asyncio.create_task(schedule_block_summary(block, channel))
+        active_tasks.add(task)
+        task.add_done_callback(lambda t: active_tasks.discard(t))
+
+def is_within_5_minutes_of_another(target_dt):
+    times = sorted([v[0] for v in pending_places.values()])
+    for dt in times:
+        if dt != target_dt and abs((dt - target_dt).total_seconds()) <= 300:
+            return True
+    return False
+
 async def schedule_notification(unlock_dt, text, channel):
-    if unlock_dt <= now_jst():
-        return
-    if not (8 <= unlock_dt.hour or unlock_dt.hour < 2):
-        return
-    if text.startswith("奪取"):
+    if unlock_dt <= now_jst(): return
+    if text.startswith("奪取") and not (SKIP_NOTIFY_START <= unlock_dt.hour < SKIP_NOTIFY_END):
         if not is_within_5_minutes_of_another(unlock_dt):
             t = unlock_dt - timedelta(minutes=2)
             if t > now_jst() and (text, "2min") not in sent_notifications:
                 sent_notifications.add((text, "2min"))
                 await asyncio.sleep((t - now_jst()).total_seconds())
-                msg = await channel.send(f"⏰ {text} **2分前です！！**")
-                await asyncio.sleep(120)
-                await msg.delete()
+                await channel.send(f"⏰ {text} **2分前です！！**")
         t15 = unlock_dt - timedelta(seconds=15)
         if t15 > now_jst() and (text, "15s") not in sent_notifications:
             sent_notifications.add((text, "15s"))
             await asyncio.sleep((t15 - now_jst()).total_seconds())
-            msg = await channel.send(f"⏰ {text} **15秒前です！！**")
-            await asyncio.sleep(120)
-            await msg.delete()
-
+            await channel.send(f"⏰ {text} **15秒前です！！**")
 # =======================
-# 自動リセット（通知なし）
+# 自動リセット処理（毎日02:00）
 # =======================
 async def daily_reset_task():
     await client.wait_until_ready()
@@ -207,6 +248,8 @@ async def daily_reset_task():
         if now >= next_reset:
             next_reset += timedelta(days=1)
         await asyncio.sleep((next_reset - now).total_seconds())
+
+        # リセット処理
         pending_places.clear()
         summary_blocks.clear()
         sent_notifications.clear()
@@ -214,15 +257,18 @@ async def daily_reset_task():
             task.cancel()
         active_tasks.clear()
 
+        channel = client.get_channel(NOTIFY_CHANNEL_ID)
+        if channel:
+            await channel.send("🕑 自動日次リセットを実行しました")
+
 # =======================
-# 定期クリーンアップ
+# 過去予定の定期削除（1分ごと）
 # =======================
 async def periodic_cleanup_task():
     await client.wait_until_ready()
     while not client.is_closed():
-        await remove_expired_entries()
+        remove_expired_entries()
         await asyncio.sleep(60)
-
         
 # =======================
 # コマンドベースのリセット
@@ -252,6 +298,7 @@ async def on_message(message):
     if message.author.bot or message.channel.id not in READABLE_CHANNEL_IDS:
         return
 
+    cleanup_old_entries()
     channel = client.get_channel(NOTIFY_CHANNEL_ID)
 
     if message.content.strip() == "!reset":
