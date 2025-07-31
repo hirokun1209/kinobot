@@ -194,12 +194,14 @@ def find_or_create_block(new_dt):
     summary_blocks.append(new_block)
     return new_block
 
+import math
+
 def format_block_msg(block, with_footer=True):
     lines = ["⏰ スケジュールのお知らせ📢", ""]
     unique_events = sorted(set(block["events"]), key=lambda x: x[0])
     lines += [f"{txt}  " for _, txt in unique_events]
     if with_footer:
-        diff = int((block["min"] - now_jst()).total_seconds() // 60)
+        diff = math.ceil((block["min"] - now_jst()).total_seconds() / 60)
         lines += ["", f"⚠️ {diff}分後に始まるよ⚠️" if diff < 30 else "⚠️ 30分後に始まるよ⚠️"]
     return "\n".join(lines)
 
