@@ -250,28 +250,35 @@ def is_within_5_minutes_of_another(target_dt):
 async def schedule_notification(unlock_dt, text, channel):
     if unlock_dt <= now_jst():
         return
+
     # 通知時間制限: 02:00〜08:00はスキップ
     if not (8 <= unlock_dt.hour or unlock_dt.hour < 2):
         return
+
     if text.startswith("奪取"):
-        # 2分前通知
-        if not is_within_5_minutes_of_another(unlock_dt):
-            t = unlock_dt - timedelta(minutes=2)
-            if t > now_jst() and (text, "2min") not in sent_notifications:
+        now = now_jst()
+        t_2min = unlock_dt - timedelta(minutes=2)
+        t_15s = unlock_dt - timedelta(seconds=15)
+
+        async def notify_2min():
+            if t_2min > now and (text, "2min") not in sent_notifications and not is_within_5_minutes_of_another(unlock_dt):
                 sent_notifications.add((text, "2min"))
-                await asyncio.sleep((t - now_jst()).total_seconds())
+                await asyncio.sleep((t_2min - now_jst()).total_seconds())
                 msg = await channel.send(f"⏰ {text} **2分前です！！**")
                 await asyncio.sleep(120)
                 await msg.delete()
-        # 15秒前通知
-        t15 = unlock_dt - timedelta(seconds=15)
-        if t15 > now_jst() and (text, "15s") not in sent_notifications:
-            sent_notifications.add((text, "15s"))
-            await asyncio.sleep((t15 - now_jst()).total_seconds())
-            msg = await channel.send(f"⏰ {text} **15秒前です！！**")
-            await asyncio.sleep(120)
-            await msg.delete()
 
+        async def notify_15s():
+            if t_15s > now and (text, "15s") not in sent_notifications:
+                sent_notifications.add((text, "15s"))
+                await asyncio.sleep((t_15s - now_jst()).total_seconds())
+                msg = await channel.send(f"⏰ {text} **15秒前です！！**")
+                await asyncio.sleep(120)
+                await msg.delete()
+
+        # 並列で通知をスケジュール
+        asyncio.create_task(notify_2min())
+        asyncio.create_task(notify_15s())
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
