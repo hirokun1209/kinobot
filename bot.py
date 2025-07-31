@@ -405,8 +405,8 @@ async def on_message(message):
                         task2.add_done_callback(lambda t: active_tasks.discard(t))
                 if new_results:
                     await status.edit(content="✅ 解析完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results]))
-                        else:
-                    await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。実際と異なる場合は画像を再送信してください。")
+                else:
+                     await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。実際と異なる場合は画像を再送信してください。")
 # =======================
 # 起動
 # =======================
