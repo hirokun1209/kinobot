@@ -213,7 +213,7 @@ def parse_multiple_places(center_texts, top_time_texts):
             d = durations[i]
             dt, unlock = add_time(top_time, d)
             if dt:
-                res.append((dt, f"{mode} {server}-{current}-{unlock}"))
+                res.append((dt, f"{mode} {server}-{current}-{unlock}", d))  # ← 生文字列も返す
             current = None
             i += 1
     return res
@@ -501,6 +501,8 @@ async def on_message(message):
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
         new_results = []
+        top_time = "?"  # 初期化
+
         for a in message.attachments:
             b = await a.read()
             img = Image.open(io.BytesIO(b)).convert("RGB")
@@ -509,11 +511,13 @@ async def on_message(message):
             center = crop_center_area(np_img)
             top_txts = extract_text_from_image(top)
             center_txts = extract_text_from_image(center)
+
+            top_time = next((t for t in top_txts if re.match(r"\d{2}:\d{2}:\d{2}", t)), "?")
             parsed = parse_multiple_places(center_txts, top_txts)
-            for dt, txt in parsed:
+            for dt, txt, raw in parsed:
                 if txt not in pending_places:
                     pending_places[txt] = (dt, txt, "", now_jst())
-                    new_results.append(txt)
+                    new_results.append(f"{txt} ({raw})")
                     task = asyncio.create_task(handle_new_event(dt, txt, channel))
                     active_tasks.add(task)
                     task.add_done_callback(lambda t: active_tasks.discard(t))
@@ -521,10 +525,12 @@ async def on_message(message):
                         task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
                         active_tasks.add(task2)
                         task2.add_done_callback(lambda t: active_tasks.discard(t))
-                if new_results:
-                    await status.edit(content="✅ 解析完了！登録された予定:\n" + "\n".join([f"・{txt}" for txt in new_results]))
-                else:
-                     await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。実際と異なる場合は画像を再送信してください。")
+
+        if new_results:
+            await status.edit(content=f"✅ 解析完了！登録されました [基準時間: {top_time}]\n" + "\n".join([f"・{txt}" for txt in new_results]))
+        else:
+            await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。実際と異なる場合は画像を再送信してください。")
+        return
 # =======================
 # 起動
 # =======================
