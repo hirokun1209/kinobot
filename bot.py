@@ -154,29 +154,47 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
     for line in texts:
         matches = re.findall(r"免戦中([^\s+%]*)", line)
         for m in matches:
-            s = m.replace("日", "")  # 「日」などの誤認文字を削除
-            s = re.sub(r"[^\d:]", "", s)  # 数字と : 以外は除去
+            s = m.replace("日", "")
+            s = re.sub(r"[^\d:]", "", s)
 
-            # パターン1：03:38:14（正規）
+            # そのまま H:M:S
             if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", s):
                 durations.append(s)
 
-            # パターン2：09:17（分秒）→ 00:09:17
+            # そのまま M:S → 00:M:S
             elif re.fullmatch(r"\d{1,2}:\d{2}", s):
                 durations.append(f"00:{s}")
 
-            # パターン3：03:3814 → 推定: 03:38:14
-            elif re.fullmatch(r"\d{1,2}:\d{4}", s):
-                h, rest = s.split(":")
-                m, sec = rest[:2], rest[2:]
+            # 5桁以上でコロン含む（例: 01316:31 → 01:16:31）
+            elif re.fullmatch(r"\d{3,5}:\d{2}", s):
+                # 左側は時間+分がくっついてる
+                left, sec = s.split(":")
+                if len(left) == 5:
+                    h, m = left[:2], left[2:]
+                elif len(left) == 4:
+                    h, m = left[:1], left[1:]
+                elif len(left) == 3:
+                    h, m = left[0], left[1:]
+                else:
+                    continue  # 認識不能
                 durations.append(f"{int(h):02}:{int(m):02}:{int(sec):02}")
 
-            # パターン4：011617 → 01:16:17
+            # 6桁数字 → HHMMSS
             elif re.fullmatch(r"\d{6}", s):
                 h, m, sec = s[:2], s[2:4], s[4:]
                 durations.append(f"{int(h):02}:{int(m):02}:{int(sec):02}")
 
-            # パターン5：44 → 秒のみ
+            # 4桁 → MMSS
+            elif re.fullmatch(r"\d{4}", s):
+                m, sec = s[:2], s[2:]
+                durations.append(f"00:{int(m):02}:{int(sec):02}")
+
+            # 3桁 → M:SS
+            elif re.fullmatch(r"\d{3}", s):
+                m, sec = s[0], s[1:]
+                durations.append(f"00:{int(m):02}:{int(sec):02}")
+
+            # 2桁以下 → 秒
             elif re.fullmatch(r"\d{1,2}", s):
                 durations.append(f"00:00:{int(s):02}")
     return durations
