@@ -369,6 +369,55 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
+    if message.content.strip() == "!ocrdebug":
+        if not message.attachments:
+            await message.channel.send("⚠️ 画像を添付してください（OCR結果とトリミング画像を確認します）")
+            return
+
+        a = message.attachments[0]
+        b = await a.read()
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+        # トリミング
+        top = crop_top_right(np_img)
+        center = crop_center_area(np_img)
+
+        # OCR
+        top_txts = extract_text_from_image(top)
+        center_txts = extract_text_from_image(center)
+
+        # OCRテキスト成形
+        top_text = "\n".join(top_txts) if top_txts else "(検出なし)"
+        center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
+
+        # トリミング画像を一時保存
+        from PIL import Image
+        import tempfile
+
+        def save_temp_image(arr, suffix=".png"):
+            temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)).save(temp.name)
+            return temp.name
+
+        top_img_path = save_temp_image(top)
+        center_img_path = save_temp_image(center)
+
+        # 送信
+        await message.channel.send(
+            content=f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_text}\n```",
+            file=discord.File(top_img_path, filename="top.png")
+        )
+        await message.channel.send(
+            content=f"📸 **中央OCR結果（サーバー・免戦）**:\n```\n{center_text}\n```",
+            file=discord.File(center_img_path, filename="center.png")
+        )
+
+        # 一時ファイル削除
+        os.remove(top_img_path)
+        os.remove(center_img_path)
+        return
+
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
         for server, place, t in manual:
