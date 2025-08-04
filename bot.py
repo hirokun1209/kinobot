@@ -149,29 +149,36 @@ def add_time(base_time_str, duration_str):
         return None, None
     dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
     return dt, dt.strftime("%H:%M:%S")
-def extract_imsen_durations(texts: list[str]) -> list[str]:
+def def extract_imsen_durations(texts: list[str]) -> list[str]:
     durations = []
     for line in texts:
         matches = re.findall(r"免戦中([^\s+%]*)", line)
         for m in matches:
             s = m.replace("日", "")  # 「日」などの誤認文字を削除
             s = re.sub(r"[^\d:]", "", s)  # 数字と : 以外は除去
+
+            # パターン1：03:38:14（正規）
             if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", s):
-                durations.append(s)  # HH:MM:SS
+                durations.append(s)
+
+            # パターン2：09:17（分秒）→ 00:09:17
             elif re.fullmatch(r"\d{1,2}:\d{2}", s):
-                durations.append(f"00:{s}")  # MM:SS → 00:MM:SS
-            elif re.fullmatch(r"\d{3,4}:\d{1,2}", s):
-                digits, ss = s.split(":")
-                if len(digits) == 4:
-                    h, m = digits[:2], digits[2:]
-                else:
-                    h, m = digits[0], digits[1:]
-                durations.append(f"{int(h):02}:{int(m):02}:{int(ss):02}")
-            elif re.fullmatch(r"\d{3,6}", s):
-                # 例: "011617" → 01:16:17
-                s = s.zfill(6)
+                durations.append(f"00:{s}")
+
+            # パターン3：03:3814 → 推定: 03:38:14
+            elif re.fullmatch(r"\d{1,2}:\d{4}", s):
+                h, rest = s.split(":")
+                m, sec = rest[:2], rest[2:]
+                durations.append(f"{int(h):02}:{int(m):02}:{int(sec):02}")
+
+            # パターン4：011617 → 01:16:17
+            elif re.fullmatch(r"\d{6}", s):
                 h, m, sec = s[:2], s[2:4], s[4:]
                 durations.append(f"{int(h):02}:{int(m):02}:{int(sec):02}")
+
+            # パターン5：44 → 秒のみ
+            elif re.fullmatch(r"\d{1,2}", s):
+                durations.append(f"00:00:{int(s):02}")
     return durations
     
 def parse_multiple_places(center_texts, top_time_texts):
