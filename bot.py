@@ -149,7 +149,27 @@ def add_time(base_time_str, duration_str):
         return None, None
     dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
     return dt, dt.strftime("%H:%M:%S")
-
+def extract_imsen_durations(texts: list[str]) -> list[str]:
+    durations = []
+    for line in texts:
+        matches = re.findall(r"免戦中([^\s+%]*)", line)
+        for m in matches:
+            s = m.replace("日", "")  # 「日」などの誤認文字を削除
+            if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", s):
+                durations.append(s)  # HH:MM:SS
+            elif re.fullmatch(r"\d{1,2}:\d{2}", s):
+                durations.append(f"00:{s}")  # MM:SS → 00:MM:SS
+            elif re.fullmatch(r"\d{3,4}:\d{1,2}", s):
+                digits, ss = s.split(":")
+                if len(digits) == 4:
+                    h, m = digits[:2], digits[2:]
+                else:
+                    h, m = digits[0], digits[1:]
+                durations.append(f"{int(h):02}:{int(m):02}:{int(ss):02}")
+            elif re.fullmatch(r"\d{1,2}", s):
+                durations.append(f"00:00:{int(s):02}")  # 秒のみ
+    return durations
+    
 def parse_multiple_places(center_texts, top_time_texts):
     res = []
     top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
@@ -158,18 +178,22 @@ def parse_multiple_places(center_texts, top_time_texts):
         return []
     mode = "警備" if server == "1268" else "奪取"
     current = None
+
+    durations = extract_imsen_durations(center_texts)
+
+    i = 0
     for t in center_texts:
         p = re.search(r"越域駐騎場(\d+)", t)
         if p:
             current = p.group(1)
-        d = re.search(r"免戦中(\d{1,2}:\d{2}(?::\d{2})?)", t)
-        if d and current:
-            dt, unlock = add_time(top_time, d.group(1))
+        if current and i < len(durations):
+            d = durations[i]
+            dt, unlock = add_time(top_time, d)
             if dt:
                 res.append((dt, f"{mode} {server}-{current}-{unlock}"))
             current = None
+            i += 1
     return res
-
 # =======================
 # ブロック・通知処理
 # =======================
