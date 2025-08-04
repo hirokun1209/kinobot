@@ -151,52 +151,46 @@ def add_time(base_time_str, duration_str):
     return dt, dt.strftime("%H:%M:%S")
 def extract_imsen_durations(texts: list[str]) -> list[str]:
     durations = []
-    for line in texts:
-        matches = re.findall(r"免戦中([^\s+%]*)", line)
-        for m in matches:
-            s = m.replace("日", "")
-            s = re.sub(r"[^\d:]", "", s)
+    for text in texts:
+        matches = re.findall(r"免戦中([0-9:\-日分秒hmsHMShms％%日]+)", text)
+        for raw in matches:
+            cleaned = re.sub(r"[^\d:]", "", raw)  # 数字と : のみ残す
 
-            # そのまま H:M:S
-            if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", s):
-                durations.append(s)
+            # コロンが2つ → 正常形式
+            if cleaned.count(":") == 2:
+                durations.append(cleaned)
+                continue
 
-            # そのまま M:S → 00:M:S
-            elif re.fullmatch(r"\d{1,2}:\d{2}", s):
-                durations.append(f"00:{s}")
+            # コロン1つ → M:Sとみなす
+            if cleaned.count(":") == 1:
+                parts = cleaned.split(":")
+                if len(parts) == 2:
+                    m, s = parts
+                    durations.append(f"00:{int(m):02}:{int(s):02}")
+                    continue
 
-            # 5桁以上でコロン含む（例: 01316:31 → 01:16:31）
-            elif re.fullmatch(r"\d{3,5}:\d{2}", s):
-                # 左側は時間+分がくっついてる
-                left, sec = s.split(":")
-                if len(left) == 5:
-                    h, m = left[:2], left[2:]
-                elif len(left) == 4:
-                    h, m = left[:1], left[1:]
-                elif len(left) == 3:
-                    h, m = left[0], left[1:]
-                else:
-                    continue  # 認識不能
-                durations.append(f"{int(h):02}:{int(m):02}:{int(sec):02}")
+            # コロンがない → 文字数によって補正
+            numbers_only = re.sub(r"[^\d]", "", raw)
+            if len(numbers_only) == 6:
+                # HHMMSS
+                h, m, s = numbers_only[:2], numbers_only[2:4], numbers_only[4:6]
+                durations.append(f"{int(h):02}:{int(m):02}:{int(s):02}")
+            elif len(numbers_only) == 5:
+                # HMMSS
+                h, m, s = numbers_only[:1], numbers_only[1:3], numbers_only[3:5]
+                durations.append(f"{int(h):02}:{int(m):02}:{int(s):02}")
+            elif len(numbers_only) == 4:
+                # MMSS
+                m, s = numbers_only[:2], numbers_only[2:4]
+                durations.append(f"00:{int(m):02}:{int(s):02}")
+            elif len(numbers_only) == 3:
+                # MSS
+                m, s = numbers_only[:1], numbers_only[1:3]
+                durations.append(f"00:{int(m):02}:{int(s):02}")
+            else:
+                # フォールバック
+                durations.append("00:00:00")
 
-            # 6桁数字 → HHMMSS
-            elif re.fullmatch(r"\d{6}", s):
-                h, m, sec = s[:2], s[2:4], s[4:]
-                durations.append(f"{int(h):02}:{int(m):02}:{int(sec):02}")
-
-            # 4桁 → MMSS
-            elif re.fullmatch(r"\d{4}", s):
-                m, sec = s[:2], s[2:]
-                durations.append(f"00:{int(m):02}:{int(sec):02}")
-
-            # 3桁 → M:SS
-            elif re.fullmatch(r"\d{3}", s):
-                m, sec = s[0], s[1:]
-                durations.append(f"00:{int(m):02}:{int(sec):02}")
-
-            # 2桁以下 → 秒
-            elif re.fullmatch(r"\d{1,2}", s):
-                durations.append(f"00:00:{int(s):02}")
     return durations
     
 def parse_multiple_places(center_texts, top_time_texts):
