@@ -155,6 +155,7 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
         matches = re.findall(r"免戦中([^\s+%]*)", line)
         for m in matches:
             s = m.replace("日", "")  # 「日」などの誤認文字を削除
+            s = re.sub(r"[^\d:]", "", s)  # 数字と : 以外は除去
             if re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", s):
                 durations.append(s)  # HH:MM:SS
             elif re.fullmatch(r"\d{1,2}:\d{2}", s):
@@ -166,8 +167,11 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
                 else:
                     h, m = digits[0], digits[1:]
                 durations.append(f"{int(h):02}:{int(m):02}:{int(ss):02}")
-            elif re.fullmatch(r"\d{1,2}", s):
-                durations.append(f"00:00:{int(s):02}")  # 秒のみ
+            elif re.fullmatch(r"\d{3,6}", s):
+                # 例: "011617" → 01:16:17
+                s = s.zfill(6)
+                h, m, sec = s[:2], s[2:4], s[4:]
+                durations.append(f"{int(h):02}:{int(m):02}:{int(sec):02}")
     return durations
     
 def parse_multiple_places(center_texts, top_time_texts):
