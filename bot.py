@@ -392,7 +392,6 @@ async def on_message(message):
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
 
         # トリミング画像を一時保存
-        from PIL import Image
         import tempfile
 
         def save_temp_image(arr, suffix=".png"):
