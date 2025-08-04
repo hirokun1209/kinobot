@@ -419,6 +419,10 @@ async def on_message(message):
         top_text = "\n".join(top_txts) if top_txts else "(検出なし)"
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
 
+        # 補正後の免戦時間も表示
+        durations = extract_imsen_durations(center_txts)
+        duration_text = "\n".join(durations) if durations else "(抽出なし)"
+        
         # トリミング画像を一時保存
         import tempfile
 
