@@ -436,6 +436,9 @@ async def on_message(message):
             file=discord.File(top_img_path, filename="top.png")
         )
         await message.channel.send(
+            content=f"🕒 **補正後の免戦時間（抽出結果）**:\n```\n{duration_text}\n```"
+        )
+        await message.channel.send(
             content=f"📸 **中央OCR結果（サーバー・免戦）**:\n```\n{center_text}\n```",
             file=discord.File(center_img_path, filename="center.png")
         )
