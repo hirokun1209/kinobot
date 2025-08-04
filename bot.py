@@ -149,7 +149,7 @@ def add_time(base_time_str, duration_str):
         return None, None
     dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
     return dt, dt.strftime("%H:%M:%S")
-def def extract_imsen_durations(texts: list[str]) -> list[str]:
+def extract_imsen_durations(texts: list[str]) -> list[str]:
     durations = []
     for line in texts:
         matches = re.findall(r"免戦中([^\s+%]*)", line)
