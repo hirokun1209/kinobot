@@ -444,6 +444,13 @@ async def on_message(message):
         top_text = "\n".join(top_txts) if top_txts else "(検出なし)"
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
 
+        # 補正済みの予定一覧も表示
+        parsed_preview = parse_multiple_places(center_txts, top_txts)
+        if parsed_preview:
+            preview_lines = [f"・{txt}" for _, txt in parsed_preview]
+            preview_text = "\n".join(preview_lines)
+            await message.channel.send(f"📸 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```")
+    
         # 補正後の免戦時間も表示
         durations = extract_imsen_durations(center_txts)
         duration_text = "\n".join(durations) if durations else "(抽出なし)"
