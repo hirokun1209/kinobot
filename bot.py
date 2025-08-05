@@ -457,33 +457,47 @@ async def on_message(message):
         def extract_and_correct_base_time(txts):
             if not txts:
                 return "??:??:??"
-            
+
             raw = txts[0].strip()
-            digits = re.sub(r"\D", "", raw)  # 数字だけ取り出す
+            digits = re.sub(r"\D", "", raw)
 
-            # 8桁なら → 11:14:22
-            if len(digits) == 8:
-                h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
-                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                    return f"{h:02}:{m:02}:{s:02}"
+            # 🧪 1つ飛ばし補正（例: "11814822" → "11:14:22"）
+            if len(digits) >= 8:
+                try:
+                    h = int(digits[0] + digits[1])
+                    m = int(digits[3] + digits[4])
+                    s = int(digits[6] + digits[7])
+                    if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                        return f"{h:02}:{m:02}:{s:02}"
+                except:
+                    pass
 
-            # 6桁なら → 通常時刻形式
-            if len(digits) == 6:
-                h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
-                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                    return f"{h:02}:{m:02}:{s:02}"
+            # 🧪 通常の6桁（HHMMSS）補正
+            if len(digits) >= 6:
+                try:
+                    h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
+                    if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                        return f"{h:02}:{m:02}:{s:02}"
+                except:
+                    pass
 
-            # 5桁なら → H:MM:SS 形式とみなす
+            # 🧪 5桁（HMMSS）→ H:MM:SS
             if len(digits) == 5:
-                h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:])
-                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                    return f"{h:02}:{m:02}:{s:02}"
+                try:
+                    h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:])
+                    if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                        return f"{h:02}:{m:02}:{s:02}"
+                except:
+                    pass
 
-            # 4桁 → MM:SS とみなして 00:MM:SS
+            # 🧪 4桁（MMSS）→ 00:MM:SS
             if len(digits) == 4:
-                m, s = int(digits[:2]), int(digits[2:])
-                if 0 <= m < 60 and 0 <= s < 60:
-                    return f"00:{m:02}:{s:02}"
+                try:
+                    m, s = int(digits[:2]), int(digits[2:])
+                    if 0 <= m < 60 and 0 <= s < 60:
+                        return f"00:{m:02}:{s:02}"
+                except:
+                    pass
 
             return "??:??:??"
 
