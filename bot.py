@@ -452,34 +452,38 @@ async def on_message(message):
 
         # 基準時間補正関数
         def extract_and_correct_base_time(txts):
-            for t in txts:
-                # 完全一致形式 (HH:MM:SS)
-                if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
-                    return t
+            if not txts:
+                return "??:??:??"
+    
+            t = txts[0]  # 最初の1行だけ対象
 
-                # 数字8桁（例: 11814822 → 11:14:22）
-                if re.fullmatch(r"\d{8}", t):
-                    h, m, s = t[:2], t[2:4], t[6:]
-                    return f"{int(h):02}:{int(m):02}:{int(s):02}"
+            # 完全一致形式 (HH:MM:SS)
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
+                return t
+            
+            # 数字8桁（例: 11814822 → 11:14:22）
+            if re.fullmatch(r"\d{8}", t):
+                h, m, s = t[:2], t[2:4], t[4:6]
+                return f"{int(h):02}:{int(m):02}:{int(s):02}"
+        
+            # ノイズを除去して桁数補正
+            digits = re.sub(r"\D", "", t)
+            if len(digits) == 6:
+                return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
+            elif len(digits) == 5:
+                return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
+            elif len(digits) == 4:
+                return f"00:{int(digits[:2]):02}:{int(digits[2:]):02}"
+            elif len(digits) == 3:
+                return f"00:{int(digits[:1]):02}:{int(digits[1:]):02}"
 
-                # 数字のみ（ノイズ除去）
-                digits = re.sub(r"\D", "", t)
-                if len(digits) == 6:
-                    return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
-                elif len(digits) == 5:
-                    return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
-                elif len(digits) == 4:
-                    return f"00:{int(digits[:2]):02}:{int(digits[2:]):02}"
-                elif len(digits) == 3:
-                    return f"00:{int(digits[:1]):02}:{int(digits[1:]):02}"
             return "??:??:??"
-
         top_time_corrected = extract_and_correct_base_time(top_txts)
         top_raw_text = "\n".join(top_txts) if top_txts else "(検出なし)"
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
 
         parsed_preview = parse_multiple_places(center_txts, top_txts)
-        preview_lines = [f"・{txt}" for _, txt in parsed_preview] if parsed_preview else ["(なし)"]
+        preview_lines = [f"・{txt}" for _, txt, _ in parsed_preview] if parsed_preview else ["(なし)"]
         preview_text = "\n".join(preview_lines)
 
         durations = extract_imsen_durations(center_txts)
@@ -493,16 +497,10 @@ async def on_message(message):
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
         )
 
-    # 補正後の免戦時間の送信
-    await message.channel.send(
-        content=f"🕒 **補正後の免戦時間（抽出結果）**:\n```\n{duration_text}\n```"
-    )
-
     # 中央OCR結果
-    await message.channel.send(
-        content=f"📸 **中央OCR結果（サーバー・免戦）**:\n```\n{center_text}\n```",
-        file=discord.File(center_img_path, filename="center.png")
-    )
+        await message.channel.send(
+            content=f"📸 **中央OCR結果（サーバー・免戦）**:\n```\n{center_text}\n```"
+        )
 
     os.remove(top_img_path)
     os.remove(center_img_path)
