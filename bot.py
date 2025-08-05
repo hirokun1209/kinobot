@@ -514,7 +514,8 @@ async def on_message(message):
             base_time = next((t for t in top_txts if re.match(r"\d{2}:\d{2}:\d{2}", t)), "??:??:??")
 
             image_results = []
-            for dt, txt, *_ in parsed:
+        for dt, txt, raw in parsed:
+            display_txt = f"{txt} ({raw})"
                 if txt not in pending_places:
                     pending_places[txt] = (dt, txt, "", now_jst())
                     image_results.append(txt)
