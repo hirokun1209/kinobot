@@ -457,54 +457,35 @@ async def on_message(message):
         def extract_and_correct_base_time(txts):
             if not txts:
                 return "??:??:??"
+            
+            raw = txts[0].strip()
+            digits = re.sub(r"\D", "", raw)  # 数字だけ取り出す
 
-            t = txts[0].strip()
-
-            # HH:MM:SS
-            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
-                h, m, s = map(int, t.split(":"))
+            # 8桁なら → 11:14:22
+            if len(digits) == 8:
+                h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
                 if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                     return f"{h:02}:{m:02}:{s:02}"
 
-            # 8桁数字 → HHMMSS 例: 11814822 → 11:14:22
-            if re.fullmatch(r"\d{8}", t):
-                h, m, s = int(t[:2]), int(t[2:4]), int(t[4:6])
-                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                    return f"{h:02}:{m:02}:{s:02}"
-
-            # 数字のあとに ":" 2桁（例: 11814:22 → 11:14:22）
-            match = re.match(r"(\d{4,6}):(\d{2})", t)
-            if match:
-                digits, s = match.groups()
-                if len(digits) == 6:
-                    h, m = int(digits[:2]), int(digits[2:4])
-                elif len(digits) == 5:
-                    h, m = int(digits[:1]), int(digits[1:3])
-                elif len(digits) == 4:
-                    h, m = 0, int(digits[:2])
-                else:
-                    h, m = 0, 0
-                s = int(s)
-                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                    return f"{h:02}:{m:02}:{s:02}"
-
-            # その他 → 数字だけ抜いて補正
-            digits = re.sub(r"\D", "", t)
+            # 6桁なら → 通常時刻形式
             if len(digits) == 6:
                 h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
-            elif len(digits) == 5:
-                h, m, s = int(digits[:1]), int(digits[1:3]), int(digits[3:])
-            elif len(digits) == 4:
-                h, m, s = 0, int(digits[:2]), int(digits[2:])
-            elif len(digits) == 3:
-                h, m, s = 0, int(digits[:1]), int(digits[1:])
-            else:
-                return "??:??:??"
+                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                    return f"{h:02}:{m:02}:{s:02}"
 
-            if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                return f"{h:02}:{m:02}:{s:02}"
-            else:
-                return "??:??:??"
+            # 5桁なら → H:MM:SS 形式とみなす
+            if len(digits) == 5:
+                h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:])
+                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                    return f"{h:02}:{m:02}:{s:02}"
+
+            # 4桁 → MM:SS とみなして 00:MM:SS
+            if len(digits) == 4:
+                m, s = int(digits[:2]), int(digits[2:])
+                if 0 <= m < 60 and 0 <= s < 60:
+                    return f"00:{m:02}:{s:02}"
+
+            return "??:??:??"
 
         # 補正実行
         top_time_corrected = extract_and_correct_base_time(top_txts)
