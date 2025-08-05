@@ -455,29 +455,39 @@ async def on_message(message):
             if not txts:
                 return "??:??:??"
     
-            t = txts[0]  # 最初の1行だけ対象
+        # 上部OCRの最初の行だけ使う（例: "11814822"）
+            t = txts[0].strip()
 
-            # 完全一致形式 (HH:MM:SS)
-            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
-                return t
-            
-            # 数字8桁（例: 11814822 → 11:14:22）
+        # 数字8桁（例: 11814822 → 11:14:22）
             if re.fullmatch(r"\d{8}", t):
-                h, m, s = t[:2], t[2:4], t[4:6]
-                return f"{int(h):02}:{int(m):02}:{int(s):02}"
-        
-            # ノイズを除去して桁数補正
+                h, m, s = int(t[:2]), int(t[2:4]), int(t[6:])
+                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                    return f"{h:02}:{m:02}:{s:02}"
+
+        # HH:MM:SS形式
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
+                h, m, s = map(int, t.split(":"))
+                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                    return f"{h:02}:{m:02}:{s:02}"
+
+        # その他：ノイズ除去して数値部分だけで判断
             digits = re.sub(r"\D", "", t)
             if len(digits) == 6:
-                return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
+                h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
             elif len(digits) == 5:
-                return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
+                h, m, s = int(digits[:1]), int(digits[1:3]), int(digits[3:])
             elif len(digits) == 4:
-                return f"00:{int(digits[:2]):02}:{int(digits[2:]):02}"
+                h, m, s = 0, int(digits[:2]), int(digits[2:])
             elif len(digits) == 3:
-                return f"00:{int(digits[:1]):02}:{int(digits[1:]):02}"
+                h, m, s = 0, int(digits[:1]), int(digits[1:])
+            else:
+                return "??:??:??"
 
-            return "??:??:??"
+        # 上限チェック
+            if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                return f"{h:02}:{m:02}:{s:02}"
+            else:
+                return "??:??:??"
         top_time_corrected = extract_and_correct_base_time(top_txts)
         top_raw_text = "\n".join(top_txts) if top_txts else "(検出なし)"
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
