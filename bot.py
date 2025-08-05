@@ -432,10 +432,10 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
-    if message.content.strip() == "!ocrdebug":
-        if not message.attachments:
-            await message.channel.send("⚠️ 画像を添付してください（OCR結果とトリミング画像を確認します）")
-            return
+if message.content.strip() == "!ocrdebug":
+    if not message.attachments:
+        await message.channel.send("⚠️ 画像を添付してください（OCR結果とトリミング画像を確認します）")
+        return
 
     a = message.attachments[0]
     b = await a.read()
@@ -448,37 +448,40 @@ async def on_message(message):
     top_txts = extract_text_from_image(top)
     center_txts = extract_text_from_image(center)
 
-    # 🔽 補正関数
-def extract_and_correct_base_time(txts):
-    for t in txts:
-        # 完全一致形式 (HH:MM:SS)
-        if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
-            return t
-        # 数字8桁（例: 11814822 → 11:14:22）
-        if re.fullmatch(r"\d{8}", t):
-            return f"{int(t[:2]):02}:{int(t[2:4]):02}:{int(t[4:6]):02}"
-        # 数字のみ、長さ6や5（HHMMSS or HMMSS）
-        digits = re.sub(r"\D", "", t)
-        if len(digits) == 6:
-            return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
-        elif len(digits) == 5:
-            return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
-    return "??:??:??"
+    # 補正関数
+    def extract_and_correct_base_time(txts):
+        for t in txts:
+            # 完全一致形式 (HH:MM:SS)
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
+                return t
+            # 数字8桁（例: 11814822 → 11:14:22）
+            if re.fullmatch(r"\d{8}", t):
+                return f"{int(t[:2]):02}:{int(t[2:4]):02}:{int(t[4:6]):02}"
+            # 数字のみ、長さ6や5（HHMMSS or HMMSS）
+            digits = re.sub(r"\D", "", t)
+            if len(digits) == 6:
+                return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
+            elif len(digits) == 5:
+                return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
+        return "??:??:??"
 
+    # 表示用テキスト
     top_time_corrected = extract_and_correct_base_time(top_txts)
     top_raw_text = "\n".join(top_txts) if top_txts else "(検出なし)"
     center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
 
+    # 補正済みの予定一覧
     parsed_preview = parse_multiple_places(center_txts, top_txts)
     if parsed_preview:
-        preview_lines = [f"・{txt}" for _, txt in parsed_preview]
+        preview_lines = [f"・{txt}" for _, txt, *_ in parsed_preview]
         preview_text = "\n".join(preview_lines)
         await message.channel.send(f"📸 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```")
 
+    # 補正後の免戦時間も表示
     durations = extract_imsen_durations(center_txts)
     duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
-    # 🖼️ トリミング画像保存
+    # トリミング画像を一時保存
     import tempfile
     def save_temp_image(arr, suffix=".png"):
         temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -488,18 +491,19 @@ def extract_and_correct_base_time(txts):
     top_img_path = save_temp_image(top)
     center_img_path = save_temp_image(center)
 
-    # 🔽 上部OCR生データ＋補正後基準時間を一緒に送信
+    # 生の上部OCR結果と補正後基準時間の送信
     await message.channel.send(
-        content=f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_raw_text}\n```\n🛠️ **補正後の基準時間** → `{top_time_corrected}`",
+        content=f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_raw_text}\n```" +
+                f"\n🛠️ **補正後の基準時間** → `{top_time_corrected}`",
         file=discord.File(top_img_path, filename="top.png")
     )
 
-    # 🔽 補正後免戦時間
+    # 補正後の免戦時間の送信
     await message.channel.send(
         content=f"🕒 **補正後の免戦時間（抽出結果）**:\n```\n{duration_text}\n```"
     )
 
-    # 🔽 中央部OCR結果
+    # 中央OCR結果
     await message.channel.send(
         content=f"📸 **中央OCR結果（サーバー・免戦）**:\n```\n{center_text}\n```",
         file=discord.File(center_img_path, filename="center.png")
