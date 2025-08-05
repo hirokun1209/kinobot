@@ -197,19 +197,19 @@ def parse_multiple_places(center_texts, top_time_texts):
     res = []
 
     def extract_top_time(txts):
-    for t in txts:
-        # パターン: HH:MM:SS（完全一致）
-        if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
-            return t
+        for t in txts:
+            # パターン: HH:MM:SS（完全一致）
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
+                return t
 
-    for t in txts:
-        # 数字だけ抽出
-        digits = re.sub(r"[^\d]", "", t)
-        if len(digits) >= 6:
-            h, m, s = digits[:2], digits[2:4], digits[4:6]
-            return f"{int(h):02}:{int(m):02}:{int(s):02}"
+        for t in txts:
+            # 数字だけ抽出
+            digits = re.sub(r"[^\d]", "", t)
+            if len(digits) >= 6:
+                h, m, s = digits[:2], digits[2:4], digits[4:6]
+                return f"{int(h):02}:{int(m):02}:{int(s):02}"
 
-    return None
+        return None
 
     top_time = extract_top_time(top_time_texts)
     server = extract_server_number(center_texts)
