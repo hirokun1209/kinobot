@@ -419,10 +419,12 @@ async def on_message(message):
     cleanup_old_entries()
     channel = client.get_channel(NOTIFY_CHANNEL_ID)
 
+    # ==== !reset ====
     if message.content.strip() == "!reset":
         await reset_all(message)
         return
 
+    # ==== !debug ====
     if message.content.strip() == "!debug":
         if pending_places:
             lines = ["✅ 現在の登録された予定:"]
@@ -432,6 +434,7 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
+    # ==== !ocrdebug ====
     if message.content.strip() == "!ocrdebug":
         if not message.attachments:
             await message.channel.send("⚠️ 画像を添付してください（OCR結果とトリミング画像を確認します）")
@@ -442,35 +445,25 @@ async def on_message(message):
         img = Image.open(io.BytesIO(b)).convert("RGB")
         np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        # トリミング
         top = crop_top_right(np_img)
         center = crop_center_area(np_img)
 
-        # OCRテキスト
         top_txts = extract_text_from_image(top)
         center_txts = extract_text_from_image(center)
 
-        # 基準時間補正関数
+        # 基準時間補正
         def extract_and_correct_base_time(txts):
             if not txts:
                 return "??:??:??"
-    
-            # 上部OCRの最初の行だけ使う（例: "11814822"）
             t = txts[0].strip()
-
-            # 数字8桁（例: 11814822 → 11:14:22）
             if re.fullmatch(r"\d{8}", t):
-                h, m, s = int(t[:2]), int(t[2:4]), int(t[6:])
+                h, m, s = int(t[:2]), int(t[2:4]), int(t[4:6])
                 if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                     return f"{h:02}:{m:02}:{s:02}"
-
-            # HH:MM:SS形式
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
                 h, m, s = map(int, t.split(":"))
                 if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                     return f"{h:02}:{m:02}:{s:02}"
-
-            # その他：ノイズ除去して数値部分だけで判断
             digits = re.sub(r"\D", "", t)
             if len(digits) == 6:
                 h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
@@ -482,12 +475,11 @@ async def on_message(message):
                 h, m, s = 0, int(digits[:1]), int(digits[1:])
             else:
                 return "??:??:??"
-
-            # 上限チェック
             if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                 return f"{h:02}:{m:02}:{s:02}"
             else:
                 return "??:??:??"
+
         top_time_corrected = extract_and_correct_base_time(top_txts)
         top_raw_text = "\n".join(top_txts) if top_txts else "(検出なし)"
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
@@ -506,14 +498,9 @@ async def on_message(message):
             f"📋 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```\n"
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
         )
+        return  # ← ここにあるべき！
 
-    # 中央OCR結果
-        await message.channel.send(
-            content=f"📸 **中央OCR結果（サーバー・免戦）**:\n```\n{center_text}\n```"
-        )
-
-    return
-
+    # ==== 手動追加（例: 1234-1-12:34:56）====
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
         for server, place, t in manual:
@@ -533,7 +520,8 @@ async def on_message(message):
                     active_tasks.add(task2)
                     task2.add_done_callback(lambda t: active_tasks.discard(t))
         return
-        
+
+    # ==== 通常画像送信 ====
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
         grouped_results = []
@@ -562,12 +550,9 @@ async def on_message(message):
                         task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
                         active_tasks.add(task2)
                         task2.add_done_callback(lambda t: active_tasks.discard(t))
-
-            # ✅ ここが重要：結果がある場合に追加
             if image_results:
                 grouped_results.append((base_time, image_results))
 
-        # 結果送信
         if grouped_results:
             lines = ["✅ 解析完了！登録されました"]
             for base_time, txts in grouped_results:
