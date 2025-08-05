@@ -449,19 +449,21 @@ async def on_message(message):
     center_txts = extract_text_from_image(center)
 
     # 🔽 補正関数
-    def extract_and_correct_base_time(txts):
-        for t in txts:
-            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
-                return t
-            if re.fullmatch(r"\d{8}", t):
-                # 例: 11814822 → 11:14:22（注意：位置は 0-2, 4-6, 6-8）
-                return f"{int(t[:2]):02}:{int(t[4:6]):02}:{int(t[6:]):02}"
-            digits = re.sub(r"\D", "", t)
-            if len(digits) == 6:
-                return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
-            elif len(digits) == 5:
-                return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
-        return "??:??:??"
+def extract_and_correct_base_time(txts):
+    for t in txts:
+        # 完全一致形式 (HH:MM:SS)
+        if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
+            return t
+        # 数字8桁（例: 11814822 → 11:14:22）
+        if re.fullmatch(r"\d{8}", t):
+            return f"{int(t[:2]):02}:{int(t[2:4]):02}:{int(t[4:6]):02}"
+        # 数字のみ、長さ6や5（HHMMSS or HMMSS）
+        digits = re.sub(r"\D", "", t)
+        if len(digits) == 6:
+            return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
+        elif len(digits) == 5:
+            return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
+    return "??:??:??"
 
     top_time_corrected = extract_and_correct_base_time(top_txts)
     top_raw_text = "\n".join(top_txts) if top_txts else "(検出なし)"
