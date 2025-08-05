@@ -445,25 +445,50 @@ async def on_message(message):
         img = Image.open(io.BytesIO(b)).convert("RGB")
         np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
+        # トリミング
         top = crop_top_right(np_img)
         center = crop_center_area(np_img)
 
+        # OCRテキスト抽出
         top_txts = extract_text_from_image(top)
         center_txts = extract_text_from_image(center)
 
-        # 基準時間補正
+        # 補正関数
         def extract_and_correct_base_time(txts):
             if not txts:
                 return "??:??:??"
+
             t = txts[0].strip()
-            if re.fullmatch(r"\d{8}", t):
-                h, m, s = int(t[:2]), int(t[2:4]), int(t[4:6])
-                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                    return f"{h:02}:{m:02}:{s:02}"
+
+            # HH:MM:SS
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
                 h, m, s = map(int, t.split(":"))
                 if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                     return f"{h:02}:{m:02}:{s:02}"
+
+            # 8桁数字 → HHMMSS 例: 11814822 → 11:14:22
+            if re.fullmatch(r"\d{8}", t):
+                h, m, s = int(t[:2]), int(t[2:4]), int(t[4:6])
+                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                    return f"{h:02}:{m:02}:{s:02}"
+
+            # 数字のあとに ":" 2桁（例: 11814:22 → 11:14:22）
+            match = re.match(r"(\d{4,6}):(\d{2})", t)
+            if match:
+                digits, s = match.groups()
+                if len(digits) == 6:
+                    h, m = int(digits[:2]), int(digits[2:4])
+                elif len(digits) == 5:
+                    h, m = int(digits[:1]), int(digits[1:3])
+                elif len(digits) == 4:
+                    h, m = 0, int(digits[:2])
+                else:
+                    h, m = 0, 0
+                s = int(s)
+                if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                    return f"{h:02}:{m:02}:{s:02}"
+
+            # その他 → 数字だけ抜いて補正
             digits = re.sub(r"\D", "", t)
             if len(digits) == 6:
                 h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
@@ -475,22 +500,27 @@ async def on_message(message):
                 h, m, s = 0, int(digits[:1]), int(digits[1:])
             else:
                 return "??:??:??"
+
             if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                 return f"{h:02}:{m:02}:{s:02}"
             else:
                 return "??:??:??"
 
+        # 補正実行
         top_time_corrected = extract_and_correct_base_time(top_txts)
         top_raw_text = "\n".join(top_txts) if top_txts else "(検出なし)"
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
 
+        # 予定抽出
         parsed_preview = parse_multiple_places(center_txts, top_txts)
         preview_lines = [f"・{txt}" for _, txt, _ in parsed_preview] if parsed_preview else ["(なし)"]
         preview_text = "\n".join(preview_lines)
 
+        # 免戦時間抽出
         durations = extract_imsen_durations(center_txts)
         duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
+        # 送信
         await message.channel.send(
             f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_raw_text}\n```\n"
             f"🛠️ **補正後の基準時間** → `{top_time_corrected}`\n\n"
@@ -498,7 +528,7 @@ async def on_message(message):
             f"📋 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```\n"
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
         )
-        return  # ← ここにあるべき！
+        return
 
     # ==== 手動追加（例: 1234-1-12:34:56）====
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
