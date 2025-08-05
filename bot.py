@@ -550,22 +550,24 @@ async def on_message(message):
             base_time = next((t for t in top_txts if re.match(r"\d{2}:\d{2}:\d{2}", t)), "??:??:??")
 
             image_results = []
-        for dt, txt, raw in parsed:
-            if txt not in pending_places:
-                pending_places[txt] = (dt, txt, "", now_jst())
-                display_txt = f"{txt} ({raw})"
-                image_results.append(display_txt)
-                task = asyncio.create_task(handle_new_event(dt, txt, channel))
-                active_tasks.add(task)
-                task.add_done_callback(lambda t: active_tasks.discard(t))
-                if txt.startswith("奪取"):
-                    task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
-                    active_tasks.add(task2)
-                    task2.add_done_callback(lambda t: active_tasks.discard(t))
-            
+            for dt, txt, raw in parsed:
+                if txt not in pending_places:
+                    pending_places[txt] = (dt, txt, "", now_jst())
+                    display_txt = f"{txt} ({raw})"
+                    image_results.append(display_txt)
+                    task = asyncio.create_task(handle_new_event(dt, txt, channel))
+                    active_tasks.add(task)
+                    task.add_done_callback(lambda t: active_tasks.discard(t))
+                    if txt.startswith("奪取"):
+                        task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
+                        active_tasks.add(task2)
+                        task2.add_done_callback(lambda t: active_tasks.discard(t))
+
+            # ✅ ここが重要：結果がある場合に追加
             if image_results:
                 grouped_results.append((base_time, image_results))
 
+        # 結果送信
         if grouped_results:
             lines = ["✅ 解析完了！登録されました"]
             for base_time, txts in grouped_results:
