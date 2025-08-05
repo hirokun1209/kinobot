@@ -455,22 +455,22 @@ async def on_message(message):
             if not txts:
                 return "??:??:??"
     
-        # 上部OCRの最初の行だけ使う（例: "11814822"）
+            # 上部OCRの最初の行だけ使う（例: "11814822"）
             t = txts[0].strip()
 
-        # 数字8桁（例: 11814822 → 11:14:22）
+            # 数字8桁（例: 11814822 → 11:14:22）
             if re.fullmatch(r"\d{8}", t):
                 h, m, s = int(t[:2]), int(t[2:4]), int(t[6:])
                 if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                     return f"{h:02}:{m:02}:{s:02}"
 
-        # HH:MM:SS形式
+            # HH:MM:SS形式
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
                 h, m, s = map(int, t.split(":"))
                 if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                     return f"{h:02}:{m:02}:{s:02}"
 
-        # その他：ノイズ除去して数値部分だけで判断
+            # その他：ノイズ除去して数値部分だけで判断
             digits = re.sub(r"\D", "", t)
             if len(digits) == 6:
                 h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
@@ -483,7 +483,7 @@ async def on_message(message):
             else:
                 return "??:??:??"
 
-        # 上限チェック
+            # 上限チェック
             if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                 return f"{h:02}:{m:02}:{s:02}"
             else:
@@ -512,8 +512,6 @@ async def on_message(message):
             content=f"📸 **中央OCR結果（サーバー・免戦）**:\n```\n{center_text}\n```"
         )
 
-    os.remove(top_img_path)
-    os.remove(center_img_path)
     return
 
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
