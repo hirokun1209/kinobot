@@ -432,10 +432,10 @@ async def on_message(message):
             await message.channel.send("⚠️ 登録された予定はありません")
         return
 
-if message.content.strip() == "!ocrdebug":
-    if not message.attachments:
-        await message.channel.send("⚠️ 画像を添付してください（OCR結果とトリミング画像を確認します）")
-        return
+    if message.content.strip() == "!ocrdebug":
+        if not message.attachments:
+            await message.channel.send("⚠️ 画像を添付してください（OCR結果とトリミング画像を確認します）")
+            return
 
     a = message.attachments[0]
     b = await a.read()
