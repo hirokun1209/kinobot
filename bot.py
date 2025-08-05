@@ -195,7 +195,22 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
     
 def parse_multiple_places(center_texts, top_time_texts):
     res = []
-    top_time = next((t for t in top_time_texts if re.match(r"\d{2}:\d{2}:\d{2}", t)), None)
+
+    def extract_top_time(txts):
+        # パターン: HH:MM:SS
+        for t in txts:
+            if re.match(r"\d{2}:\d{2}:\d{2}", t):
+                return t
+
+        # パターン: 8桁の連続数字 → HHMMSS補正
+        for t in txts:
+            digits = re.sub(r"[^\d]", "", t)
+            if len(digits) == 8:
+                # 例: 11814822 → 11:14:22
+                return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:6]):02}"
+        return None
+
+    top_time = extract_top_time(top_time_texts)
     server = extract_server_number(center_texts)
     if not top_time or not server:
         return []
@@ -213,7 +228,7 @@ def parse_multiple_places(center_texts, top_time_texts):
             d = durations[i]
             dt, unlock = add_time(top_time, d)
             if dt:
-                res.append((dt, f"{mode} {server}-{current}-{unlock}", d))  # ← 生文字列も返す
+                res.append((dt, f"{mode} {server}-{current}-{unlock}", d))  # 生文字列も返す
             current = None
             i += 1
     return res
