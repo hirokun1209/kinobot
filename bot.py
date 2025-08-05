@@ -467,8 +467,8 @@ async def on_message(message):
             elif len(digits) == 5:
                 return f"{int(digits[:1]):02}:{int(digits[1:3]):02}:{int(digits[3:]):02}"
         return "??:??:??"
-top_time_corrected = extract_and_correct_base_time(top_txts)
-top_text = top_time_corrected
+        top_time_corrected = extract_and_correct_base_time(top_txts)
+        top_text = top_time_corrected
         center_text = "\n".join(center_txts) if center_txts else "(検出なし)"
 
         # 補正済みの予定一覧も表示
