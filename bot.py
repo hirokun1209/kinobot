@@ -515,17 +515,17 @@ async def on_message(message):
 
             image_results = []
         for dt, txt, raw in parsed:
-            display_txt = f"{txt} ({raw})"
-                if txt not in pending_places:
-                    pending_places[txt] = (dt, txt, "", now_jst())
-                    image_results.append(txt)
-                    task = asyncio.create_task(handle_new_event(dt, txt, channel))
-                    active_tasks.add(task)
-                    task.add_done_callback(lambda t: active_tasks.discard(t))
-                    if txt.startswith("奪取"):
-                        task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
-                        active_tasks.add(task2)
-                        task2.add_done_callback(lambda t: active_tasks.discard(t))
+            if txt not in pending_places:
+                pending_places[txt] = (dt, txt, "", now_jst())
+                display_txt = f"{txt} ({raw})"
+                image_results.append(display_txt)
+                task = asyncio.create_task(handle_new_event(dt, txt, channel))
+                active_tasks.add(task)
+                task.add_done_callback(lambda t: active_tasks.discard(t))
+                if txt.startswith("奪取"):
+                    task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
+                    active_tasks.add(task2)
+                    task2.add_done_callback(lambda t: active_tasks.discard(t))
             
             if image_results:
                 grouped_results.append((base_time, image_results))
