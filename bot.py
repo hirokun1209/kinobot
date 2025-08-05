@@ -454,7 +454,8 @@ async def on_message(message):
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
                 return t
             if re.fullmatch(r"\d{8}", t):
-                return f"{int(t[:2]):02}:{int(t[2:4]):02}:{int(t[6:]):02}"
+                # 例: 11814822 → 11:14:22（注意：位置は 0-2, 4-6, 6-8）
+                return f"{int(t[:2]):02}:{int(t[4:6]):02}:{int(t[6:]):02}"
             digits = re.sub(r"\D", "", t)
             if len(digits) == 6:
                 return f"{int(digits[:2]):02}:{int(digits[2:4]):02}:{int(digits[4:]):02}"
