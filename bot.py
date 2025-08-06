@@ -536,46 +536,26 @@ async def on_message(message):
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
         )
         return
-        # ==== !a 奪取 1234-1-12:34:56 123500 ====
-    if message.content.startswith("!a "):
-        parts = message.content[2:].strip().split()
-        if len(parts) != 2:
-            await message.channel.send("⚠️ 書式は `!a 奪取 1234-1-12:34:56 123500` です")
-            return
-        txt, new_time_raw = parts
-        digits = re.sub(r"\D", "", new_time_raw)
-        if len(digits) != 6:
-            await message.channel.send("⚠️ 時間は6桁（HHMMSS）で指定してください")
-            return
-        try:
-            h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
-            if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
-                raise ValueError()
-            new_time_str = f"{h:02}:{m:02}:{s:02}"
-        except:
-            await message.channel.send("⚠️ 時刻の形式が正しくありません")
-            return
+    # ==== !a 奪取 1272-4-06:24:35 123450 ====
+    match = re.fullmatch(r"!a\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})\s+(\d{6})", message.content.strip())
+    if match:
+        mode, server, place, old_time, new_duration = match.groups()
 
-        # 一致する予定を探す
-        if txt not in pending_places:
-            await message.channel.send("⚠️ 指定された予定が見つかりません")
+        old_txt = f"{mode} {server}-{place}-{old_time}"
+        new_dt, new_time = add_time("00:00:00", f"{new_duration[:2]}:{new_duration[2:4]}:{new_duration[4:6]}")
+        if not new_dt:
+            await message.channel.send("⚠️ 時間変換に失敗しました")
             return
+        new_txt = f"{mode} {server}-{place}-{new_time}"
 
-        old_dt, _, _, _ = pending_places[txt]
-        new_dt = datetime.combine(now_jst().date(), datetime.strptime(new_time_str, "%H:%M:%S").time(), tzinfo=JST)
-        if new_dt < old_dt:
-            new_dt += timedelta(days=1) if old_dt.hour > 20 and new_dt.hour < 4 else timedelta()
+        # 予定を上書き（通知・コピーも）
+        if old_txt in pending_places:
+            pending_places.pop(old_txt)
 
-        # 情報更新
-        del pending_places[txt]
-        server, place = re.findall(r"(\d+)-(\d+)-", txt)[0]
-        mode = "警備" if server == "1268" else "奪取"
-        new_txt = f"{mode} {server}-{place}-{new_time_str}"
         pending_places[new_txt] = (new_dt, new_txt, server, now_jst())
+        await message.channel.send(f"✅ 更新しました → `{new_txt}`")
 
-        await message.channel.send(f"🔁 `{txt}` を `{new_txt}` に更新しました")
-
-        # イベント更新（通知やブロック編集）
+        # 通知スケジューリング
         task = asyncio.create_task(handle_new_event(new_dt, new_txt, channel))
         active_tasks.add(task)
         task.add_done_callback(lambda t: active_tasks.discard(t))
