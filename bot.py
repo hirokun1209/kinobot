@@ -458,10 +458,28 @@ async def on_message(message):
 
         removed = False
 
-        # pending_places から削除
+        # pending_places から削除＋通知削除
         if txt in pending_places:
-            del pending_places[txt]
+            entry = pending_places.pop(txt)
             removed = True
+
+            # 通知チャンネルの削除
+            if "main_msg_id" in entry and entry["main_msg_id"]:
+                ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["main_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+            # コピー用チャンネルの削除
+            if "copy_msg_id" in entry and entry["copy_msg_id"]:
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
 
         # summary_blocks から削除
         for block in summary_blocks:
@@ -594,13 +612,38 @@ async def on_message(message):
             return
         new_txt = f"{mode} {server}-{place}-{new_time}"
 
-        # 予定を上書き（通知・コピーも）
+        # 元の予定があるなら削除処理（通知/コピー両方）
         if old_txt in pending_places:
-            pending_places.pop(old_txt)
+            old_entry = pending_places.pop(old_txt)
 
-        pending_places[new_txt] = (new_dt, new_txt, server, now_jst())
+            # 通知チャンネルの削除
+            if "main_msg_id" in old_entry and old_entry["main_msg_id"]:
+                ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(old_entry["main_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+            # コピー用チャンネルの削除
+            if "copy_msg_id" in old_entry and old_entry["copy_msg_id"]:
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(old_entry["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+        # 新しい予定として登録
+        pending_places[new_txt] = {
+            "dt": new_dt,
+            "txt": new_txt,
+            "server": server,
+            "created_at": now_jst(),
+            "main_msg_id": None,
+            "copy_msg_id": None,
+        }
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
-
         # 通知スケジューリング
         task = asyncio.create_task(handle_new_event(new_dt, new_txt, channel))
         active_tasks.add(task)
