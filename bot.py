@@ -436,6 +436,38 @@ async def on_message(message):
         await reset_all(message)
         return
 
+    # ==== !del 奪取 1272-4-06:24:35 ====
+    match = re.fullmatch(r"!del\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", message.content.strip())
+    if match:
+        mode, server, place, t = match.groups()
+        txt = f"{mode} {server}-{place}-{t}"
+
+        removed = False
+
+        # pending_places から削除
+        if txt in pending_places:
+            del pending_places[txt]
+            removed = True
+
+        # summary_blocks から削除
+        for block in summary_blocks:
+            before = len(block["events"])
+            block["events"] = [ev for ev in block["events"] if ev[1] != txt]
+            after = len(block["events"])
+            if before != after:
+                removed = True
+                if block["msg"]:
+                    try:
+                        await block["msg"].edit(content=format_block_msg(block, True))
+                    except:
+                        pass
+
+        if removed:
+            await message.channel.send(f"🗑️ 削除しました → `{txt}`")
+        else:
+            await message.channel.send(f"⚠️ 該当の予定が見つかりませんでした → `{txt}`")
+        return
+
     # ==== !debug ====
     if message.content.strip() == "!debug":
         if pending_places:
