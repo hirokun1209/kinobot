@@ -198,40 +198,42 @@ def parse_multiple_places(center_texts, top_time_texts):
 
     def extract_top_time(txts):
         for t in txts:
-            # パターン: HH:MM:SS（完全一致）
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
                 return t
-
         for t in txts:
-            # 数字だけ抽出
             digits = re.sub(r"[^\d]", "", t)
             if len(digits) >= 6:
                 h, m, s = digits[:2], digits[2:4], digits[4:6]
                 return f"{int(h):02}:{int(m):02}:{int(s):02}"
-
         return None
 
     top_time = extract_top_time(top_time_texts)
     server = extract_server_number(center_texts)
     if not top_time or not server:
         return []
+
     mode = "警備" if server == "1268" else "奪取"
-    current = None
+    last_place = None
 
-    durations = extract_imsen_durations(center_texts)
-
-    i = 0
     for t in center_texts:
-        p = re.search(r"越域駐騎場(\d+)", t)
-        if p:
-            current = p.group(1)
-        if current and i < len(durations):
-            d = durations[i]
-            dt, unlock = add_time(top_time, d)
-            if dt:
-                res.append((dt, f"{mode} {server}-{current}-{unlock}", d))  # 生文字列も返す
-            current = None
-            i += 1
+        # 駐騎場番号の検出
+        match = re.search(r"越域駐騎場(\d+)", t)
+        if match:
+            last_place = match.group(1)
+            continue
+
+        # 免戦時間の検出
+        match = re.search(r"免戦中([0-9:\-日分秒hmsHMShms％%日]+)", t)
+        if match and last_place:
+            raw = match.group(1)
+            durations = extract_imsen_durations([raw])
+            if durations:
+                d = durations[0]
+                dt, unlock = add_time(top_time, d)
+                if dt:
+                    res.append((dt, f"{mode} {server}-{last_place}-{unlock}", d))
+            last_place = None  # 1つの免戦時間を使ったらリセット
+
     return res
 # =======================
 # ブロック・通知処理
