@@ -58,6 +58,14 @@ ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 # =======================
 # 管理構造
 # =======================
+# txt: str -> {
+#     "dt": datetime,
+#     "txt": str,
+#     "server": str,
+#     "created_at": datetime,
+#     "main_msg_id": Optional[int],
+#     "copy_msg_id": Optional[int]
+# }
 pending_places = {}
 summary_blocks = []
 active_tasks = set()
@@ -260,7 +268,10 @@ async def send_to_copy_channel(dt, txt):
         await msg.delete()
     except:
         pass
-        
+        return msg.id
+def store_copy_msg_id(txt, msg_id):
+    if txt in pending_places:
+        pending_places[txt]["copy_msg_id"] = msg_id
 def find_or_create_block(new_dt):
     for block in summary_blocks:
         if new_dt <= block["max"] + timedelta(minutes=45):
@@ -304,7 +315,10 @@ async def handle_new_event(dt, txt, channel):
     if (dt, txt) not in block["events"]:
         block["events"].append((dt, txt))
         # 通常通知チャンネルに加え、コピー専用にも送信
-        asyncio.create_task(send_to_copy_channel(dt, txt))
+        copy_task = asyncio.create_task(send_to_copy_channel(dt, txt))
+        copy_task.add_done_callback(
+            lambda t: store_copy_msg_id(txt, t.result())
+        )
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
     if block["msg"]:
@@ -606,7 +620,14 @@ async def on_message(message):
             txt = f"{mode} {server}-{place}-{t}"
             dt = datetime.combine(now_jst().date(), datetime.strptime(t, "%H:%M:%S").time(), tzinfo=JST)
             if txt not in pending_places:
-                pending_places[txt] = (dt, txt, server, now_jst())
+                pending_places[txt] = {
+                    "dt": dt,
+                    "txt": txt,
+                    "server": server,
+                    "created_at": now_jst(),
+                    "main_msg_id": None,
+                    "copy_msg_id": None,
+                }
                 await message.channel.send(f"✅手動登録:{txt}")
                 task = asyncio.create_task(handle_new_event(dt, txt, channel))
                 active_tasks.add(task)
@@ -686,7 +707,14 @@ async def on_message(message):
         image_results = []
         for dt, txt, raw in parsed:
             if txt not in pending_places:
-                pending_places[txt] = (dt, txt, "", now_jst())
+                pending_places[txt] = {
+                    "dt": dt,
+                    "txt": txt,
+                    "server": "",
+                    "created_at": now_jst(),
+                    "main_msg_id": None,
+                    "copy_msg_id": None
+                }
                 display_txt = f"{txt} ({raw})"
                 image_results.append(display_txt)
                 task = asyncio.create_task(handle_new_event(dt, txt, channel))
