@@ -196,6 +196,7 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
 def parse_multiple_places(center_texts, top_time_texts):
     res = []
 
+    # 上部時間の抽出（補正後）
     def extract_top_time(txts):
         for t in txts:
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
@@ -213,26 +214,35 @@ def parse_multiple_places(center_texts, top_time_texts):
         return []
 
     mode = "警備" if server == "1268" else "奪取"
-    last_place = None
 
-    for t in center_texts:
-        # 駐騎場番号の検出
-        match = re.search(r"越域駐騎場(\d+)", t)
+    # ✅ グループ構築
+    groups = []
+    current_group = {"place": None, "lines": []}
+
+    for line in center_texts:
+        match = re.search(r"越域駐騎場(\d+)", line)
         if match:
-            last_place = match.group(1)
-            continue
+            # 新しい駐騎場番号を見つけたら前のグループ保存
+            if current_group["place"] and current_group["lines"]:
+                groups.append(current_group)
+            # 新しいグループ開始
+            current_group = {"place": match.group(1), "lines": []}
+        else:
+            current_group["lines"].append(line)
 
-        # 免戦時間の検出
-        match = re.search(r"免戦中([0-9:\-日分秒hmsHMShms％%日]+)", t)
-        if match and last_place:
-            raw = match.group(1)
-            durations = extract_imsen_durations([raw])
-            if durations:
-                d = durations[0]
-                dt, unlock = add_time(top_time, d)
-                if dt:
-                    res.append((dt, f"{mode} {server}-{last_place}-{unlock}", d))
-            last_place = None  # 1つの免戦時間を使ったらリセット
+    # 最後のグループも追加
+    if current_group["place"] and current_group["lines"]:
+        groups.append(current_group)
+
+    # ✅ 各グループの免戦時間抽出
+    for g in groups:
+        durations = extract_imsen_durations(g["lines"])
+        if not durations:
+            continue
+        d = durations[0]  # 最初の免戦時間を使用
+        dt, unlock = add_time(top_time, d)
+        if dt:
+            res.append((dt, f"{mode} {server}-{g['place']}-{unlock}", d))
 
     return res
 # =======================
