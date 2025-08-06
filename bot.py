@@ -81,9 +81,28 @@ EXPIRE_GRACE = timedelta(minutes=2)  # 終了から2分猶予してから削除
 async def remove_expired_entries():
     now = now_jst()
 
-    # pending_placesの削除
-    for k, (dt, *_rest) in list(pending_places.items()):
+    # pending_placesの削除 + メッセージも削除
+    for k, v in list(pending_places.items()):
+        dt = v["dt"]
         if dt + EXPIRE_GRACE < now:
+            # 通知チャンネルの削除
+            if "main_msg_id" in v and v["main_msg_id"]:
+                ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(v["main_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+            # コピー用チャンネルの削除
+            if "copy_msg_id" in v and v["copy_msg_id"]:
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(v["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
             del pending_places[k]
 
     # summary_blocksの削除と通知メッセージ削除
@@ -117,7 +136,7 @@ def now_jst():
 def cleanup_old_entries():
     now = now_jst()
     for k in list(pending_places):
-        if (now - pending_places[k][3]) > timedelta(hours=6):
+        if (now - pending_places[k]["created_at"]) > timedelta(hours=6):
             del pending_places[k]
 
 def crop_top_right(img):
@@ -336,7 +355,7 @@ async def handle_new_event(dt, txt, channel):
         task.add_done_callback(lambda t: active_tasks.discard(t))
 
 def is_within_5_minutes_of_another(target_dt):
-    times = sorted([v[0] for v in pending_places.values()])
+    times = sorted([v["dt"] for v in pending_places.values()])
     for dt in times:
         if dt != target_dt and abs((dt - target_dt).total_seconds()) <= 300:
             return True
@@ -409,27 +428,35 @@ async def periodic_cleanup_task():
 # コマンドベースのリセット
 # =======================
 async def reset_all(message):
+    # 個別メッセージ削除（通知・コピー用）
+    for entry in list(pending_places.values()):
+        # 通知チャンネルの削除
+        if "main_msg_id" in entry and entry["main_msg_id"]:
+            ch = client.get_channel(NOTIFY_CHANNEL_ID)
+            try:
+                msg = await ch.fetch_message(entry["main_msg_id"])
+                await msg.delete()
+            except:
+                pass
+
+        # コピー用チャンネルの削除
+        if "copy_msg_id" in entry and entry["copy_msg_id"]:
+            ch = client.get_channel(COPY_CHANNEL_ID)
+            try:
+                msg = await ch.fetch_message(entry["copy_msg_id"])
+                await msg.delete()
+            except:
+                pass
+
     pending_places.clear()
     summary_blocks.clear()
     sent_notifications.clear()
+
     for task in list(active_tasks):
         task.cancel()
     active_tasks.clear()
 
-    # 通知チャンネルとコピー用チャンネルのメッセージ削除
-    for cid in [NOTIFY_CHANNEL_ID, COPY_CHANNEL_ID]:
-        if cid != 0:
-            ch = client.get_channel(cid)
-            if ch:
-                try:
-                    async for msg in ch.history(limit=100):
-                        if msg.author == client.user:
-                            await msg.delete()
-                except:
-                    pass
-
     await message.channel.send("✅ 全ての予定と通知をリセットしました")
-
 # =======================
 # Discordイベント
 # =======================
@@ -508,7 +535,7 @@ async def on_message(message):
     if message.content.strip() == "!debug":
         if pending_places:
             lines = ["✅ 現在の登録された予定:"]
-            lines += [f"・{v[1]}" for v in sorted(pending_places.values(), key=lambda x: x[0])]
+            lines += [f"・{v['txt']}" for v in sorted(pending_places.values(), key=lambda x: x["dt"])]
             await message.channel.send("\n".join(lines))
         else:
             await message.channel.send("⚠️ 登録された予定はありません")
