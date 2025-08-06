@@ -326,9 +326,13 @@ async def handle_new_event(dt, txt, channel):
             await block["msg"].edit(content=format_block_msg(block, True))
         except discord.NotFound:
             block["msg"] = await channel.send(format_block_msg(block, True))
+            # 🆕 ここで main_msg_id を保存
+            if txt in pending_places:
+                pending_places[txt]["main_msg_id"] = block["msg"].id
     else:
         task = asyncio.create_task(schedule_block_summary(block, channel))
         active_tasks.add(task)
+        task.add_done_callback(lambda t: active_tasks.discard(t))
         task.add_done_callback(lambda t: active_tasks.discard(t))
 
 def is_within_5_minutes_of_another(target_dt):
