@@ -829,9 +829,12 @@ async def on_message(message):
         durations = extract_imsen_durations(center_txts)
         duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
+        # 上部OCR結果を安全に整形
+        top_txts_str = "\n".join(top_txts) if top_txts else "(検出なし)"
+
         # 送信
         await message.channel.send(
-            f"📸 **上部OCR結果（基準時刻）**:\n```\n{'\n'.join(top_txts) if top_txts else '(検出なし)'}\n```\n"
+            f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_txts_str}\n```\n"
             f"📋 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```\n"
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
         )
