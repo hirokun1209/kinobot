@@ -706,8 +706,9 @@ async def on_message(message):
         preview_lines = [f"・{txt}" for _, txt, _ in parsed_preview] if parsed_preview else ["(なし)"]
         preview_text = "\n".join(preview_lines)
 
-        # 免戦時間抽出
-        durations = extract_imsen_durations(center_txts)
+        # 免戦時間抽出 ＋ 補正
+        raw_durations = extract_imsen_durations(center_txts)
+        durations = [correct_imsen_text(d) for d in raw_durations]
         duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
         # 送信
