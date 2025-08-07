@@ -296,7 +296,7 @@ async def send_to_copy_channel(dt, txt):
 
     msg = await channel.send(content=txt.replace("🕒 ", ""))
 
-    # 🔸 削除処理だけ別タスクで動かす
+    # 🔸 削除処理だけ別タスクで起動（非同期）
     async def auto_delete():
         await asyncio.sleep(max(0, (dt - now_jst()).total_seconds() + 120))
         try:
@@ -304,8 +304,8 @@ async def send_to_copy_channel(dt, txt):
         except:
             pass
 
-    asyncio.create_task(auto_delete())
-    return msg.id
+    asyncio.create_task(auto_delete())  # ここだけ非同期で動かす
+    return msg.id  # ← 重要：先に msg.id を返す
     
 def store_copy_msg_id(txt, msg_id):
     if txt in pending_places:
