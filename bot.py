@@ -753,6 +753,24 @@ async def on_message(message):
 
         await message.channel.send("📤 コピー用チャンネルへ送信しました")
         return
+    # ==== !n ====
+    if message.content.strip() == "!n":
+        if not sent_notifications_tasks:
+            await message.channel.send("⚠️ 通知予約はありません")
+            return
+
+        two_min_lines = ["🕑 **2分前通知予約**:"]
+        fifteen_sec_lines = ["⏱ **15秒前通知予約**:"]
+        for (txt, kind), task in sorted(sent_notifications_tasks.items(), key=lambda x: (x[0][1], x[0][0])):
+            status = " (キャンセル済)" if task.cancelled() else ""
+            if kind == "2min":
+                two_min_lines.append(f"・{txt}{status}")
+            elif kind == "15s":
+                fifteen_sec_lines.append(f"・{txt}{status}")
+
+        msg = "\n".join(two_min_lines + [""] + fifteen_sec_lines)
+        await message.channel.send(msg)
+        return
     # ==== !ocrdebug ====
     if message.content.strip() == "!ocrdebug":
         if not message.attachments:
