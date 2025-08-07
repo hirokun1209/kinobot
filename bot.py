@@ -405,7 +405,33 @@ async def daily_reset_task():
             next_reset += timedelta(days=1)
         await asyncio.sleep((next_reset - now).total_seconds())
 
-        # リセット処理
+        # ✅ チャンネル上のメッセージ削除処理追加
+        for entry in list(pending_places.values()):
+            if "main_msg_id" in entry and entry["main_msg_id"]:
+                ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["main_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+            if "copy_msg_id" in entry and entry["copy_msg_id"]:
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+        # summary_blocks まとめメッセージ削除
+        for block in summary_blocks:
+            if block.get("msg"):
+                try:
+                    await block["msg"].delete()
+                except:
+                    pass
+
+        # 内部状態の初期化
         pending_places.clear()
         summary_blocks.clear()
         sent_notifications.clear()
@@ -413,7 +439,7 @@ async def daily_reset_task():
             task.cancel()
         active_tasks.clear()
 
-        channel = client.get_channel(NOTIFY_CHANNEL_ID)
+        # ✅ 通知は送らない（silent reset）
 
 # =======================
 # 過去予定の定期削除（1分ごと）
