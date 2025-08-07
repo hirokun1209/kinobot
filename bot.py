@@ -245,46 +245,54 @@ def parse_multiple_places(center_texts, top_time_texts):
 
     return res
 
-def correct_imsen_text(raw: str) -> str:
-    cleaned = re.sub(r"[^\d:]", "", raw)
+def correct_imsen_text(text: str) -> str:
+    # 数字だけを抽出（ノイズ除去）
+    digits = re.sub(r"\D", "", text)
 
-    # コロンが2つ → 正常形式としてチェック
-    if cleaned.count(":") == 2:
+    # ":" を含む場合 → 区切りを除去して連結
+    if ":" in text:
+        parts = re.findall(r"\d+", text)
+        digits = "".join(parts)
+
+    # 🧪 7桁以上（例: 0431423 → 04:14:23）
+    if len(digits) >= 7:
         try:
-            h, m, s = map(int, cleaned.split(":"))
+            h = int(digits[0:2])
+            m = int(digits[2:4])
+            s = int(digits[4:6])
             if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                 return f"{h:02}:{m:02}:{s:02}"
         except:
             pass
 
-    # コロンが1つ → MM:SSとみなす
-    if cleaned.count(":") == 1:
+    # 6桁（HHMMSS）
+    if len(digits) == 6:
         try:
-            m, s = map(int, cleaned.split(":"))
+            h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:])
+            if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                return f"{h:02}:{m:02}:{s:02}"
+        except:
+            pass
+
+    # 5桁（HMMSS）
+    if len(digits) == 5:
+        try:
+            h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:])
+            if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                return f"{h:02}:{m:02}:{s:02}"
+        except:
+            pass
+
+    # 4桁（MMSS）→ 00:MM:SS
+    if len(digits) == 4:
+        try:
+            m, s = int(digits[:2]), int(digits[2:])
             if 0 <= m < 60 and 0 <= s < 60:
                 return f"00:{m:02}:{s:02}"
         except:
             pass
 
-    # 数字だけの場合の桁数補正
-    digits = re.sub(r"\D", "", raw)
-    try:
-        if len(digits) == 6:
-            h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
-        elif len(digits) == 5:
-            h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:5])
-        elif len(digits) == 4:
-            h, m, s = 0, int(digits[:2]), int(digits[2:4])
-        elif len(digits) == 3:
-            h, m, s = 0, int(digits[0]), int(digits[1:3])
-        else:
-            return cleaned
-        if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-            return f"{h:02}:{m:02}:{s:02}"
-    except:
-        pass
-
-    return cleaned
+    return text  # 補正失敗時はそのまま返す
 # =======================
 # ブロック・通知処理
 # =======================
