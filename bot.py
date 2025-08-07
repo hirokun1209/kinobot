@@ -771,10 +771,10 @@ async def on_message(message):
             active_tasks.add(task2)
             task2.add_done_callback(lambda t: active_tasks.discard(t))
 
-        # コピー用チャンネルに再送
+        # コピー用チャンネルに再送（send_to_copy_channel関数を使用）
         copy_task = asyncio.create_task(send_to_copy_channel(new_dt, new_txt))
         copy_task.add_done_callback(lambda t: store_copy_msg_id(new_txt, t.result()))
-        
+
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
         return
     # ==== 手動追加（例: 1234-1-12:34:56）====
