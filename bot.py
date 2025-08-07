@@ -643,18 +643,12 @@ async def on_message(message):
 
         removed = False
 
+        # pending_places からは予定を外す（通知チャンネルのメッセージは削除しない）
         if txt in pending_places:
             entry = pending_places.pop(txt)
             removed = True
 
-            if entry.get("main_msg_id"):
-                ch = client.get_channel(NOTIFY_CHANNEL_ID)
-                try:
-                    msg = await ch.fetch_message(entry["main_msg_id"])
-                    await msg.delete()
-                except:
-                    pass
-
+            # コピー用チャンネルの個別メッセージだけ削除
             if entry.get("copy_msg_id"):
                 ch = client.get_channel(COPY_CHANNEL_ID)
                 try:
@@ -663,6 +657,7 @@ async def on_message(message):
                 except:
                     pass
 
+        # summary_blocks からイベントを除去し、まとめメッセージを編集
         for block in summary_blocks:
             before = len(block["events"])
             block["events"] = [ev for ev in block["events"] if ev[1] != txt]
@@ -674,18 +669,19 @@ async def on_message(message):
                     block["max"] = max(ev[0] for ev in block["events"])
                 else:
                     block["min"] = block["max"] = datetime.max.replace(tzinfo=JST)
-                if block["msg"]:
+
+                if block.get("msg"):
                     try:
                         await block["msg"].edit(content=format_block_msg(block, True))
                     except:
                         pass
 
         if removed:
-            await message.channel.send(f"🗑️ 削除しました → `{txt}`")
+            await message.channel.send(f"🗑️ 該当の予定を一覧から除外しました → `{txt}`")
         else:
             await message.channel.send(f"⚠️ 該当の予定が見つかりませんでした → `{txt}`")
         return
-
+        
     # ==== !debug ====
     if message.content.strip() == "!debug":
         if pending_places:
