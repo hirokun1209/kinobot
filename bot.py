@@ -70,6 +70,7 @@ pending_places = {}
 summary_blocks = []
 active_tasks = set()
 sent_notifications = set()
+sent_notifications_tasks = {}
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
 def store_copy_msg_id(txt, msg_id):
@@ -413,9 +414,10 @@ async def schedule_notification(unlock_dt, text, channel):
                 await asyncio.sleep(120)
                 await msg.delete()
 
-        # 並列で通知をスケジュール
-        asyncio.create_task(notify_2min())
-        asyncio.create_task(notify_15s())
+        # 並列で通知をスケジュールし、タスクを記録しておく
+        sent_notifications_tasks[(text, "2min")] = asyncio.create_task(notify_2min())
+        sent_notifications_tasks[(text, "15s")] = asyncio.create_task(notify_15s())
+        
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
@@ -737,36 +739,36 @@ async def on_message(message):
             await message.channel.send("⚠️ 時間の指定が不正です")
             return
 
-        now = now_jst()
-        new_dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
-        if new_dt < now:
-            new_dt += timedelta(days=1)  # 翌日扱いに補正
+        base = datetime.strptime(timestr, "%H:%M:%S").replace(tzinfo=JST)
+        new_dt = base.replace(hour=h, minute=m, second=s)
         new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
-        if old_txt not in pending_places:
-            await message.channel.send("⚠️ 対象の予定が見つかりません")
-            return
+        if old_txt in pending_places:
+            old_entry = pending_places.pop(old_txt)
 
-        # 削除前の情報保持
-        old_entry = pending_places.pop(old_txt)
+            # 通知チャンネル削除
+            if "main_msg_id" in old_entry and old_entry["main_msg_id"]:
+                ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(old_entry["main_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
 
-        # 通知チャンネルのメッセージ削除
-        if "main_msg_id" in old_entry and old_entry["main_msg_id"]:
-            ch = client.get_channel(NOTIFY_CHANNEL_ID)
-            try:
-                msg = await ch.fetch_message(old_entry["main_msg_id"])
-                await msg.delete()
-            except:
-                pass
+            # コピー用チャンネル削除
+            if "copy_msg_id" in old_entry and old_entry["copy_msg_id"]:
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(old_entry["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
 
-        # コピー用チャンネルのメッセージ削除
-        if "copy_msg_id" in old_entry and old_entry["copy_msg_id"]:
-            ch = client.get_channel(COPY_CHANNEL_ID)
-            try:
-                msg = await ch.fetch_message(old_entry["copy_msg_id"])
-                await msg.delete()
-            except:
-                pass
+            # 🔻 通知タスクのキャンセル
+            for key in [(old_txt, "2min"), (old_txt, "15s")]:
+                task = sent_notifications_tasks.pop(key, None)
+                if task:
+                    task.cancel()
 
         # 再登録
         pending_places[new_txt] = {
@@ -778,9 +780,32 @@ async def on_message(message):
             "copy_msg_id": None,
         }
 
-        # 再通知処理
-        await handle_new_event(new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID))
-        await schedule_notification(new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID))
+        # 通常通知チャンネルに編集反映のみ（再送しない）
+        block = find_or_create_block(new_dt)
+        for i, (old_dt, old_txt_in_block) in enumerate(block["events"]):
+            if old_txt_in_block == old_txt:
+                block["events"][i] = (new_dt, new_txt)
+                break
+        else:
+            block["events"].append((new_dt, new_txt))
+
+        if block["msg"]:
+            try:
+                await block["msg"].edit(content=format_block_msg(block, True))
+                pending_places[new_txt]["main_msg_id"] = block["msg"].id
+            except:
+                pass
+
+        # コピー用チャンネルに再送（!a の場合は自動削除なし）
+        copy_ch = client.get_channel(COPY_CHANNEL_ID)
+        if copy_ch:
+            msg = await copy_ch.send(content=new_txt.replace("🕒 ", ""))
+            pending_places[new_txt]["copy_msg_id"] = msg.id
+
+        # 🆕 通知スケジュール再登録
+        notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
+        if notify_ch:
+            await schedule_notification(new_dt, new_txt, notify_ch)
 
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
         return
