@@ -868,9 +868,9 @@ async def on_ready():
             digits = re.sub(r"\D", "", raw)
             if len(digits) >= 8:
                 try:
-                    h = int(digits[0] + digits[1])
-                    m = int(digits[3] + digits[4])
-                    s = int(digits[6] + digits[7])
+                    h = int(digits[0:2])
+                    m = int(digits[2:4])
+                    s = int(digits[6:8])
                     if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                         return f"{h:02}:{m:02}:{s:02}"
                 except:
@@ -906,6 +906,7 @@ async def on_ready():
             center = crop_center_area(np_img)
             top_txts = extract_text_from_image(top)
             center_txts = extract_text_from_image(center)
+
             base_time = extract_and_correct_base_time(top_txts)
             parsed = parse_multiple_places(center_txts, top_txts)
 
@@ -918,7 +919,7 @@ async def on_ready():
                         "server": "",
                         "created_at": now_jst(),
                         "main_msg_id": None,
-                        "copy_msg_id": None
+                        "copy_msg_id": None,
                     }
                     display_txt = f"{txt} ({raw})"
                     image_results.append(display_txt)
