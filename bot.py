@@ -765,8 +765,8 @@ async def on_message(message):
             active_tasks.add(task)
             task.add_done_callback(lambda t: active_tasks.discard(t))
 
-        # 奪取なら個別通知（2分/15秒前）
-        if new_txt.startswith("奪取"):
+        # 奪取なら個別通知（2分/15秒前）、過去ならスキップ
+        if new_txt.startswith("奪取") and new_dt > now_jst():
             task2 = asyncio.create_task(schedule_notification(new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID)))
             active_tasks.add(task2)
             task2.add_done_callback(lambda t: active_tasks.discard(t))
