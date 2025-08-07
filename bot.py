@@ -751,29 +751,27 @@ async def on_message(message):
             "copy_msg_id": None,
         }
 
-        # 通常通知チャンネルに反映（block更新）
+        # 通常通知チャンネルに編集反映のみ（再送しない）
         block = find_or_create_block(new_dt)
-        block["events"].append((new_dt, new_txt))
+        for i, (old_dt, old_txt_in_block) in enumerate(block["events"]):
+            if old_txt_in_block == old_txt:
+                block["events"][i] = (new_dt, new_txt)
+                break
+        else:
+            block["events"].append((new_dt, new_txt))
+
         if block["msg"]:
             try:
                 await block["msg"].edit(content=format_block_msg(block, True))
                 pending_places[new_txt]["main_msg_id"] = block["msg"].id
             except:
                 pass
-        else:
-            task = asyncio.create_task(schedule_block_summary(block, client.get_channel(NOTIFY_CHANNEL_ID)))
-            active_tasks.add(task)
-            task.add_done_callback(lambda t: active_tasks.discard(t))
 
-        # 奪取なら個別通知（2分/15秒前）、過去ならスキップ
-        if new_txt.startswith("奪取") and new_dt > now_jst():
-            task2 = asyncio.create_task(schedule_notification(new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID)))
-            active_tasks.add(task2)
-            task2.add_done_callback(lambda t: active_tasks.discard(t))
-
-        # コピー用チャンネルに再送（send_to_copy_channel関数を使用）
-        copy_task = asyncio.create_task(send_to_copy_channel(new_dt, new_txt))
-        copy_task.add_done_callback(lambda t: store_copy_msg_id(new_txt, t.result()))
+        # コピー用チャンネルに再送（!a の場合は自動削除なし）
+        copy_ch = client.get_channel(COPY_CHANNEL_ID)
+        if copy_ch:
+            msg = await copy_ch.send(content=new_txt.replace("🕒 ", ""))
+            pending_places[new_txt]["copy_msg_id"] = msg.id
 
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
         return
