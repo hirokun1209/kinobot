@@ -67,6 +67,7 @@ ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 #     "copy_msg_id": Optional[int]
 # }
 pending_places = {}
+copy_queue = []
 summary_blocks = []
 active_tasks = set()
 sent_notifications = set()
@@ -293,13 +294,18 @@ async def send_to_copy_channel(dt, txt):
     if not channel:
         return None
     msg = await channel.send(content=txt.replace("🕒 ", ""))
-    return msg.id  # ← この行が重要！
-    await asyncio.sleep(max(0, (dt - now_jst()).total_seconds() + 120))  # 2分猶予で削除
-    try:
-        await msg.delete()
-    except:
-        pass
-    return msg.id
+
+    # 削除はバックグラウンドで行う（2分後）
+    async def delete_later():
+        await asyncio.sleep(max(0, (dt - now_jst()).total_seconds() + 120))
+        try:
+            await msg.delete()
+        except:
+            pass
+
+    asyncio.create_task(delete_later())  # 🔄 非同期で削除タスク起動
+
+    return msg.id  # ← 最後に返却
 def store_copy_msg_id(txt, msg_id):
     if txt in pending_places:
         pending_places[txt]["copy_msg_id"] = msg_id
@@ -353,8 +359,7 @@ async def handle_new_event(dt, txt, channel):
     if (dt, txt) not in block["events"]:
         block["events"].append((dt, txt))
         # 📝 コピー専用チャンネルへの送信
-        copy_task = asyncio.create_task(send_to_copy_channel(dt, txt))
-        copy_task.add_done_callback(lambda t: store_copy_msg_id(txt, t.result()))
+        pending_copy_queue.append((dt, txt))
 
     # 時間範囲を更新
     block["min"] = min(block["min"], dt)
@@ -424,7 +429,17 @@ async def schedule_notification(unlock_dt, text, channel):
         # 並列で通知をスケジュールし、タスクを記録しておく
         sent_notifications_tasks[(text, "2min")] = asyncio.create_task(notify_2min())
         sent_notifications_tasks[(text, "15s")] = asyncio.create_task(notify_15s())
-        
+
+async def process_copy_queue():
+    while True:
+        await asyncio.sleep(30)
+        if pending_copy_queue:
+            queue_copy = sorted(pending_copy_queue, key=lambda x: x[0])
+            pending_copy_queue.clear()
+            for dt, txt in queue_copy:
+                msg = await send_to_copy_channel(dt, txt)
+                store_copy_msg_id(txt, msg)
+
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
@@ -835,6 +850,11 @@ async def on_message(message):
                     task2.add_done_callback(lambda t: active_tasks.discard(t))
         return
 
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}")
+    client.loop.create_task(process_copy_queue())  # 🔄 コピーキュー処理
+    
     # ==== 通常画像送信 ====
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
