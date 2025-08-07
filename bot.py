@@ -293,19 +293,20 @@ async def send_to_copy_channel(dt, txt):
     channel = client.get_channel(COPY_CHANNEL_ID)
     if not channel:
         return None
+
     msg = await channel.send(content=txt.replace("🕒 ", ""))
 
-    # 削除はバックグラウンドで行う（2分後）
-    async def delete_later():
+    # 🔸 削除処理だけ別タスクで動かす
+    async def auto_delete():
         await asyncio.sleep(max(0, (dt - now_jst()).total_seconds() + 120))
         try:
             await msg.delete()
         except:
             pass
 
-    asyncio.create_task(delete_later())  # 🔄 非同期で削除タスク起動
-
-    return msg.id  # ← 最後に返却
+    asyncio.create_task(auto_delete())
+    return msg.id
+    
 def store_copy_msg_id(txt, msg_id):
     if txt in pending_places:
         pending_places[txt]["copy_msg_id"] = msg_id
