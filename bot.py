@@ -317,13 +317,18 @@ async def send_to_copy_channel(dt, txt):
 def find_or_create_block(new_dt):
     for block in summary_blocks:
         if new_dt <= block["max"] + timedelta(minutes=45):
-            print(f"🔁 既存ブロックに追加: {new_dt} → {block['min']} ～ {block['max']}")
             return block
-    new_block = {"events": [], "min": new_dt, "max": new_dt, "msg": None}
+    # task と lock を追加
+    new_block = {
+        "events": [],
+        "min": new_dt,
+        "max": new_dt,
+        "msg": None,
+        "task": None,
+        "lock": asyncio.Lock(),
+    }
     summary_blocks.append(new_block)
-    print(f"🆕 新規ブロック作成: {new_dt}")
-    return new_block  # ← 到達不能コードは削除済み
-
+    return new_block
 import math
 
 def format_block_msg(block, with_footer=True):
@@ -337,7 +342,9 @@ def format_block_msg(block, with_footer=True):
 
 async def schedule_block_summary(block, channel):
     try:
+        # 開始30分前の案内
         await asyncio.sleep(max(0, (block["min"] - timedelta(minutes=30) - now_jst()).total_seconds()))
+
         if not block["msg"]:
             block["msg"] = await channel.send(format_block_msg(block, True))
         else:
@@ -345,6 +352,8 @@ async def schedule_block_summary(block, channel):
                 await block["msg"].edit(content=format_block_msg(block, True))
             except discord.NotFound:
                 block["msg"] = await channel.send(format_block_msg(block, True))
+
+        # 開始時刻になったらフッター差し替え
         await asyncio.sleep(max(0, (block["min"] - now_jst()).total_seconds()))
         if block["msg"]:
             try:
@@ -353,27 +362,26 @@ async def schedule_block_summary(block, channel):
                 pass
     except Exception as e:
         print(f"[ERROR] schedule_block_summary failed: {e}")
+    finally:
+        # タスク参照を必ずクリア（多重起動防止のため）
+        block["task"] = None
 
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
 
-    # イベント追加
+    # 予定を追加
     if (dt, txt) not in block["events"]:
         block["events"].append((dt, txt))
-        # pending_copy_queue.append((dt, txt))  # 必要なら再有効化
 
-    # 範囲更新
+    # ブロックの範囲更新
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
 
-    # 古いイベント削除（今回追加分は残す）
+    # 古いイベントを整理（今回追加分は必ず残す）
     now = now_jst()
-    block["events"] = [
-        (d, t) for (d, t) in block["events"]
-        if (t in pending_places or t == txt) and d > now
-    ]
+    block["events"] = [(d, t) for (d, t) in block["events"] if (t in pending_places or t == txt) and d > now]
 
-    # 通知メッセージ更新
+    # すでにまとめメッセージがあるなら編集
     if block["msg"]:
         try:
             await block["msg"].edit(content=format_block_msg(block, True))
@@ -383,10 +391,15 @@ async def handle_new_event(dt, txt, channel):
             block["msg"] = await channel.send(format_block_msg(block, True))
             if txt in pending_places:
                 pending_places[txt]["main_msg_id"] = block["msg"].id
-    else:
-        task = asyncio.create_task(schedule_block_summary(block, channel))
-        active_tasks.add(task)
-        task.add_done_callback(lambda t: active_tasks.discard(t))
+        return
+
+    # まとめメッセージがまだ無い場合：タスクを1本だけ起動
+    async with block["lock"]:
+        if block["task"] is None or block["task"].done():
+            task = asyncio.create_task(schedule_block_summary(block, channel))
+            block["task"] = task
+            active_tasks.add(task)
+            task.add_done_callback(lambda t: active_tasks.discard(t))
 
 def is_within_5_minutes_of_another(target_dt):
     times = sorted([v["dt"] for v in pending_places.values()])
