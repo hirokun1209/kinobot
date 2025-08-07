@@ -343,6 +343,14 @@ async def handle_new_event(dt, txt, channel):
 
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
+
+    # 🧹 古いイベントを削除（過去時刻 or 削除済みのもの）
+    now = now_jst()
+    block["events"] = [
+        (d, t) for (d, t) in block["events"]
+        if t in pending_places and d > now
+    ]
+
     if block["msg"]:
         try:
             await block["msg"].edit(content=format_block_msg(block, True))
@@ -354,7 +362,6 @@ async def handle_new_event(dt, txt, channel):
     else:
         task = asyncio.create_task(schedule_block_summary(block, channel))
         active_tasks.add(task)
-        task.add_done_callback(lambda t: active_tasks.discard(t))
         task.add_done_callback(lambda t: active_tasks.discard(t))
 
 def is_within_5_minutes_of_another(target_dt):
