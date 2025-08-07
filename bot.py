@@ -369,7 +369,7 @@ async def handle_new_event(dt, txt, channel):
     if (dt, txt) not in block["events"]:
         block["events"].append((dt, txt))
         # 📝 コピー専用チャンネルへの送信
-        pending_copy_queue.append((dt, txt))
+        #pending_copy_queue.append((dt, txt))
 
     # 時間範囲を更新
     block["min"] = min(block["min"], dt)
@@ -707,6 +707,29 @@ async def on_message(message):
             await message.channel.send("\n".join(lines))
         else:
             await message.channel.send("⚠️ 登録された予定はありません")
+        return
+    # ==== !s ====
+    if message.content.strip() == "!s":
+        if not pending_places:
+            await message.channel.send("⚠️ 登録された予定はありません")
+            return
+
+        ch = client.get_channel(NOTIFY_CHANNEL_ID)
+        if not ch:
+            await message.channel.send("⚠️ 通知チャンネルが見つかりません")
+            return
+
+        sorted_places = sorted(pending_places.values(), key=lambda x: x["dt"])
+        lines = ["⏰ 手動通知: 現在のスケジュール一覧"]
+        lines += [f"{v['txt']}  " for v in sorted_places]
+
+        try:
+            msg = await ch.send("\n".join(lines))
+        except:
+            await message.channel.send("⚠️ 通知チャンネルへの送信に失敗しました")
+            return
+
+        await message.channel.send("📤 通知チャンネルへ送信しました")
         return
     # ==== !c ====
     if message.content.strip() == "!c":
