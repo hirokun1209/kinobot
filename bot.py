@@ -72,7 +72,10 @@ active_tasks = set()
 sent_notifications = set()
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
-
+def store_copy_msg_id(txt, msg_id):
+    if txt in pending_places:
+        pending_places[txt]["copy_msg_id"] = msg_id
+        
 # =======================
 # 過去予定の自動削除
 # =======================
@@ -277,11 +280,12 @@ def parse_multiple_places(center_texts, top_time_texts):
 # =======================
 async def send_to_copy_channel(dt, txt):
     if COPY_CHANNEL_ID == 0:
-        return
+        return None
     channel = client.get_channel(COPY_CHANNEL_ID)
     if not channel:
-        return
-    msg = await channel.send(f"{txt}")
+        return None
+    msg = await channel.send(content=txt.replace("🕒 ", ""))
+    return msg.id  # ← この行が重要！
     await asyncio.sleep(max(0, (dt - now_jst()).total_seconds() + 120))  # 2分猶予で削除
     try:
         await msg.delete()
@@ -335,7 +339,7 @@ async def handle_new_event(dt, txt, channel):
         block["events"].append((dt, txt))
         # 通常通知チャンネルに加え、コピー専用にも送信
         copy_task = asyncio.create_task(send_to_copy_channel(dt, txt))
-        copy_task.add_done_callback(
+        copy_task.add_done_callback(lambda t: store_copy_msg_id(txt, t.result()))
             lambda t: store_copy_msg_id(txt, t.result())
         )
     block["min"] = min(block["min"], dt)
@@ -762,8 +766,8 @@ async def on_message(message):
             task2.add_done_callback(lambda t: active_tasks.discard(t))
 
         # コピー用チャンネルに再送（send_to_copy_channel関数を使用）
-        copy_task = asyncio.create_task(send_to_copy_channel(new_dt, new_txt))
-        copy_task.add_done_callback(
+        copy_task = asyncio.create_task(send_to_copy_channel(dt, txt))
+        copy_task.add_done_callback(lambda t: store_copy_msg_id(txt, t.result()))
             lambda t: store_copy_msg_id(new_txt, t.result())
         )
 
