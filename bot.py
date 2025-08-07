@@ -646,32 +646,37 @@ async def on_message(message):
         if old_txt in pending_places:
             old_entry = pending_places.pop(old_txt)
 
-            # 通知チャンネルの削除
+            # 通知チャンネルの編集
             if "main_msg_id" in old_entry and old_entry["main_msg_id"]:
                 ch = client.get_channel(NOTIFY_CHANNEL_ID)
                 try:
                     msg = await ch.fetch_message(old_entry["main_msg_id"])
-                    await msg.delete()
+                    await msg.edit(content=new_txt)
+                    main_msg_id = msg.id
                 except:
-                    pass
+                    main_msg_id = None
+            else:
+                main_msg_id = None
 
-            # コピー用チャンネルの削除
+            # コピー用チャンネルの編集
             if "copy_msg_id" in old_entry and old_entry["copy_msg_id"]:
                 ch = client.get_channel(COPY_CHANNEL_ID)
                 try:
                     msg = await ch.fetch_message(old_entry["copy_msg_id"])
-                    await msg.delete()
+                    await msg.edit(content=new_txt)
+                    copy_msg_id = msg.id
                 except:
-                    pass
-
+                    copy_msg_id = None
+            else:
+                copy_msg_id = None
         # ==== 🔄 新しい予定として登録 ====
         pending_places[new_txt] = {
             "dt": new_dt,
             "txt": new_txt,
             "server": server,
             "created_at": now_jst(),
-            "main_msg_id": None,
-            "copy_msg_id": None,
+            "main_msg_id": main_msg_id,
+            "copy_msg_id": copy_msg_id,
         }
 
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
