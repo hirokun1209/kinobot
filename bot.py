@@ -737,8 +737,10 @@ async def on_message(message):
             await message.channel.send("⚠️ 時間の指定が不正です")
             return
 
-        base = datetime.strptime(timestr, "%H:%M:%S").replace(tzinfo=JST)
-        new_dt = base.replace(hour=h, minute=m, second=s)
+        now = now_jst()
+        new_dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
+        if new_dt < now:
+            new_dt += timedelta(days=1)  # 翌日扱いに補正
         new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
         if old_txt not in pending_places:
