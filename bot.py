@@ -720,13 +720,18 @@ async def on_message(message):
             return
 
         sorted_places = sorted(pending_places.values(), key=lambda x: x["dt"])
+        lines = ["📢 手動通知: 現在登録されているスケジュール一覧", ""]
         for v in sorted_places:
-            txt = v["txt"]
-            try:
-                msg = await ch.send(f"📢 手動通知: {txt}")
-                v["main_msg_id"] = msg.id  # ✅ 手動通知のメッセージIDを保存
-            except:
-                pass
+            lines.append(f"{v['txt']}")
+
+        try:
+            msg = await ch.send("\n".join(lines))
+            # 保存する場合（任意）：1つ1つのmain_msg_idに設定
+            for v in sorted_places:
+                v["main_msg_id"] = msg.id
+        except:
+            await message.channel.send("⚠️ 通知の送信に失敗しました")
+            return
 
         await message.channel.send("📤 通知チャンネルへ送信しました")
         return
@@ -1044,10 +1049,18 @@ async def on_message(message):
                 grouped_results.append((base_time, image_results))
 
         if grouped_results:
-            lines = ["✅ 解析完了！登録されました"]
+            lines = [
+                "✅ 解析完了！登録されました",
+                "",
+                "🧭 **次の操作:**",
+                "　📤 `!s` → ⏰ 時間コピー用チャンネルにスケジュールを送信",
+                "　📢 `!c` → 📝 通知チャンネルに手動でスケジュールを通知",
+                "",
+            ]
             for base_time, txts in grouped_results:
-                lines.append(f"\n📸 [基準時間: {base_time}]")
+                lines.append(f"📸 [基準時間: {base_time}]")
                 lines += [f"・{txt}" for txt in txts]
+                lines.append("")  # 各ブロックの間に空行
             await status.edit(content="\n".join(lines))
         else:
             await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。")
