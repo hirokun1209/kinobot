@@ -70,6 +70,7 @@ pending_places = {}
 copy_queue = []
 summary_blocks = []
 pending_copy_queue = []
+manual_summary_msg_ids = []
 active_tasks = set()
 sent_notifications = set()
 sent_notifications_tasks = {}
@@ -411,8 +412,8 @@ async def schedule_notification(unlock_dt, text, channel):
     if unlock_dt <= now_jst():
         return
 
-    # 通知時間制限: 02:00〜08:00はスキップ
-    if not (8 <= unlock_dt.hour or unlock_dt.hour < 2):
+    # 通知時間制限: 00:00〜06:00はスキップ
+    if 0 <= unlock_dt.hour < 6:
         return
 
     if text.startswith("奪取"):
@@ -487,7 +488,22 @@ async def daily_reset_task():
                     await block["msg"].delete()
                 except:
                     pass
+        # 通知予約(2分前/15秒前)タスクのキャンセル
+        for key, task in list(sent_notifications_tasks.items()):
+            task.cancel()
+        sent_notifications_tasks.clear()
 
+        # 手動通知(!s)のまとめメッセージ削除
+        if manual_summary_msg_ids:
+            ch2 = client.get_channel(NOTIFY_CHANNEL_ID)
+            if ch2:
+                for mid in list(manual_summary_msg_ids):
+                    try:
+                        msg = await ch2.fetch_message(mid)
+                        await msg.delete()
+                    except:
+                        pass
+            manual_summary_msg_ids.clear()
         # 内部状態の初期化
         pending_places.clear()
         summary_blocks.clear()
@@ -732,9 +748,8 @@ async def on_message(message):
 
         try:
             msg = await ch.send("\n".join(lines))
-            # 保存する場合（任意）：1つ1つのmain_msg_idに設定
-            for v in sorted_places:
-                v["main_msg_id"] = msg.id
+            # まとめメッセージは予定ごとの main_msg_id に紐付けない
+            manual_summary_msg_ids.append(msg.id)
         except:
             await message.channel.send("⚠️ 通知の送信に失敗しました")
             return
@@ -1078,11 +1093,6 @@ async def on_message(message):
         else:
             await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。")
         return
-
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
-    client.loop.create_task(process_copy_queue())  # 🔄 コピーキュー処理
     
 # =======================
 # 起動
