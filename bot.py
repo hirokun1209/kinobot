@@ -955,7 +955,10 @@ async def on_message(message):
                 server = "1" + server
             mode = "警備" if server == "1268" else "奪取"
             txt = f"{mode} {server}-{place}-{t}"
-            dt = datetime.combine(now_jst().date(), datetime.strptime(t, "%H:%M:%S").time(), tzinfo=JST)
+            t_obj = datetime.strptime(t, "%H:%M:%S").time()
+            dt = datetime.combine(now_jst().date(), t_obj, tzinfo=JST)
+            if t_obj <= time(2, 0, 1):
+                dt += timedelta(days=1)
             if txt not in pending_places:
                 pending_places[txt] = {
                     "dt": dt,
