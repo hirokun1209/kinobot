@@ -879,6 +879,10 @@ async def on_message(message):
 
         base = datetime.strptime(timestr, "%H:%M:%S").replace(tzinfo=JST)
         new_dt = base.replace(hour=h, minute=m, second=s)
+
+        # ⏰ 00:00:00〜02:00:01 の場合は日付を翌日に補正
+        if timedelta(hours=0, minutes=0, seconds=0) <= timedelta(hours=h, minutes=m, seconds=s) <= timedelta(hours=2, minutes=0, seconds=1):
+            new_dt += timedelta(days=1)
         new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
         if old_txt in pending_places:
