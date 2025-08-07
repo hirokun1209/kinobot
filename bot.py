@@ -720,14 +720,13 @@ async def on_message(message):
             return
 
         sorted_places = sorted(pending_places.values(), key=lambda x: x["dt"])
-        lines = ["⏰ 手動通知: 現在のスケジュール一覧"]
-        lines += [f"{v['txt']}  " for v in sorted_places]
-
-        try:
-            msg = await ch.send("\n".join(lines))
-        except:
-            await message.channel.send("⚠️ 通知チャンネルへの送信に失敗しました")
-            return
+        for v in sorted_places:
+            txt = v["txt"]
+            try:
+                msg = await ch.send(f"📢 手動通知: {txt}")
+                v["main_msg_id"] = msg.id  # ✅ 手動通知のメッセージIDを保存
+            except:
+                pass
 
         await message.channel.send("📤 通知チャンネルへ送信しました")
         return
