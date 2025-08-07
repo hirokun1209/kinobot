@@ -864,11 +864,8 @@ async def on_ready():
         def extract_and_correct_base_time(txts):
             if not txts:
                 return "??:??:??"
-
             raw = txts[0].strip()
             digits = re.sub(r"\D", "", raw)
-
-            # 🧪 1つ飛ばし補正（例: "11814822" → "11:14:22"）
             if len(digits) >= 8:
                 try:
                     h = int(digits[0] + digits[1])
@@ -878,8 +875,6 @@ async def on_ready():
                         return f"{h:02}:{m:02}:{s:02}"
                 except:
                     pass
-
-            # 🧪 通常の6桁（HHMMSS）補正
             if len(digits) >= 6:
                 try:
                     h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
@@ -887,8 +882,6 @@ async def on_ready():
                         return f"{h:02}:{m:02}:{s:02}"
                 except:
                     pass
-
-            # 🧪 5桁（HMMSS）→ H:MM:SS
             if len(digits) == 5:
                 try:
                     h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:])
@@ -896,8 +889,6 @@ async def on_ready():
                         return f"{h:02}:{m:02}:{s:02}"
                 except:
                     pass
-
-            # 🧪 4桁（MMSS）→ 00:MM:SS
             if len(digits) == 4:
                 try:
                     m, s = int(digits[:2]), int(digits[2:])
@@ -905,56 +896,52 @@ async def on_ready():
                         return f"00:{m:02}:{s:02}"
                 except:
                     pass
-
             return "??:??:??"
 
-    for a in message.attachments:
-        b = await a.read()
-        img = Image.open(io.BytesIO(b)).convert("RGB")
-        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        top = crop_top_right(np_img)
-        center = crop_center_area(np_img)
-        top_txts = extract_text_from_image(top)
-        center_txts = extract_text_from_image(center)
+        for a in message.attachments:
+            b = await a.read()
+            img = Image.open(io.BytesIO(b)).convert("RGB")
+            np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            top = crop_top_right(np_img)
+            center = crop_center_area(np_img)
+            top_txts = extract_text_from_image(top)
+            center_txts = extract_text_from_image(center)
+            base_time = extract_and_correct_base_time(top_txts)
+            parsed = parse_multiple_places(center_txts, top_txts)
 
-        # ✅ 共通の補正ロジックに置き換え
-        base_time = extract_and_correct_base_time(top_txts)
+            image_results = []
+            for dt, txt, raw in parsed:
+                if txt not in pending_places:
+                    pending_places[txt] = {
+                        "dt": dt,
+                        "txt": txt,
+                        "server": "",
+                        "created_at": now_jst(),
+                        "main_msg_id": None,
+                        "copy_msg_id": None
+                    }
+                    display_txt = f"{txt} ({raw})"
+                    image_results.append(display_txt)
+                    task = asyncio.create_task(handle_new_event(dt, txt, channel))
+                    active_tasks.add(task)
+                    task.add_done_callback(lambda t: active_tasks.discard(t))
+                    if txt.startswith("奪取"):
+                        task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
+                        active_tasks.add(task2)
+                        task2.add_done_callback(lambda t: active_tasks.discard(t))
 
-        parsed = parse_multiple_places(center_txts, top_txts)
+            if image_results:
+                grouped_results.append((base_time, image_results))
 
-        image_results = []
-        for dt, txt, raw in parsed:
-            if txt not in pending_places:
-                pending_places[txt] = {
-                    "dt": dt,
-                    "txt": txt,
-                    "server": "",
-                    "created_at": now_jst(),
-                    "main_msg_id": None,
-                    "copy_msg_id": None
-                }
-                display_txt = f"{txt} ({raw})"
-                image_results.append(display_txt)
-                task = asyncio.create_task(handle_new_event(dt, txt, channel))
-                active_tasks.add(task)
-                task.add_done_callback(lambda t: active_tasks.discard(t))
-                if txt.startswith("奪取"):
-                    task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
-                    active_tasks.add(task2)
-                    task2.add_done_callback(lambda t: active_tasks.discard(t))
-
-        if image_results:
-            grouped_results.append((base_time, image_results))
-
-    if grouped_results:
-        lines = ["✅ 解析完了！登録されました"]
-        for base_time, txts in grouped_results:
-            lines.append(f"\n📸 [基準時間: {base_time}]")
-            lines += [f"・{txt}" for txt in txts]
-        await status.edit(content="\n".join(lines))
-    else:
-        await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。")
-    return
+        if grouped_results:
+            lines = ["✅ 解析完了！登録されました"]
+            for base_time, txts in grouped_results:
+                lines.append(f"\n📸 [基準時間: {base_time}]")
+                lines += [f"・{txt}" for txt in txts]
+            await status.edit(content="\n".join(lines))
+        else:
+            await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。")
+        return
 # =======================
 # 起動
 # =======================
