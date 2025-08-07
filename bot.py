@@ -235,7 +235,8 @@ def parse_multiple_places(center_texts, top_time_texts):
         durations = extract_imsen_durations(g["lines"])
         if not durations:
             continue
-        d = durations[0]  # 最初の免戦時間を使用
+        raw_d = durations[0]
+        d = correct_imsen_text(raw_d)
         dt, unlock = add_time(top_time, d)
         if dt:
             res.append((dt, f"{mode} {server}-{g['place']}-{unlock}", d))
