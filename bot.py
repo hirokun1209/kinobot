@@ -666,12 +666,10 @@ async def on_message(message):
         )
         return
     # ==== !a 奪取 1234-1-12:00:00 130000 or 13:00:00 ====
-    match = re.fullmatch(r"!a\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})\s+([0-9]{6}|\d{1,2}:\d{2}:\d{2})", message.content.strip())
     if match:
         mode, server, place, timestr, raw = match.groups()
         old_txt = f"{mode} {server}-{place}-{timestr}"
 
-        # ==== 🕒 新しい時刻に入れ替え ====
         try:
             if ":" in raw:
                 h, m, s = map(int, raw.split(":"))
@@ -684,11 +682,9 @@ async def on_message(message):
         new_dt = datetime.now(JST).replace(hour=h, minute=m, second=s, microsecond=0)
         new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
-        # ==== 🧹 古い予定があれば削除（通知/コピー） ====
         if old_txt in pending_places:
             old_entry = pending_places.pop(old_txt)
-
-            # 通知チャンネルの削除
+            # 通知チャンネル削除
             if "main_msg_id" in old_entry and old_entry["main_msg_id"]:
                 ch = client.get_channel(NOTIFY_CHANNEL_ID)
                 try:
@@ -696,8 +692,7 @@ async def on_message(message):
                     await msg.delete()
                 except:
                     pass
-
-            # コピー用チャンネルの削除
+            # コピー用チャンネル削除
             if "copy_msg_id" in old_entry and old_entry["copy_msg_id"]:
                 ch = client.get_channel(COPY_CHANNEL_ID)
                 try:
@@ -706,7 +701,9 @@ async def on_message(message):
                 except:
                     pass
 
-        # ==== ✅ 登録し直す ====
+        await message.channel.send(f"✅ 更新しました → `{new_txt}`")
+
+        # ✅ 新しい予定を再登録＋通知
         pending_places[new_txt] = {
             "dt": new_dt,
             "txt": new_txt,
@@ -716,16 +713,15 @@ async def on_message(message):
             "copy_msg_id": None,
         }
 
-        await message.channel.send(f"✅ 更新しました → `{new_txt}`")
-        return
-        # 通知スケジューリング
         task = asyncio.create_task(handle_new_event(new_dt, new_txt, channel))
         active_tasks.add(task)
         task.add_done_callback(lambda t: active_tasks.discard(t))
+
         if new_txt.startswith("奪取"):
             task2 = asyncio.create_task(schedule_notification(new_dt, new_txt, channel))
             active_tasks.add(task2)
             task2.add_done_callback(lambda t: active_tasks.discard(t))
+
         return
     # ==== 手動追加（例: 1234-1-12:34:56）====
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
