@@ -708,7 +708,28 @@ async def on_message(message):
         else:
             await message.channel.send("⚠️ 登録された予定はありません")
         return
+    # ==== !c ====
+    if message.content.strip() == "!c":
+        if not pending_places:
+            await message.channel.send("⚠️ 登録された予定はありません")
+            return
 
+        ch = client.get_channel(COPY_CHANNEL_ID)
+        if not ch:
+            await message.channel.send("⚠️ コピー用チャンネルが見つかりません")
+            return
+
+        sorted_places = sorted(pending_places.values(), key=lambda x: x["dt"])
+        for v in sorted_places:
+            txt = v["txt"]
+            try:
+                msg = await ch.send(content=txt.replace("🕒 ", ""))
+                v["copy_msg_id"] = msg.id
+            except:
+                pass
+
+        await message.channel.send("📤 コピー用チャンネルへ送信しました")
+        return
     # ==== !ocrdebug ====
     if message.content.strip() == "!ocrdebug":
         if not message.attachments:
