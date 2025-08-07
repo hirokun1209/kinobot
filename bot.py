@@ -69,6 +69,7 @@ ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 pending_places = {}
 copy_queue = []
 summary_blocks = []
+pending_copy_queue = []
 active_tasks = set()
 sent_notifications = set()
 sent_notifications_tasks = {}
@@ -549,7 +550,7 @@ async def on_ready():
     print(f"📌 読み取り許可チャンネル: {READABLE_CHANNEL_IDS}")
     asyncio.create_task(daily_reset_task())  # ✅ 自動リセットスケジューラー起動
     asyncio.create_task(periodic_cleanup_task())  # ✅ 過去予定の削除スケジューラー起動
-        
+    asyncio.create_task(process_copy_queue())  # ✅ コピーキューの処理も起動
 @client.event
 async def on_message(message):
     if message.author.bot or message.channel.id not in READABLE_CHANNEL_IDS:
