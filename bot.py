@@ -287,7 +287,7 @@ async def send_to_copy_channel(dt, txt):
         await msg.delete()
     except:
         pass
-        return msg.id
+    return msg.id
 def store_copy_msg_id(txt, msg_id):
     if txt in pending_places:
         pending_places[txt]["copy_msg_id"] = msg_id
