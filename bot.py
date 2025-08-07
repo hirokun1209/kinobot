@@ -640,16 +640,16 @@ async def on_message(message):
     if match:
         mode, server, place, t = match.groups()
         txt = f"{mode} {server}-{place}-{t}"
-
         removed = False
 
-        # pending_places からは予定を外す（通知チャンネルのメッセージは削除しない）
+        # pending_places から削除
         if txt in pending_places:
             entry = pending_places.pop(txt)
             removed = True
 
-            # コピー用チャンネルの個別メッセージだけ削除
-            if entry.get("copy_msg_id"):
+            # 通知チャンネルは削除せず → 後で編集する
+            # コピー用チャンネルは削除
+            if "copy_msg_id" in entry and entry["copy_msg_id"]:
                 ch = client.get_channel(COPY_CHANNEL_ID)
                 try:
                     msg = await ch.fetch_message(entry["copy_msg_id"])
@@ -657,29 +657,32 @@ async def on_message(message):
                 except:
                     pass
 
-        # summary_blocks からイベントを除去し、まとめメッセージを編集
+        # summary_blocks から削除
         for block in summary_blocks:
             before = len(block["events"])
             block["events"] = [ev for ev in block["events"] if ev[1] != txt]
             after = len(block["events"])
+
             if before != after:
                 removed = True
+                # min/max 再構築
                 if block["events"]:
                     block["min"] = min(ev[0] for ev in block["events"])
                     block["max"] = max(ev[0] for ev in block["events"])
                 else:
                     block["min"] = block["max"] = datetime.max.replace(tzinfo=JST)
 
-                if block.get("msg"):
+                # まとめメッセージを編集で更新（該当行だけ消す）
+                if block["msg"]:
                     try:
                         await block["msg"].edit(content=format_block_msg(block, True))
                     except:
                         pass
 
         if removed:
-            await message.channel.send(f"🗑️ 該当の予定を一覧から除外しました → `{txt}`")
+            await message.channel.send(f"🗑️ 予定を削除しました: {txt}")
         else:
-            await message.channel.send(f"⚠️ 該当の予定が見つかりませんでした → `{txt}`")
+            await message.channel.send(f"⚠️ 該当する予定が見つかりません: {txt}")
         return
         
     # ==== !debug ====
