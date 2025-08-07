@@ -340,8 +340,7 @@ async def handle_new_event(dt, txt, channel):
         # 通常通知チャンネルに加え、コピー専用にも送信
         copy_task = asyncio.create_task(send_to_copy_channel(dt, txt))
         copy_task.add_done_callback(lambda t: store_copy_msg_id(txt, t.result()))
-            lambda t: store_copy_msg_id(txt, t.result())
-        )
+
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
     if block["msg"]:
@@ -768,8 +767,6 @@ async def on_message(message):
         # コピー用チャンネルに再送（send_to_copy_channel関数を使用）
         copy_task = asyncio.create_task(send_to_copy_channel(dt, txt))
         copy_task.add_done_callback(lambda t: store_copy_msg_id(txt, t.result()))
-            lambda t: store_copy_msg_id(new_txt, t.result())
-        )
 
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
         return
