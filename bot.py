@@ -486,7 +486,33 @@ async def on_message(message):
 
     # ==== !reset ====
     if message.content.strip() == "!reset":
-        await reset_all(message)
+        # 通知チャンネルとコピー用チャンネルのメッセージ削除
+        for entry in pending_places.values():
+            # 通知チャンネルのメッセージ削除
+            if "main_msg_id" in entry and entry["main_msg_id"]:
+                ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["main_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+            # コピー用チャンネルのメッセージ削除
+            if "copy_msg_id" in entry and entry["copy_msg_id"]:
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+        # 内部データクリア
+        pending_places.clear()
+        for task in list(active_tasks):
+            task.cancel()
+        summary_blocks.clear()
+
+        await message.channel.send("♻️ 全予定をリセットしました")
         return
 
     # ==== !del 奪取 1272-4-06:24:35 ====
