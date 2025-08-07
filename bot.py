@@ -335,28 +335,34 @@ async def schedule_block_summary(block, channel):
 
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
+
+    # ✅ 先に追加
     if (dt, txt) not in block["events"]:
         block["events"].append((dt, txt))
-        # 通常通知チャンネルに加え、コピー専用にも送信
+
+        # 🔄 コピー専用チャンネルに送信 → 完了後に ID を記録
         copy_task = asyncio.create_task(send_to_copy_channel(dt, txt))
         copy_task.add_done_callback(lambda t: store_copy_msg_id(txt, t.result()))
 
     block["min"] = min(block["min"], dt)
     block["max"] = max(block["max"], dt)
 
-    # 🧹 古いイベントを削除（過去時刻 or 削除済みのもの）
+    # ✅ pending_places への登録完了を少し待つ（確実に存在するように）
+    await asyncio.sleep(0.1)  # 必要なら調整可（非ブロッキング）
+
+    # 🧹 古いイベント削除（過去 or 削除済み）
     now = now_jst()
     block["events"] = [
         (d, t) for (d, t) in block["events"]
         if t in pending_places and d > now
     ]
 
+    # 📝 通知メッセージ編集 or 初回投稿
     if block["msg"]:
         try:
             await block["msg"].edit(content=format_block_msg(block, True))
         except discord.NotFound:
             block["msg"] = await channel.send(format_block_msg(block, True))
-            # 🆕 ここで main_msg_id を保存
             if txt in pending_places:
                 pending_places[txt]["main_msg_id"] = block["msg"].id
     else:
