@@ -244,34 +244,45 @@ def parse_multiple_places(center_texts, top_time_texts):
     return res
 
 def correct_imsen_text(raw: str) -> str:
-    # 数字と : のみ残す
     cleaned = re.sub(r"[^\d:]", "", raw)
 
-    # コロンが2つ → 正常形式
+    # コロンが2つ → 正常形式としてチェック
     if cleaned.count(":") == 2:
-        return cleaned
+        try:
+            h, m, s = map(int, cleaned.split(":"))
+            if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+                return f"{h:02}:{m:02}:{s:02}"
+        except:
+            pass
 
-    # コロン1つ → M:Sとみなして補正
+    # コロンが1つ → MM:SSとみなす
     if cleaned.count(":") == 1:
-        m, s = cleaned.split(":")
-        return f"00:{int(m):02}:{int(s):02}"
+        try:
+            m, s = map(int, cleaned.split(":"))
+            if 0 <= m < 60 and 0 <= s < 60:
+                return f"00:{m:02}:{s:02}"
+        except:
+            pass
 
-    # コロンなし → 桁数で補正
-    numbers_only = re.sub(r"[^\d]", "", raw)
-    if len(numbers_only) == 6:
-        h, m, s = numbers_only[:2], numbers_only[2:4], numbers_only[4:6]
-        return f"{int(h):02}:{int(m):02}:{int(s):02}"
-    elif len(numbers_only) == 5:
-        h, m, s = numbers_only[:1], numbers_only[1:3], numbers_only[3:5]
-        return f"{int(h):02}:{int(m):02}:{int(s):02}"
-    elif len(numbers_only) == 4:
-        m, s = numbers_only[:2], numbers_only[2:4]
-        return f"00:{int(m):02}:{int(s):02}"
-    elif len(numbers_only) == 3:
-        m, s = numbers_only[:1], numbers_only[1:3]
-        return f"00:{int(m):02}:{int(s):02}"
+    # 数字だけの場合の桁数補正
+    digits = re.sub(r"\D", "", raw)
+    try:
+        if len(digits) == 6:
+            h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
+        elif len(digits) == 5:
+            h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:5])
+        elif len(digits) == 4:
+            h, m, s = 0, int(digits[:2]), int(digits[2:4])
+        elif len(digits) == 3:
+            h, m, s = 0, int(digits[0]), int(digits[1:3])
+        else:
+            return cleaned
+        if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+            return f"{h:02}:{m:02}:{s:02}"
+    except:
+        pass
 
-    return cleaned  # 不明な形式はそのまま返す
+    return cleaned
 # =======================
 # ブロック・通知処理
 # =======================
@@ -657,18 +668,18 @@ async def on_message(message):
             raw = txts[0].strip()
             digits = re.sub(r"\D", "", raw)
 
-            # 🧪 1つ飛ばし補正（例: "11814822" → "11:14:22"）
-            if len(digits) >= 8:
+            # 🧪 1つ飛ばし補正（例: "1832817" → "18:32:17"）
+            if len(digits) >= 7:
                 try:
-                    h = int(digits[0] + digits[1])
-                    m = int(digits[3] + digits[4])
-                    s = int(digits[6] + digits[7])
+                    h = int(digits[0:2])
+                    m = int(digits[2:4])
+                    s = int(digits[5:7])
                     if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                         return f"{h:02}:{m:02}:{s:02}"
                 except:
                     pass
 
-            # 🧪 通常の6桁（HHMMSS）補正
+            # 🧪 6桁（HHMMSS）
             if len(digits) >= 6:
                 try:
                     h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
@@ -677,21 +688,12 @@ async def on_message(message):
                 except:
                     pass
 
-            # 🧪 5桁（HMMSS）→ H:MM:SS
+            # 🧪 5桁（HMMSS）
             if len(digits) == 5:
                 try:
                     h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:])
                     if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
                         return f"{h:02}:{m:02}:{s:02}"
-                except:
-                    pass
-
-            # 🧪 4桁（MMSS）→ 00:MM:SS
-            if len(digits) == 4:
-                try:
-                    m, s = int(digits[:2]), int(digits[2:])
-                    if 0 <= m < 60 and 0 <= s < 60:
-                        return f"00:{m:02}:{s:02}"
                 except:
                     pass
 
@@ -708,8 +710,7 @@ async def on_message(message):
         preview_text = "\n".join(preview_lines)
 
         # 免戦時間抽出 ＋ 補正
-        raw_durations = extract_imsen_durations(center_txts)
-        durations = [correct_imsen_text(d) for d in raw_durations]
+        durations = extract_imsen_durations(center_txts)
         duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
         # 送信
