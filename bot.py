@@ -298,7 +298,12 @@ def store_copy_msg_id(txt, msg_id):
 def find_or_create_block(new_dt):
     for block in summary_blocks:
         if new_dt <= block["max"] + timedelta(minutes=45):
+            print(f"🔁 既存ブロックに追加: {new_dt} → {block['min']} ～ {block['max']}")
             return block
+    new_block = {"events": [], "min": new_dt, "max": new_dt, "msg": None}
+    summary_blocks.append(new_block)
+    print(f"🆕 新規ブロック作成: {new_dt}")
+    return new_block
     new_block = {"events": [], "min": new_dt, "max": new_dt, "msg": None}
     summary_blocks.append(new_block)
     return new_block
