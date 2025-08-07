@@ -634,6 +634,12 @@ async def on_message(message):
 
         # 内部状態の初期化
         pending_places.clear()
+        # 通知予約タスクのキャンセル
+        for key, task in list(sent_notifications_tasks.items()):
+            task.cancel()
+        sent_notifications_tasks.clear()
+
+        # その他のタスクのキャンセル
         for task in list(active_tasks):
             task.cancel()
         summary_blocks.clear()
