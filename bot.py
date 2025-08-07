@@ -631,19 +631,18 @@ async def on_message(message):
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
         )
         return
-    # ==== !a 奪取 1272-4-06:24:35 123450 ====
+    # ==== !a 奪取 1234-1-12:34:56 123500 ====
     match = re.fullmatch(r"!a\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})\s+(\d{6})", message.content.strip())
     if match:
-        mode, server, place, old_time, new_duration = match.groups()
+        mode, server, place, timestr, raw = match.groups()
+        old_txt = f"{mode} {server}-{place}-{timestr}"
 
-        old_txt = f"{mode} {server}-{place}-{old_time}"
-        new_dt, new_time = add_time("00:00:00", f"{new_duration[:2]}:{new_duration[2:4]}:{new_duration[4:6]}")
-        if not new_dt:
-            await message.channel.send("⚠️ 時間変換に失敗しました")
-            return
-        new_txt = f"{mode} {server}-{place}-{new_time}"
+        h, m, s = int(raw[:2]), int(raw[2:4]), int(raw[4:])
+        base = datetime.strptime(timestr, "%H:%M:%S").replace(tzinfo=JST)
+        new_dt = base + timedelta(hours=h, minutes=m, seconds=s)
+        new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
-        # 元の予定があるなら削除処理（通知/コピー両方）
+        # ==== 🧹 元の予定があるなら削除処理（通知/コピー両方） ====
         if old_txt in pending_places:
             old_entry = pending_places.pop(old_txt)
 
@@ -665,7 +664,7 @@ async def on_message(message):
                 except:
                     pass
 
-        # 新しい予定として登録
+        # ==== 🔄 新しい予定として登録 ====
         pending_places[new_txt] = {
             "dt": new_dt,
             "txt": new_txt,
@@ -674,7 +673,9 @@ async def on_message(message):
             "main_msg_id": None,
             "copy_msg_id": None,
         }
+
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
+        return
         # 通知スケジューリング
         task = asyncio.create_task(handle_new_event(new_dt, new_txt, channel))
         active_tasks.add(task)
