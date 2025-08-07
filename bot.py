@@ -735,16 +735,11 @@ async def on_message(message):
             active_tasks.add(task2)
             task2.add_done_callback(lambda t: active_tasks.discard(t))
 
-        # コピー用チャンネルに再送
-        copy_ch = client.get_channel(COPY_CHANNEL_ID)
-        if copy_ch:
-            msg = await copy_ch.send(new_txt.replace("🕒 ", ""))
-            pending_places[new_txt]["copy_msg_id"] = msg.id
-            await asyncio.sleep(max(0, (new_dt - now_jst()).total_seconds() + 120))
-            try:
-                await msg.delete()
-            except:
-                pass
+        # コピー用チャンネルに再送（send_to_copy_channel関数を使用）
+        copy_task = asyncio.create_task(send_to_copy_channel(new_dt, new_txt))
+        copy_task.add_done_callback(
+            lambda t: store_copy_msg_id(new_txt, t.result())
+        )
 
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
         return
