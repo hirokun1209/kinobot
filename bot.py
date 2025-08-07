@@ -7,7 +7,7 @@ import re
 import asyncio
 import numpy as np
 from paddleocr import PaddleOCR
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from PIL import Image
 from fastapi import FastAPI
 import uvicorn
@@ -171,7 +171,7 @@ def add_time(base_time_str, duration_str):
     except:
         return None, None
     base_dt = datetime.combine(today, base_time, tzinfo=JST)
-    if base_time < datetime.strptime("02:00:01", "%H:%M:%S").time():
+    if base_time < datetime.strptime("06:00:00", "%H:%M:%S").time():
         base_dt += timedelta(days=1)  # 翌日扱い
     parts = duration_str.split(":")
     if len(parts) == 3:
@@ -880,8 +880,8 @@ async def on_message(message):
         base = datetime.strptime(timestr, "%H:%M:%S").replace(tzinfo=JST)
         new_dt = base.replace(hour=h, minute=m, second=s)
 
-        # ⏰ 00:00:00〜02:00:01 の場合は日付を翌日に補正
-        if timedelta(hours=0, minutes=0, seconds=0) <= timedelta(hours=h, minutes=m, seconds=s) <= timedelta(hours=2, minutes=0, seconds=1):
+        # ⏰ 00:00:00〜05:59:59 の場合は日付を翌日に補正
+        if timedelta(hours=h, minutes=m, seconds=s) < timedelta(hours=6):
             new_dt += timedelta(days=1)
         new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
@@ -961,7 +961,7 @@ async def on_message(message):
             txt = f"{mode} {server}-{place}-{t}"
             t_obj = datetime.strptime(t, "%H:%M:%S").time()
             dt = datetime.combine(now_jst().date(), t_obj, tzinfo=JST)
-            if t_obj <= time(2, 0, 1):
+            if t_obj < time(6, 0, 0):
                 dt += timedelta(days=1)
             if txt not in pending_places:
                 pending_places[txt] = {
