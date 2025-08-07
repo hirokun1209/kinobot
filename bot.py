@@ -559,6 +559,49 @@ async def on_ready():
     asyncio.create_task(daily_reset_task())  # ✅ 自動リセットスケジューラー起動
     asyncio.create_task(periodic_cleanup_task())  # ✅ 過去予定の削除スケジューラー起動
     asyncio.create_task(process_copy_queue())  # ✅ コピーキューの処理も起動
+async def auto_dedup():
+    seen = {}
+    to_remove = []
+
+    for v in pending_places.values():
+        match = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", v["txt"])
+        if not match:
+            continue
+        mode, server, place, timestr = match.groups()
+        key = (server, place)
+        current_dt = v["dt"]
+
+        if key not in seen:
+            seen[key] = (current_dt, v["txt"])
+        else:
+            prev_dt, prev_txt = seen[key]
+            if current_dt < prev_dt:
+                to_remove.append(prev_txt)
+                seen[key] = (current_dt, v["txt"])
+            else:
+                to_remove.append(v["txt"])
+
+    for txt in to_remove:
+        if txt in pending_places:
+            entry = pending_places.pop(txt)
+
+            # 通知チャンネルの削除
+            if "main_msg_id" in entry and entry["main_msg_id"]:
+                ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["main_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+            # コピー用チャンネルの削除
+            if "copy_msg_id" in entry and entry["copy_msg_id"]:
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(entry["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
 @client.event
 async def on_message(message):
     if message.author.bot or message.channel.id not in READABLE_CHANNEL_IDS:
@@ -924,6 +967,8 @@ async def on_message(message):
                         "main_msg_id": None,
                         "copy_msg_id": None,
                     }
+                    # ✅ 自動重複除去（同じサーバー・駐機場で後の時刻を削除）
+                    await auto_dedup()
                     display_txt = f"{txt} ({raw})"
                     image_results.append(display_txt)
                     task = asyncio.create_task(handle_new_event(dt, txt, channel))
