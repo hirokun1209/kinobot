@@ -506,7 +506,7 @@ async def on_message(message):
                 except:
                     pass
 
-        # 内部データクリア
+        # 内部状態の初期化
         pending_places.clear()
         for task in list(active_tasks):
             task.cancel()
