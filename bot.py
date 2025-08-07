@@ -595,13 +595,21 @@ async def on_message(message):
                 except:
                     pass
 
-        # summary_blocks から削除
+        # summary_blocks から削除＆min/max再構成
         for block in summary_blocks:
             before = len(block["events"])
             block["events"] = [ev for ev in block["events"] if ev[1] != txt]
             after = len(block["events"])
             if before != after:
                 removed = True
+                # min/max 再構築
+                if block["events"]:
+                    block["min"] = min(ev[0] for ev in block["events"])
+                    block["max"] = max(ev[0] for ev in block["events"])
+                else:
+                    block["min"] = block["max"] = datetime.max.replace(tzinfo=JST)
+
+                # ブロック通知の再編集
                 if block["msg"]:
                     try:
                         await block["msg"].edit(content=format_block_msg(block, True))
