@@ -185,43 +185,8 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
     for text in texts:
         matches = re.findall(r"免戦中([0-9:\-日分秒hmsHMShms％%日]+)", text)
         for raw in matches:
-            cleaned = re.sub(r"[^\d:]", "", raw)  # 数字と : のみ残す
-
-            # コロンが2つ → 正常形式
-            if cleaned.count(":") == 2:
-                durations.append(cleaned)
-                continue
-
-            # コロン1つ → M:Sとみなす
-            if cleaned.count(":") == 1:
-                parts = cleaned.split(":")
-                if len(parts) == 2:
-                    m, s = parts
-                    durations.append(f"00:{int(m):02}:{int(s):02}")
-                    continue
-
-            # コロンがない → 文字数によって補正
-            numbers_only = re.sub(r"[^\d]", "", raw)
-            if len(numbers_only) == 6:
-                # HHMMSS
-                h, m, s = numbers_only[:2], numbers_only[2:4], numbers_only[4:6]
-                durations.append(f"{int(h):02}:{int(m):02}:{int(s):02}")
-            elif len(numbers_only) == 5:
-                # HMMSS
-                h, m, s = numbers_only[:1], numbers_only[1:3], numbers_only[3:5]
-                durations.append(f"{int(h):02}:{int(m):02}:{int(s):02}")
-            elif len(numbers_only) == 4:
-                # MMSS
-                m, s = numbers_only[:2], numbers_only[2:4]
-                durations.append(f"00:{int(m):02}:{int(s):02}")
-            elif len(numbers_only) == 3:
-                # MSS
-                m, s = numbers_only[:1], numbers_only[1:3]
-                durations.append(f"00:{int(m):02}:{int(s):02}")
-            else:
-                # フォールバック
-                durations.append("00:00:00")
-
+            corrected = correct_imsen_text(raw)
+            durations.append(corrected)
     return durations
     
 def parse_multiple_places(center_texts, top_time_texts):
@@ -276,6 +241,36 @@ def parse_multiple_places(center_texts, top_time_texts):
             res.append((dt, f"{mode} {server}-{g['place']}-{unlock}", d))
 
     return res
+
+def correct_imsen_text(raw: str) -> str:
+    # 数字と : のみ残す
+    cleaned = re.sub(r"[^\d:]", "", raw)
+
+    # コロンが2つ → 正常形式
+    if cleaned.count(":") == 2:
+        return cleaned
+
+    # コロン1つ → M:Sとみなして補正
+    if cleaned.count(":") == 1:
+        m, s = cleaned.split(":")
+        return f"00:{int(m):02}:{int(s):02}"
+
+    # コロンなし → 桁数で補正
+    numbers_only = re.sub(r"[^\d]", "", raw)
+    if len(numbers_only) == 6:
+        h, m, s = numbers_only[:2], numbers_only[2:4], numbers_only[4:6]
+        return f"{int(h):02}:{int(m):02}:{int(s):02}"
+    elif len(numbers_only) == 5:
+        h, m, s = numbers_only[:1], numbers_only[1:3], numbers_only[3:5]
+        return f"{int(h):02}:{int(m):02}:{int(s):02}"
+    elif len(numbers_only) == 4:
+        m, s = numbers_only[:2], numbers_only[2:4]
+        return f"00:{int(m):02}:{int(s):02}"
+    elif len(numbers_only) == 3:
+        m, s = numbers_only[:1], numbers_only[1:3]
+        return f"00:{int(m):02}:{int(s):02}"
+
+    return cleaned  # 不明な形式はそのまま返す
 # =======================
 # ブロック・通知処理
 # =======================
