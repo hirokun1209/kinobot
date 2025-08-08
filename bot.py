@@ -444,6 +444,72 @@ async def minus_one_for_places(place_ids: list[str]):
 
     return updated
 
+async def retime_event_in_summary(old_txt: str, new_dt: datetime, new_txt: str, channel):
+    """
+    通知チャンネルのまとめメッセージを編集で更新する:
+      - 古い行(old_txt)は全ブロックから削除
+      - 新しい行(new_txt)を該当ブロックへ追加
+      - すべて時間順に整列
+    """
+    # 1) 古い行を全ブロックから除去
+    for block in list(summary_blocks):
+        if not block.get("events"):
+            continue
+        block["events"] = [(d, t) for (d, t) in block["events"] if t != old_txt]
+        if block["events"]:
+            block["events"].sort(key=lambda x: x[0])
+            block["min"] = min(d for d, _ in block["events"])
+            block["max"] = max(d for d, _ in block["events"])
+        else:
+            # 空になったブロックは min/max を新DTに仮置き
+            block["min"] = block["max"] = new_dt
+
+    # 2) 新しい行を入れる（なければブロック作成）
+    target_block = find_or_create_block(new_dt)
+    if (new_dt, new_txt) not in target_block["events"]:
+        target_block["events"].append((new_dt, new_txt))
+    target_block["events"].sort(key=lambda x: x[0])
+    target_block["min"] = min(target_block["min"], new_dt)
+    target_block["max"] = max(target_block["max"], new_dt)
+
+    # 3) まとめメッセージを一括編集
+    for block in summary_blocks:
+        if block.get("events"):
+            block["events"].sort(key=lambda x: x[0])
+        if block.get("msg"):
+            try:
+                await block["msg"].edit(content=format_block_msg(block, True))
+            except:
+                pass
+
+    # 4) pending_places の main_msg_id を新しいテキストにひも付け（ブロックにメッセージがある場合）
+    if target_block.get("msg") and new_txt in pending_places:
+        pending_places[new_txt]["main_msg_id"] = target_block["msg"].id
+
+# === 手動まとめ(!s)メッセージを最新状態で上書き ===
+async def refresh_manual_summaries():
+    if not manual_summary_msg_ids:
+        return
+    ch = client.get_channel(NOTIFY_CHANNEL_ID)
+    if not ch:
+        return
+
+    # pending_places を時刻順に並べて、!s と同じレイアウトで作り直す
+    sorted_places = sorted(pending_places.values(), key=lambda x: x["dt"])
+    lines = ["📢 手動通知: 現在登録されているスケジュール一覧", ""]
+    for v in sorted_places:
+        lines.append(v["txt"])
+    new_content = "\n".join(lines)
+
+    # 既に送ってある手動まとめメッセージを全部「編集」で上書き
+    for mid in list(manual_summary_msg_ids):
+        try:
+            msg = await ch.fetch_message(mid)
+            await msg.edit(content=new_content)
+        except:
+            # （消されてる等の例外は無視）
+            pass
+
 async def handle_new_event(dt, txt, channel):
     block = find_or_create_block(dt)
 
@@ -786,6 +852,8 @@ async def on_message(message):
                 task.cancel()
 
         if removed:
+            # 手動まとめ(!s)が既に送られている場合は、編集で最新化
+            await refresh_manual_summaries()
             await message.channel.send(f"🗑️ 予定を削除しました: {txt}")
         else:
             await message.channel.send(f"⚠️ 該当する予定が見つかりません: {txt}")
@@ -957,94 +1025,88 @@ async def on_message(message):
         )
         return
 
-    # ==== !a 奪取 1234-1-12:00:00 130000 or 13:00:00 ====
-    match = re.fullmatch(r"!a\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})\s+(\d{6}|\d{1,2}:\d{2}:\d{2})", message.content.strip())
-    if match:
-        mode, server, place, timestr, raw = match.groups()
-        old_txt = f"{mode} {server}-{place}-{timestr}"
+# ==== !a 奪取 1234-1-12:00:00 130000 or 13:00:00 ====
+match = re.fullmatch(r"!a\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})\s+(\d{6}|\d{1,2}:\d{2}:\d{2})", message.content.strip())
+if match:
+    mode, server, place, timestr, raw = match.groups()
+    old_txt = f"{mode} {server}-{place}-{timestr}"
 
-        # ---- 入力時刻のパース ----
-        try:
-            if ":" in raw:
-                h, m, s = map(int, raw.split(":"))
-            else:
-                h, m, s = int(raw[:2]), int(raw[2:4]), int(raw[4:])
-        except:
-            await message.channel.send("⚠️ 時間の指定が不正です")
-            return
-
-        # ---- 新日時の決定（過去扱い防止）----
-        if old_txt in pending_places:
-            base_date = pending_places[old_txt]["dt"].date()
+    # ---- 入力時刻のパース ----
+    try:
+        if ":" in raw:
+            h, m, s = map(int, raw.split(":"))
         else:
-            base_date = now_jst().date()
+            h, m, s = int(raw[:2]), int(raw[2:4]), int(raw[4:])
+    except:
+        await message.channel.send("⚠️ 時間の指定が不正です")
+        return
 
-        new_time = time(h, m, s)
-        new_dt = datetime.combine(base_date, new_time, tzinfo=JST)
+    # ---- 新日時の決定（過去扱い防止）----
+    if old_txt in pending_places:
+        base_date = pending_places[old_txt]["dt"].date()
+    else:
+        base_date = now_jst().date()
 
-        # 00:00〜05:59 は翌日扱い
-        if new_time < time(6, 0, 0):
-            new_dt += timedelta(days=1)
-        # それでも現在以下なら翌日に繰上げ
-        if new_dt <= now_jst():
-            new_dt += timedelta(days=1)
+    new_time = time(h, m, s)
+    new_dt = datetime.combine(base_date, new_time, tzinfo=JST)
 
-        new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
+    # 00:00〜05:59 は翌日扱い
+    if new_time < time(6, 0, 0):
+        new_dt += timedelta(days=1)
+    # それでも現在以下なら翌日に繰上げ
+    if new_dt <= now_jst():
+        new_dt += timedelta(days=1)
 
-        # ---- 旧エントリ情報の回収 & 通知予約キャンセル ----
-        old_main_msg_id = None
-        old_copy_msg_id = None
-        if old_txt in pending_places:
-            old_entry = pending_places.pop(old_txt)
-            old_main_msg_id = old_entry.get("main_msg_id")
-            old_copy_msg_id = old_entry.get("copy_msg_id")
+    new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
-            # 旧通知予約キャンセル（!n からも消える）
-            for key in [(old_txt, "2min"), (old_txt, "15s")]:
-                task = sent_notifications_tasks.pop(key, None)
-                if task:
-                    task.cancel()
+    # ---- 旧エントリ情報の回収 & 通知予約キャンセル ----
+    old_main_msg_id = None
+    old_copy_msg_id = None
+    if old_txt in pending_places:
+        old_entry = pending_places.pop(old_txt)
+        old_main_msg_id = old_entry.get("main_msg_id")
+        old_copy_msg_id = old_entry.get("copy_msg_id")
 
-        # ---- 新エントリを登録（ID は引き継ぐ、無ければ None のまま）----
-        pending_places[new_txt] = {
-            "dt": new_dt,
-            "txt": new_txt,
-            "server": server,
-            "created_at": now_jst(),
-            "main_msg_id": old_main_msg_id,
-            "copy_msg_id": old_copy_msg_id,
-        }
+        # 旧通知予約キャンセル（!n からも消える）
+        for key in [(old_txt, "2min"), (old_txt, "15s")]:
+            task = sent_notifications_tasks.pop(key, None)
+            if task:
+                task.cancel()
 
-        # ---- 通知チャンネル：存在する場合のみ「編集」 ----
-        if old_main_msg_id:
-            notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
-            if notify_ch:
-                try:
-                    msg = await notify_ch.fetch_message(old_main_msg_id)
-                    await msg.edit(content=new_txt)
-                except discord.NotFound:
-                    # 自動新規送信はしない（仕様）
-                    pending_places[new_txt]["main_msg_id"] = None
-                except Exception:
-                    pass
+    # ---- 新エントリを登録（ID は引き継ぐ、無ければ None のまま）----
+    pending_places[new_txt] = {
+        "dt": new_dt,
+        "txt": new_txt,
+        "server": server,
+        "created_at": now_jst(),
+        "main_msg_id": old_main_msg_id,  # まとめメッセのID（retime側で再設定される）
+        "copy_msg_id": old_copy_msg_id,  # コピー用メッセのID（あれば編集する）
+    }
 
-        # ---- コピーチャンネル：存在する場合のみ「編集」 ----
-        if old_copy_msg_id:
-            copy_ch = client.get_channel(COPY_CHANNEL_ID)
-            if copy_ch:
-                try:
-                    msg = await copy_ch.fetch_message(old_copy_msg_id)
-                    await msg.edit(content=new_txt.replace("🕒 ", ""))
-                except discord.NotFound:
-                    # 自動新規送信はしない（仕様）
-                    pending_places[new_txt]["copy_msg_id"] = None
-                except Exception:
-                    pass
+    # ---- 通知チャンネルのまとめメッセ：古い行を削除→新行を時刻順に追加（削除はせず編集で更新） ----
+    await retime_event_in_summary(old_txt, new_dt, new_txt, channel)
 
-        # ---- 通知予約を新しい時間で再登録（!n に反映）----
-        notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
-        if notify_ch:
-            await schedule_notification(new_dt, new_txt, notify_ch)
+    # ---- コピーチャンネル：存在する場合のみ「編集」。無ければ何もしない（自動新規送信しない）----
+    if old_copy_msg_id:
+        copy_ch = client.get_channel(COPY_CHANNEL_ID)
+        if copy_ch:
+            try:
+                msg = await copy_ch.fetch_message(old_copy_msg_id)
+                await msg.edit(content=new_txt.replace("🕒 ", ""))
+            except discord.NotFound:
+                # 自動新規送信はしない（仕様）
+                pending_places[new_txt]["copy_msg_id"] = None
+            except Exception:
+                pass
+
+    # ---- 通知予約を新しい時間で再登録（!n に反映）----
+    notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
+    if notify_ch:
+        await schedule_notification(new_dt, new_txt, notify_ch)
+
+        # ← ここまでが通知予約の再登録
+        # 手動まとめ(!s)が既に送られている場合は、編集で最新化
+        await refresh_manual_summaries()
 
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
         return
@@ -1163,8 +1225,9 @@ async def on_message(message):
                 "✅ 解析完了！登録されました",
                 "",
                 "🧭 **次の操作:**",
-                "　📤 `!c` → ⏰ 時間コピー用チャンネルにスケジュールを送信",
-                "　📢 `!s` → 📝 通知チャンネルに手動でスケジュールを通知",
+                "　📤 !c → ⏰ 時間コピー用チャンネルにスケジュールを送信",
+                "　📢 !s → 📝 通知チャンネルに手動でスケジュールを通知",
+                "　⏪ !1 → 📝 駐騎場ナンバーで-1秒可 ※実際と異なっている場合",
                 "",
             ]
             for base_time, txts in grouped_results:
