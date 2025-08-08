@@ -649,53 +649,55 @@ async def on_message(message):
         return
 
     # ==== !del 奪取 1272-4-06:24:35 ====
-    match = re.fullmatch(r"!del\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", message.content.strip())
-    if match:
-        mode, server, place, t = match.groups()
-        txt = f"{mode} {server}-{place}-{t}"
-        removed = False
+    if message.content.startswith("!del"):
+        args = message.content.split(maxsplit=1)
+        if len(args) < 2:
+            await message.channel.send("⚠️ 削除する予定を指定してください（例: !del 奪取 1234-1-12:34:56）")
+            return
 
-        # pending_places から削除
-        if txt in pending_places:
-            entry = pending_places.pop(txt)
-            removed = True
+        target_txt = args[1].strip()
+        found = False
 
-            # 通知チャンネルは削除せず → 後で編集する
-            # コピー用チャンネルは削除
-            if "copy_msg_id" in entry and entry["copy_msg_id"]:
-                ch = client.get_channel(COPY_CHANNEL_ID)
-                try:
-                    msg = await ch.fetch_message(entry["copy_msg_id"])
-                    await msg.delete()
-                except:
-                    pass
+        for key, v in list(pending_places.items()):
+            if v["txt"] == target_txt:
+                # 通知チャンネルのメッセージを編集して該当行を消す
+                if v.get("main_msg_id"):
+                    ch = client.get_channel(NOTIFY_CHANNEL_ID)
+                    if ch:
+                        try:
+                            msg_obj = await ch.fetch_message(v["main_msg_id"])
+                            lines = msg_obj.content.splitlines()
+                            lines = [line for line in lines if target_txt not in line]
+                            await msg_obj.edit(content="\n".join(lines))
+                        except:
+                            pass
 
-        # summary_blocks から削除
-        for block in summary_blocks:
-            before = len(block["events"])
-            block["events"] = [ev for ev in block["events"] if ev[1] != txt]
-            after = len(block["events"])
+                # コピー用チャンネルのメッセージを編集して該当行を消す
+                if v.get("copy_msg_id"):
+                    ch = client.get_channel(COPY_CHANNEL_ID)
+                    if ch:
+                        try:
+                            msg_obj = await ch.fetch_message(v["copy_msg_id"])
+                            lines = msg_obj.content.splitlines()
+                            lines = [line for line in lines if target_txt not in line]
+                            await msg_obj.edit(content="\n".join(lines))
+                        except:
+                            pass
 
-            if before != after:
-                removed = True
-                # min/max 再構築
-                if block["events"]:
-                    block["min"] = min(ev[0] for ev in block["events"])
-                    block["max"] = max(ev[0] for ev in block["events"])
-                else:
-                    block["min"] = block["max"] = datetime.max.replace(tzinfo=JST)
+                # 通知予約（!n用リスト）からも削除
+                if "notify_2min" in globals():
+                    notify_2min = [item for item in notify_2min if item["txt"] != target_txt]
+                if "notify_15sec" in globals():
+                    notify_15sec = [item for item in notify_15sec if item["txt"] != target_txt]
 
-                # まとめメッセージを編集で更新（該当行だけ消す）
-                if block["msg"]:
-                    try:
-                        await block["msg"].edit(content=format_block_msg(block, True))
-                    except:
-                        pass
+                del pending_places[key]
+                found = True
+                break
 
-        if removed:
-            await message.channel.send(f"🗑️ 予定を削除しました: {txt}")
+        if found:
+            await message.channel.send(f"🗑️ `{target_txt}` を削除しました（通知予約も解除）")
         else:
-            await message.channel.send(f"⚠️ 該当する予定が見つかりません: {txt}")
+            await message.channel.send(f"⚠️ `{target_txt}` は見つかりませんでした")
         return
         
     # ==== !debug ====
@@ -875,32 +877,39 @@ async def on_message(message):
             new_dt += timedelta(days=1)
         new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
+        # ==== 旧予定の削除処理 ====
         if old_txt in pending_places:
             old_entry = pending_places.pop(old_txt)
 
+            # 通知チャンネルの該当行を空行化
             if old_entry.get("main_msg_id"):
                 ch = client.get_channel(NOTIFY_CHANNEL_ID)
                 try:
                     msg = await ch.fetch_message(old_entry["main_msg_id"])
-                    await msg.delete()
+                    lines = msg.content.split("\n")
+                    new_lines = [line for line in lines if old_txt not in line]
+                    await msg.edit(content="\n".join(new_lines))
                 except:
                     pass
 
+            # コピー用チャンネルも空行化
             if old_entry.get("copy_msg_id"):
                 ch = client.get_channel(COPY_CHANNEL_ID)
                 try:
                     msg = await ch.fetch_message(old_entry["copy_msg_id"])
-                    await msg.delete()
+                    lines = msg.content.split("\n")
+                    new_lines = [line for line in lines if old_txt not in line]
+                    await msg.edit(content="\n".join(new_lines))
                 except:
                     pass
 
-            # 🔻 通知タスクのキャンセル
+            # 🔻 通知タスクのキャンセル（!nからも消える）
             for key in [(old_txt, "2min"), (old_txt, "15s")]:
                 task = sent_notifications_tasks.pop(key, None)
                 if task:
                     task.cancel()
 
-        # 再登録
+        # ==== 新しい予定を登録 ====
         pending_places[new_txt] = {
             "dt": new_dt,
             "txt": new_txt,
@@ -926,13 +935,13 @@ async def on_message(message):
             except:
                 pass
 
-        # コピー用チャンネルに再送（!a の場合は自動削除なし）
+        # コピー用チャンネルへ送信（!a の場合は自動削除なし）
         copy_ch = client.get_channel(COPY_CHANNEL_ID)
         if copy_ch:
             msg = await copy_ch.send(content=new_txt.replace("🕒 ", ""))
             pending_places[new_txt]["copy_msg_id"] = msg.id
 
-        # 通知スケジュール再登録
+        # 通知スケジュール再登録（!debug や !n にも反映）
         notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
         if notify_ch:
             await schedule_notification(new_dt, new_txt, notify_ch)
