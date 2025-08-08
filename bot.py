@@ -667,52 +667,45 @@ async def on_message(message):
         txt = f"{mode} {server}-{place}-{t}"
         removed = False
 
-        # pending から除去＆コピー用メッセージ削除
-        copy_msg_id = None
+        # pending_places から削除（通知チャンネルのまとめメッセは消さない）
         if txt in pending_places:
             entry = pending_places.pop(txt)
             removed = True
-            copy_msg_id = entry.get("copy_msg_id")
 
-        # 予約タスクのキャンセル（!n からも消す）
-        for key in [(txt, "2min"), (txt, "15s")]:
-            task = sent_notifications_tasks.pop(key, None)
-            if task:
-                task.cancel()
-
-        # コピー用チャンネルの当該メッセージ削除
-        if copy_msg_id:
-            ch_copy = client.get_channel(COPY_CHANNEL_ID)
-            if ch_copy:
+            # コピー用チャンネルの該当メッセージだけ削除
+            if entry.get("copy_msg_id"):
+                ch = client.get_channel(COPY_CHANNEL_ID)
                 try:
-                    msg = await ch_copy.fetch_message(copy_msg_id)
+                    msg = await ch.fetch_message(entry["copy_msg_id"])
                     await msg.delete()
                 except:
                     pass
 
-        # summary_blocks からも該当行を消す（空になったらまとめを削除）
-        for block in list(summary_blocks):
+        # summary_blocks から該当行だけ削除し、メッセージは編集で更新
+        for block in summary_blocks:
             before = len(block["events"])
             block["events"] = [ev for ev in block["events"] if ev[1] != txt]
             after = len(block["events"])
+
             if before != after:
                 removed = True
                 if block["events"]:
                     block["min"] = min(ev[0] for ev in block["events"])
                     block["max"] = max(ev[0] for ev in block["events"])
-                    if block.get("msg"):
-                        try:
-                            await block["msg"].edit(content=format_block_msg(block, True))
-                        except:
-                            pass
                 else:
-                    # もうこのまとめは不要なのでメッセージを消す
-                    if block.get("msg"):
-                        try:
-                            await block["msg"].delete()
-                        except:
-                            pass
-                    summary_blocks.remove(block)
+                    block["min"] = block["max"] = datetime.max.replace(tzinfo=JST)
+
+                if block.get("msg"):
+                    try:
+                        await block["msg"].edit(content=format_block_msg(block, True))
+                    except:
+                        pass
+
+        # 通知予約も確実にキャンセル（!n からも消える）
+        for key in [(txt, "2min"), (txt, "15s")]:
+            task = sent_notifications_tasks.pop(key, None)
+            if task and not task.cancelled():
+                task.cancel()
 
         if removed:
             await message.channel.send(f"🗑️ 予定を削除しました: {txt}")
@@ -897,21 +890,26 @@ async def on_message(message):
             new_dt += timedelta(days=1)
         new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
 
-        # 既存の予約とメッセージの扱い（コピーは「削除せず編集」に変更）
-        old_copy_msg_id = None
+        # 旧エントリがあれば掃除（コピー用/通知予約）
         if old_txt in pending_places:
             old_entry = pending_places.pop(old_txt)
-            # 通知予約タスクのキャンセル（一覧 !n からも確実に消す）
+
+            # 旧コピー用メッセージ削除
+            if old_entry.get("copy_msg_id"):
+                ch = client.get_channel(COPY_CHANNEL_ID)
+                try:
+                    msg = await ch.fetch_message(old_entry["copy_msg_id"])
+                    await msg.delete()
+                except:
+                    pass
+
+            # 旧通知予約をキャンセル
             for key in [(old_txt, "2min"), (old_txt, "15s")]:
                 task = sent_notifications_tasks.pop(key, None)
                 if task:
                     task.cancel()
 
-            # 通知まとめメッセージは消さず（この後編集で反映）
-            # コピー用は「送信済みメッセージを編集」するためIDだけ保持
-            old_copy_msg_id = old_entry.get("copy_msg_id")
-
-        # 新規（更新後）を登録
+        # 新エントリを登録（まず内部状態）
         pending_places[new_txt] = {
             "dt": new_dt,
             "txt": new_txt,
@@ -921,44 +919,19 @@ async def on_message(message):
             "copy_msg_id": None,
         }
 
-        # ブロック反映（まとめメッセージ側の行を差し替える）
-        block = find_or_create_block(new_dt)
-        replaced = False
-        for i, (ev_dt, ev_txt) in enumerate(block["events"]):
-            if ev_txt == old_txt:
-                block["events"][i] = (new_dt, new_txt)
-                replaced = True
-                break
-        if not replaced:
-            block["events"].append((new_dt, new_txt))
+        # まとめメッセ/ブロックは共通処理で整合させる
+        await handle_new_event(new_dt, new_txt, channel)
 
-        if block["msg"]:
-            try:
-                await block["msg"].edit(content=format_block_msg(block, True))
-                pending_places[new_txt]["main_msg_id"] = block["msg"].id
-            except:
-                pass
-        else:
-            # まとめメッセージが未作成ならスケジューラに任せる
-            pass
-
-        # コピー用チャンネル：旧メッセージがあれば上書き編集、無ければ新規送信
+        # コピーチャンネルは新規1件で上書き（!aは自動削除なし）
         copy_ch = client.get_channel(COPY_CHANNEL_ID)
         if copy_ch:
-            if old_copy_msg_id:
-                try:
-                    msg = await copy_ch.fetch_message(old_copy_msg_id)
-                    await msg.edit(content=new_txt.replace("🕒 ", ""))
-                    pending_places[new_txt]["copy_msg_id"] = msg.id
-                except:
-                    # 取得できなければ新規送信
-                    msg = await copy_ch.send(content=new_txt.replace("🕒 ", ""))
-                    pending_places[new_txt]["copy_msg_id"] = msg.id
-            else:
+            try:
                 msg = await copy_ch.send(content=new_txt.replace("🕒 ", ""))
                 pending_places[new_txt]["copy_msg_id"] = msg.id
+            except:
+                pass
 
-        # 通知スケジュールへ再登録（!n にも即時反映される）
+        # 通知予約を再登録（!n にも必ず反映）
         notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
         if notify_ch:
             await schedule_notification(new_dt, new_txt, notify_ch)
