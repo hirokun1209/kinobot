@@ -67,6 +67,9 @@ ocr = PaddleOCR(use_angle_cls=True, lang='japan')
 #     "main_msg_id": Optional[int],
 #     "copy_msg_id": Optional[int]
 # }
+# 直近の画像グループ（!gで使う）
+last_groups = {}     # {grp_id: [ {mode,server,place,dt,txt,main_msg_id,copy_msg_id}, ... ]}
+last_groups_seq = 0  # 採番
 pending_places = {}
 copy_queue = []
 summary_blocks = []
@@ -77,6 +80,7 @@ sent_notifications = set()
 sent_notifications_tasks = {}
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
+
 
 def store_copy_msg_id(txt, msg_id):
     if txt in pending_places:
@@ -151,6 +155,103 @@ def cleanup_old_entries():
     for k in list(pending_places):
         if (now - pending_places[k]["created_at"]) > timedelta(hours=6):
             del pending_places[k]
+
+def parse_txt_fields(txt: str):
+    m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
+    return m.groups() if m else None
+
+async def apply_adjust_for_server_place(server: str, place: str, sec_adj: int):
+    # server/place に一致する予定を sec_adj 秒ずらす（早い時間だけ残す・同時刻は統合）
+    candidates = []
+    for txt, ent in list(pending_places.items()):
+        g = parse_txt_fields(txt)
+        if g and g[1] == server and g[2] == place:
+            candidates.append((txt, ent))
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[1]["dt"])
+    old_txt, entry = candidates[0]
+    old_dt = entry["dt"]
+    mode, _, _, _ = parse_txt_fields(old_txt)
+    new_dt = old_dt + timedelta(seconds=sec_adj)
+    new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
+
+    # 旧通知予約キャンセル
+    for key in [(old_txt, "2min"), (old_txt, "15s")]:
+        task = sent_notifications_tasks.pop(key, None)
+        if task:
+            task.cancel()
+
+    # 同時刻が既にある → 統合（新規作成せず old を消す）
+    if new_txt in pending_places and new_txt != old_txt:
+        old_entry = pending_places.pop(old_txt, None)
+        await retime_event_in_summary(old_txt, pending_places[new_txt]["dt"], new_txt, client.get_channel(NOTIFY_CHANNEL_ID))
+        try:
+            if old_entry and old_entry.get("copy_msg_id"):
+                ch_copy = client.get_channel(COPY_CHANNEL_ID)
+                if ch_copy:
+                    msg = await ch_copy.fetch_message(old_entry["copy_msg_id"])
+                    await msg.delete()
+        except:
+            pass
+        notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
+        if notify_ch and mode == "奪取":
+            await schedule_notification(pending_places[new_txt]["dt"], new_txt, notify_ch)
+        return (old_txt, new_txt)
+
+    # 差し替え
+    old_main_id = entry.get("main_msg_id")
+    old_copy_id = entry.get("copy_msg_id")
+    pending_places.pop(old_txt, None)
+    pending_places[new_txt] = {
+        "dt": new_dt, "txt": new_txt, "server": server,
+        "created_at": entry.get("created_at", now_jst()),
+        "main_msg_id": old_main_id, "copy_msg_id": old_copy_id,
+    }
+
+    # まとめ編集
+    await retime_event_in_summary(old_txt, new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID))
+
+    # コピー編集（自動新規はしない）
+    if old_copy_id:
+        ch_copy = client.get_channel(COPY_CHANNEL_ID)
+        if ch_copy:
+            try:
+                msg = await ch_copy.fetch_message(old_copy_id)
+                await msg.edit(content=new_txt.replace("🕒 ", ""))
+                pending_places[new_txt]["copy_msg_id"] = msg.id
+            except discord.NotFound:
+                pending_places[new_txt]["copy_msg_id"] = None
+            except:
+                pass
+
+    # 通知再登録（奪取のみ）
+    notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
+    if notify_ch and new_txt.startswith("奪取"):
+        await schedule_notification(new_dt, new_txt, notify_ch)
+
+    # 保険：同(server,place)で new_dt 以降は削除（早い時間だけ残す）
+    for txt, ent in list(pending_places.items()):
+        g = parse_txt_fields(txt)
+        if g and g[1] == server and g[2] == place and txt != new_txt:
+            if ent["dt"] >= new_dt:
+                await retime_event_in_summary(txt, new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID))
+                try:
+                    if ent.get("copy_msg_id"):
+                        ch_copy = client.get_channel(COPY_CHANNEL_ID)
+                        if ch_copy:
+                            msg = await ch_copy.fetch_message(ent["copy_msg_id"])
+                            await msg.delete()
+                except:
+                    pass
+                for key in [(txt, "2min"), (txt, "15s")]:
+                    task = sent_notifications_tasks.pop(key, None)
+                    if task:
+                        task.cancel()
+                pending_places.pop(txt, None)
+
+    return (old_txt, new_txt)
 
 def crop_top_right(img):
     h, w = img.shape[:2]
@@ -979,6 +1080,65 @@ async def on_message(message):
             await message.channel.send("\n".join(lines))
         return
 
+    # ==== !g 画像グループ単位で±秒オフセット ====
+    # 例) !g 1 -1        → グループ1を -1秒
+    #     !g 1 3 5 -2    → グループ1,3,5を -2秒
+    #     !g 1:+2 4:-3   → グループ1は+2秒、4は-3秒
+    m_g = re.fullmatch(r"!g\s+(.+)", message.content.strip())
+    if m_g:
+        arg_str = m_g.group(1).strip()
+        tokens = arg_str.split()
+
+        if not last_groups:
+            await message.channel.send("⚠️ 対象グループがありません。まず画像を送って解析してください。")
+            return
+
+        group_adjust_map = {}
+        # パターンA: "<grp> <grp> ... <±sec>"
+        if len(tokens) >= 2 and all(re.fullmatch(r"\d+", t) for t in tokens[:-1]) and re.fullmatch(r"[-+]?\d+", tokens[-1]):
+            common_adj = int(tokens[-1])
+            for gid_str in tokens[:-1]:
+                gid = int(gid_str)
+                if gid in last_groups:
+                    group_adjust_map[gid] = common_adj
+        else:
+            # パターンB: "<grp>:<±sec> ..."
+            ok = True
+            for t in tokens:
+                m2 = re.fullmatch(r"(\d+):([-+]?\d+)", t)
+                if not m2:
+                    ok = False
+                    break
+                gid = int(m2.group(1)); sec = int(m2.group(2))
+                if gid in last_groups:
+                    group_adjust_map[gid] = sec
+            if not ok:
+                await message.channel.send("⚠️ 使い方: `!g <grp> <grp> ... <±sec>` または `!g <grp>:<±sec> <grp>:<±sec>`")
+                return
+
+        if not group_adjust_map:
+            await message.channel.send("⚠️ 指定グループが見つかりません")
+            return
+
+        updated_pairs = []
+        skipped = 0
+        for gid, sec_adj in group_adjust_map.items():
+            for e in last_groups.get(gid, []):
+                res = await apply_adjust_for_server_place(e["server"], e["place"], sec_adj)
+                if res: updated_pairs.append(res)
+                else: skipped += 1
+
+        await refresh_manual_summaries()
+
+        if updated_pairs:
+            msg = ["✅ 反映しました:"]
+            msg += [f"　{o} → {n}" for o, n in updated_pairs]
+            if skipped: msg.append(f"ℹ️ 一部スキップ: {skipped}件")
+            await message.channel.send("\n".join(msg))
+        else:
+            await message.channel.send("（変更なし）")
+        return
+
     # ==== !s ====
     if message.content.strip() == "!s":
         if not pending_places:
@@ -1282,6 +1442,7 @@ async def on_message(message):
             return "??:??:??"
 
         for a in message.attachments:
+            structured_entries_for_this_image = []  # ← !g用
             b = await a.read()
             img = Image.open(io.BytesIO(b)).convert("RGB")
             np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -1295,6 +1456,15 @@ async def on_message(message):
 
             image_results = []
             for dt, txt, raw in parsed:
+                g = parse_txt_fields(txt)
+                if g:
+                    _mode, _server, _place, _ = g
+                    structured_entries_for_this_image.append({
+                        "mode": _mode, "server": _server, "place": _place,
+                        "dt": dt, "txt": txt,
+                        "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
+                        "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
+                    })
                 if txt not in pending_places:
                     pending_places[txt] = {
                         "dt": dt,
@@ -1318,15 +1488,19 @@ async def on_message(message):
 
             if image_results:
                 grouped_results.append((base_time, image_results))
+            if structured_entries_for_this_image:
+                global last_groups_seq, last_groups
+                last_groups_seq += 1
+                last_groups[last_groups_seq] = structured_entries_for_this_image
 
         if grouped_results:
             lines = [
                 "✅ 解析完了！登録されました",
                 "",
-                "🧭 **次の操作:**",
                 "　📤 !c → ⏰ 時間コピー用チャンネルにスケジュールを送信",
                 "　📢 !s → 📝 通知チャンネルに手動でスケジュールを通知",
                 "　⏪ !1 → 📝 駐騎場ナンバーで-1秒可 ※実際と異なっている場合",
+                "　🛠 !g → 画像グループをまとめて±秒（例: !g 1 -1 / !g 1 3 5 -2 / !g 1:+2 4:-3）",
                 "",
             ]
             for base_time, txts in grouped_results:
