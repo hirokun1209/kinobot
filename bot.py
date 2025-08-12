@@ -1504,7 +1504,7 @@ async def on_message(message):
                 "",
             ]
             for base_time, txts in grouped_results:
-                lines.append(f"📸 [基準時間: {base_time}]")
+                lines.append(f"📸 [G{group_id} | 基準時間: {base_time_str}]")
                 lines += [f"・{txt}" for txt in txts]
                 lines.append("")
             await status.edit(content="\n".join(lines))
