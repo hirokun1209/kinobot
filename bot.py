@@ -1482,6 +1482,7 @@ async def on_message(message):
                     }
                     # ✅ 自動重複除去（同じサーバー・駐機場で後の時刻を削除）
                     await auto_dedup()
+                    pending_copy_queue.append((dt, txt))
                     display_txt = f"{txt} ({raw})"
                     image_results.append(display_txt)
                     task = asyncio.create_task(handle_new_event(dt, txt, channel))
