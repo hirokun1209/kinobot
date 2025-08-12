@@ -1082,9 +1082,6 @@ async def on_message(message):
         return
 
     # ==== !g 画像グループ単位で±秒オフセット ====
-    # 例) !g 1 -1        → グループ1を -1秒
-    #     !g 1 3 5 -2    → グループ1,3,5を -2秒
-    #     !g 1:+2 4:-3   → グループ1は+2秒、4は-3秒
     m_g = re.fullmatch(r"!g\s+(.+)", message.content.strip())
     if m_g:
         arg_str = m_g.group(1).strip()
@@ -1095,15 +1092,23 @@ async def on_message(message):
             return
 
         group_adjust_map = {}
+
+        # パターンC: "!g 1" → デフォルト -1秒
+        if len(tokens) == 1 and re.fullmatch(r"\d+", tokens[0]):
+            gid = int(tokens[0])
+            if gid in last_groups:
+                group_adjust_map[gid] = -1
+
         # パターンA: "<grp> <grp> ... <±sec>"
-        if len(tokens) >= 2 and all(re.fullmatch(r"\d+", t) for t in tokens[:-1]) and re.fullmatch(r"[-+]?\d+", tokens[-1]):
+        elif len(tokens) >= 2 and all(re.fullmatch(r"\d+", t) for t in tokens[:-1]) and re.fullmatch(r"[-+]?\d+", tokens[-1]):
             common_adj = int(tokens[-1])
             for gid_str in tokens[:-1]:
                 gid = int(gid_str)
                 if gid in last_groups:
                     group_adjust_map[gid] = common_adj
+
+        # パターンB: "<grp>:<±sec> ..."
         else:
-            # パターンB: "<grp>:<±sec> ..."
             ok = True
             for t in tokens:
                 m2 = re.fullmatch(r"(\d+):([-+]?\d+)", t)
@@ -1113,8 +1118,8 @@ async def on_message(message):
                 gid = int(m2.group(1)); sec = int(m2.group(2))
                 if gid in last_groups:
                     group_adjust_map[gid] = sec
-            if not ok:
-                await message.channel.send("⚠️ 使い方: `!g <grp> <grp> ... <±sec>` または `!g <grp>:<±sec> <grp>:<±sec>`")
+            if not ok and not group_adjust_map:
+                await message.channel.send("⚠️ 使い方: `!g <grp> <grp> ... <±sec>` または `!g <grp>:<±sec>` または `!g <grp>`")
                 return
 
         if not group_adjust_map:
@@ -1139,7 +1144,7 @@ async def on_message(message):
         else:
             await message.channel.send("（変更なし）")
         return
-
+        
     # ==== !s ====
     if message.content.strip() == "!s":
         if not pending_places:
@@ -1487,12 +1492,12 @@ async def on_message(message):
                         active_tasks.add(task2)
                         task2.add_done_callback(lambda t: active_tasks.discard(t))
 
-            if image_results:
-                grouped_results.append((base_time, image_results))
             if structured_entries_for_this_image:
                 last_groups_seq += 1
-                last_groups[last_groups_seq] = structured_entries_for_this_image
-
+                gid = last_groups_seq
+                last_groups[gid] = structured_entries_for_this_image
+                if image_results:
+                    grouped_results.append((gid, base_time, image_results))
         if grouped_results:
             lines = [
                 "✅ 解析完了！登録されました",
@@ -1503,8 +1508,8 @@ async def on_message(message):
                 "　🛠 !g → 画像グループをまとめて±秒（例: !g 1 -1 / !g 1 3 5 -2 / !g 1:+2 4:-3）",
                 "",
             ]
-            for base_time, txts in grouped_results:
-                lines.append(f"📸 [G{group_id} | 基準時間: {base_time_str}]")
+            for gid, base_time_str, txts in grouped_results:
+                lines.append(f"📸 [G{gid} | 基準時間: {base_time_str}]")
                 lines += [f"・{txt}" for txt in txts]
                 lines.append("")
             await status.edit(content="\n".join(lines))
