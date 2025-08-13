@@ -1139,7 +1139,9 @@ async def on_message(message):
 
         # 手動まとめ(!s)が既に送られていれば、**ここで編集で最新化**
         await refresh_manual_summaries()
-
+        batch = [(pending_places[n]["dt"], n) for _, n in updated if n in pending_places]
+        if batch:
+            await upsert_copy_channel_sorted(batch)
         if not updated:
             await message.channel.send("⚠️ 対象の駐騎場の予定が見つかりませんでした")
         else:
@@ -1203,7 +1205,9 @@ async def on_message(message):
                 else: skipped += 1
 
         await refresh_manual_summaries()
-
+        batch = [(pending_places[n]["dt"], n) for _, n in updated_pairs if n in pending_places]
+        if batch:
+            await upsert_copy_channel_sorted(batch)
         if updated_pairs:
             msg = ["✅ 反映しました:"]
             msg += [f"　{o} → {n}" for o, n in updated_pairs]
@@ -1440,7 +1444,7 @@ async def on_message(message):
 
             # 手動まとめ(!s)が既に送られている場合は、編集で最新化
             await refresh_manual_summaries()
-
+        await upsert_copy_channel_sorted([(new_dt, new_txt)])
         await message.channel.send(f"✅ 更新しました → `{new_txt}`")
         return
 
