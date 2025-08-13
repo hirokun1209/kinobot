@@ -130,6 +130,13 @@ async def remove_expired_entries():
             except:
                 pass
             block["msg"] = None
+        # ↓↓↓ 追加：5分前メッセの掃除
+        if block.get("msg_5min"):
+            try:
+                await block["msg_5min"].delete()
+            except:
+                pass
+            block["msg_5min"] = None
         if not block["events"]:
             summary_blocks.remove(block)
 
@@ -494,6 +501,7 @@ def find_or_create_block(new_dt):
         "min": new_dt,
         "max": new_dt,
         "msg": None,
+        "msg_5min": None,
         "task": None,
         "lock": asyncio.Lock(),
     }
@@ -512,28 +520,51 @@ def format_block_msg(block, with_footer=True):
 
 async def schedule_block_summary(block, channel):
     try:
-        # 開始30分前の案内
+        # ① 開始30分前まで待つ
         await asyncio.sleep(max(0, (block["min"] - timedelta(minutes=30) - now_jst()).total_seconds()))
 
+        # 30分前：まとめメッセ（フッター付き）を送信/更新
+        content_with_footer = format_block_msg(block, with_footer=True)
         if not block["msg"]:
-            block["msg"] = await channel.send(format_block_msg(block, True))
+            block["msg"] = await channel.send(content_with_footer)
         else:
             try:
-                await block["msg"].edit(content=format_block_msg(block, True))
+                await block["msg"].edit(content=content_with_footer)
             except discord.NotFound:
-                block["msg"] = await channel.send(format_block_msg(block, True))
+                block["msg"] = await channel.send(content_with_footer)
 
-        # 開始時刻になったらフッター差し替え
+        # ② 開始5分前まで待つ
+        await asyncio.sleep(max(0, (block["min"] - timedelta(minutes=5) - now_jst()).total_seconds()))
+
+        # 5分前：短い別メッセージを送る（単独）
+        try:
+            block["msg_5min"] = await channel.send("⚠️ 5分後に始まるよ⚠️")
+        except Exception:
+            block["msg_5min"] = None
+
+        # ③ 開始時刻まで待つ
         await asyncio.sleep(max(0, (block["min"] - now_jst()).total_seconds()))
+
+        # 開始時刻：まとめメッセのフッターだけ消す（本文は残す）
         if block["msg"]:
             try:
-                await block["msg"].edit(content=format_block_msg(block, False))
+                await block["msg"].edit(content=format_block_msg(block, with_footer=False))
             except discord.NotFound:
                 pass
+
+        # 開始時刻：5分前メッセージは削除
+        if block.get("msg_5min"):
+            try:
+                await block["msg_5min"].delete()
+            except Exception:
+                pass
+            finally:
+                block["msg_5min"] = None
+
     except Exception as e:
         print(f"[ERROR] schedule_block_summary failed: {e}")
     finally:
-        # タスク参照を必ずクリア（多重起動防止のため）
+        # タスク参照をクリア（多重起動防止）
         block["task"] = None
 
 async def minus_one_for_places(place_ids: list[str]):
@@ -715,6 +746,8 @@ async def handle_new_event(dt, txt, channel):
             active_tasks.add(task)
             task.add_done_callback(lambda t: active_tasks.discard(t))
 
+
+
 def is_within_5_minutes_of_another(target_dt):
     times = sorted([v["dt"] for v in pending_places.values()])
     for dt in times:
@@ -800,6 +833,12 @@ async def daily_reset_task():
                     await block["msg"].delete()
                 except:
                     pass
+            if block.get("msg_5min"):        # ← 追加
+                try:
+                    await block["msg_5min"].delete()
+                except:
+                    pass
+                block["msg_5min"] = None
 
         # 通知予約(2分前/15秒前)タスクのキャンセル
         for key, task in list(sent_notifications_tasks.items()):
