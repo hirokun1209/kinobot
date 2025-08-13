@@ -1451,6 +1451,7 @@ async def on_message(message):
     # ==== 手動追加（例: 1234-1-12:34:56）====
     manual = re.findall(r"\b(\d{3,4})-(\d+)-(\d{2}:\d{2}:\d{2})\b", message.content)
     if manual:
+        entries_to_copy = []  # ← コピー用チャンネルへ流す分を一括で持つ
         for server, place, t in manual:
             if len(server) == 3:
                 server = "1" + server
@@ -1477,6 +1478,11 @@ async def on_message(message):
                     task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
                     active_tasks.add(task2)
                     task2.add_done_callback(lambda t: active_tasks.discard(t))
+                # ← コピー用チャンネルへも反映（後で一括で時刻順差し込み）
+                entries_to_copy.append((dt, txt))
+        # ← 複数件をまとめてコピー用チャンネルに時刻順で差し込み
+        if entries_to_copy:
+            await upsert_copy_channel_sorted(entries_to_copy)
         return
 
     # ==== 通常画像送信 ====
