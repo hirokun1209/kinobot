@@ -160,6 +160,75 @@ def parse_txt_fields(txt: str):
     m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
     return m.groups() if m else None
 
+async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
+    """
+    コピー用CHを「編集で」並べ替え＋挿入。
+    - 既存のbot投稿をチャンネルの現在順（古い→新しい）で取得
+    - desired(理想の順)を dt でソートして作る
+    - 既存[i] を desired[i] に edit で置き換え
+    - 足りない分は末尾に send
+    - pending_places の copy_msg_id を再ひも付け
+    """
+    ch = client.get_channel(COPY_CHANNEL_ID)
+    if not ch:
+        return
+
+    # 1) いまチャンネルに出ている「自分の投稿」を古い順に取得
+    existing_msgs = []
+    async for m in ch.history(limit=200, oldest_first=True):
+        if m.author == client.user:
+            existing_msgs.append(m)
+
+    # 2) 既存テキストを現在順で並べる
+    existing_texts = [m.content for m in existing_msgs]
+
+    # 3) 既存の (txt -> dt) を pending_places から引く（見つからないものは末尾維持用）
+    def dt_of_text(txt):
+        ent = pending_places.get(txt)  # txt は「奪取 1234-1-20:00:00」の形
+        return ent["dt"] if ent else None
+
+    # 4) new_entries から new だけ抽出（既存と重複してたら無視）
+    existing_set = set(existing_texts)
+    add_list = [(dt, txt) for dt, txt in new_entries if txt not in existing_set]
+
+    # 5) desired（理想の順）を作る
+    #    - “いま画面にある（＝existing_texts）”で dt がわかるものは dt で並べ替えたい
+    #    - dt 不明なもの（もう pending から消えた等）は最後に現順のまま付ける
+    existing_with_dt = [(dt_of_text(txt), txt) for txt in existing_texts]
+    items_with_dt    = [(dt, txt) for (dt, txt) in existing_with_dt if dt is not None]
+    items_without_dt = [txt for (dt, txt) in existing_with_dt if dt is None]
+
+    desired_pairs = items_with_dt + add_list
+    desired_pairs.sort(key=lambda x: x[0])  # dt で昇順
+
+    desired_texts = [txt for _, txt in desired_pairs] + items_without_dt  # dt不明は末尾に現順ママ
+
+    # 6) 上から順に「既存[i] → desired[i]」へ edit
+    text_to_msgid = {}
+    for i in range(min(len(existing_msgs), len(desired_texts))):
+        cur_msg = existing_msgs[i]
+        target  = desired_texts[i].replace("🕒 ", "")
+        if cur_msg.content != target:
+            try:
+                await cur_msg.edit(content=target)
+            except:
+                pass
+        text_to_msgid[desired_texts[i]] = cur_msg.id
+
+    # 7) desired が多い分は末尾に新規 send
+    if len(desired_texts) > len(existing_msgs):
+        for txt in desired_texts[len(existing_msgs):]:
+            try:
+                m = await ch.send(content=txt.replace("🕒 ", ""))
+                text_to_msgid[txt] = m.id
+            except:
+                pass
+
+    # 8) copy_msg_id を再ひも付け
+    for txt, ent in list(pending_places.items()):
+        if ent.get("txt") == txt and txt in text_to_msgid:
+            pending_places[txt]["copy_msg_id"] = text_to_msgid[txt]
+
 async def apply_adjust_for_server_place(server: str, place: str, sec_adj: int):
     # server/place に一致する予定を sec_adj 秒ずらす（早い時間だけ残す・同時刻は統合）
     candidates = []
@@ -689,12 +758,11 @@ async def process_copy_queue():
     while True:
         await asyncio.sleep(30)
         if pending_copy_queue:
-            queue_copy = sorted(pending_copy_queue, key=lambda x: x[0])
+            # 溜まった分を時刻順にして一括反映
+            batch = sorted(pending_copy_queue, key=lambda x: x[0])  # [(dt, txt), ...]
             pending_copy_queue.clear()
-            for dt, txt in queue_copy:
-                msg = await send_to_copy_channel(dt, txt)
-                store_copy_msg_id(txt, msg)
-
+            await upsert_copy_channel_sorted(batch)
+            
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
