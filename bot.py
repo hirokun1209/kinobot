@@ -25,6 +25,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
 READABLE_CHANNEL_IDS = [int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip().isdigit()]
 COPY_CHANNEL_ID = int(os.getenv("COPY_CHANNEL_ID", "0"))
+PRE_NOTIFY_CHANNEL_ID = int(os.getenv("PRE_NOTIFY_CHANNEL_ID", "0"))
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
 
@@ -766,26 +767,35 @@ async def schedule_notification(unlock_dt, text, channel):
     if text.startswith("奪取"):
         now = now_jst()
         t_2min = unlock_dt - timedelta(minutes=2)
-        t_15s = unlock_dt - timedelta(seconds=15)
+        t_15s  = unlock_dt - timedelta(seconds=15)
+
+        # 送信先：事前通知専用があればそちら、無ければ従来の通知チャンネル
+        pre_ch = client.get_channel(PRE_NOTIFY_CHANNEL_ID) or channel
 
         async def notify_2min():
             if t_2min > now and (text, "2min") not in sent_notifications and not is_within_5_minutes_of_another(unlock_dt):
                 sent_notifications.add((text, "2min"))
                 await asyncio.sleep((t_2min - now_jst()).total_seconds())
-                msg = await channel.send(f"⏰ {text} **2分前です！！**")
-                await asyncio.sleep(120)
-                await msg.delete()
+                try:
+                    msg = await pre_ch.send(f"⏰ {text} **2分前です！！**")
+                    await asyncio.sleep(120)
+                    await msg.delete()
+                except Exception:
+                    pass
 
         async def notify_15s():
             if t_15s > now and (text, "15s") not in sent_notifications:
                 sent_notifications.add((text, "15s"))
                 await asyncio.sleep((t_15s - now_jst()).total_seconds())
-                msg = await channel.send(f"⏰ {text} **15秒前です！！**")
-                await asyncio.sleep(120)
-                await msg.delete()
+                try:
+                    msg = await pre_ch.send(f"⏰ {text} **15秒前です！！**")
+                    await asyncio.sleep(120)
+                    await msg.delete()
+                except Exception:
+                    pass
 
         sent_notifications_tasks[(text, "2min")] = asyncio.create_task(notify_2min())
-        sent_notifications_tasks[(text, "15s")] = asyncio.create_task(notify_15s())
+        sent_notifications_tasks[(text, "15s")]  = asyncio.create_task(notify_15s())
 
 async def process_copy_queue():
     while True:
