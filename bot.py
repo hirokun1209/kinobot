@@ -762,7 +762,7 @@ async def process_copy_queue():
             batch = sorted(pending_copy_queue, key=lambda x: x[0])  # [(dt, txt), ...]
             pending_copy_queue.clear()
             await upsert_copy_channel_sorted(batch)
-            
+        await asyncio.sleep(2)   # ポーリング間隔を短く
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
