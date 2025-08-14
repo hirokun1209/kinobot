@@ -183,36 +183,36 @@ async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
 
     # 1) いまチャンネルに出ている「自分の投稿」を古い順に取得
     existing_msgs = []
+async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
+    """
+    コピー用チャンネルを pending_places の内容と完全一致させる。
+    - dt昇順で再配置
+    - 余分なメッセージは削除
+    - 足りない分は新規送信
+    - copy_msg_id を再ひも付け
+    ※ new_entries は互換のため受け取るが、同期は pending_places 全体を基準にする
+    """
+    ch = client.get_channel(COPY_CHANNEL_ID)
+    if not ch:
+        return
+
+    # 1) 既存（自分の投稿のみ）を古い順で回収
+    existing_msgs = []
     async for m in ch.history(limit=200, oldest_first=True):
         if m.author == client.user:
             existing_msgs.append(m)
 
-    # 2) 既存テキストを現在順で並べる
-    existing_texts = [m.content for m in existing_msgs]
+    # 2) 望ましい一覧（pending_places 全体）を dt 昇順で作る
+    desired_pairs = sorted(
+        [(v["dt"], v["txt"]) for v in pending_places.values()],
+        key=lambda x: x[0]
+    )
+    desired_texts = [txt for _, txt in desired_pairs]
 
-    # 3) 既存の (txt -> dt) を pending_places から引く（見つからないものは末尾維持用）
-    def dt_of_text(txt):
-        ent = pending_places.get(txt)  # txt は「奪取 1234-1-20:00:00」の形
-        return ent["dt"] if ent else None
-
-    # 4) new_entries から new だけ抽出（既存と重複してたら無視）
-    existing_set = set(existing_texts)
-    add_list = [(dt, txt) for dt, txt in new_entries if txt not in existing_set]
-
-    # 5) desired（理想の順）を作る
-    #    - “いま画面にある（＝existing_texts）”で dt がわかるものは dt で並べ替えたい
-    #    - dt 不明なもの（もう pending から消えた等）は最後に現順のまま付ける
-    existing_with_dt = [(dt_of_text(txt), txt) for txt in existing_texts]
-    items_with_dt    = [(dt, txt) for (dt, txt) in existing_with_dt if dt is not None]
-    items_without_dt = [txt for (dt, txt) in existing_with_dt if dt is None]
-
-    desired_pairs = items_with_dt + add_list
-    desired_pairs.sort(key=lambda x: x[0])  # dt で昇順
-
-    desired_texts = [txt for _, txt in desired_pairs] + items_without_dt  # dt不明は末尾に現順ママ
-
-    # 6) 上から順に「既存[i] → desired[i]」へ edit
+    # 3) 既存と desired を同じ長さに揃える（編集/追加/削除）
     text_to_msgid = {}
+
+    # 3-1) 編集で合わせる
     for i in range(min(len(existing_msgs), len(desired_texts))):
         cur_msg = existing_msgs[i]
         target  = desired_texts[i].replace("🕒 ", "")
@@ -223,7 +223,7 @@ async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
                 pass
         text_to_msgid[desired_texts[i]] = cur_msg.id
 
-    # 7) desired が多い分は末尾に新規 send
+    # 3-2) 足りないぶんを追加
     if len(desired_texts) > len(existing_msgs):
         for txt in desired_texts[len(existing_msgs):]:
             try:
@@ -232,10 +232,17 @@ async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
             except:
                 pass
 
-    # 8) copy_msg_id を再ひも付け
+    # 3-3) 余っているぶんを削除
+    if len(existing_msgs) > len(desired_texts):
+        for m in existing_msgs[len(desired_texts):]:
+            try:
+                await m.delete()
+            except:
+                pass
+
+    # 4) copy_msg_id を再ひも付け
     for txt, ent in list(pending_places.items()):
-        if ent.get("txt") == txt and txt in text_to_msgid:
-            pending_places[txt]["copy_msg_id"] = text_to_msgid[txt]
+        ent["copy_msg_id"] = text_to_msgid.get(txt, None)
 
 async def apply_adjust_for_server_place(server: str, place: str, sec_adj: int):
     # server/place に一致する予定を sec_adj 秒ずらす（早い時間だけ残す・同時刻は統合）
@@ -308,27 +315,31 @@ async def apply_adjust_for_server_place(server: str, place: str, sec_adj: int):
     if notify_ch and new_txt.startswith("奪取"):
         await schedule_notification(new_dt, new_txt, notify_ch)
 
-    # 保険：同(server,place)で new_dt 以降は削除（早い時間だけ残す）
+    # --- 修正後: 同(server,place)は new_txt だけ残し、他は全削除 ---
     for txt, ent in list(pending_places.items()):
-        g = parse_txt_fields(txt)
-        if g and g[1] == server and g[2] == place and txt != new_txt:
-            if ent["dt"] >= new_dt:
-                await retime_event_in_summary(txt, new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID))
-                try:
-                    if ent.get("copy_msg_id"):
-                        ch_copy = client.get_channel(COPY_CHANNEL_ID)
-                        if ch_copy:
-                            msg = await ch_copy.fetch_message(ent["copy_msg_id"])
-                            await msg.delete()
-                except:
-                    pass
-                for key in [(txt, "2min"), (txt, "15s")]:
-                    task = sent_notifications_tasks.pop(key, None)
-                    if task:
-                        task.cancel()
-                pending_places.pop(txt, None)
+        g2 = parse_txt_fields(txt)
+        if g2 and g2[1] == server and g2[2] == place and txt != new_txt:
+            # まとめから外す（新行は既に入っている）
+            await retime_event_in_summary(txt, new_dt, new_txt, client.get_channel(NOTIFY_CHANNEL_ID))
 
-    return (old_txt, new_txt)
+            # コピー用メッセージがあれば削除
+            try:
+                if ent.get("copy_msg_id"):
+                    ch_copy = client.get_channel(COPY_CHANNEL_ID)
+                    if ch_copy:
+                        msg = await ch_copy.fetch_message(ent["copy_msg_id"])
+                        await msg.delete()
+            except:
+                pass
+
+            # 旧通知予約キャンセル
+            for key in [(txt, "2min"), (txt, "15s")]:
+                task = sent_notifications_tasks.pop(key, None)
+                if task:
+                    task.cancel()
+
+            # pending から除去
+            pending_places.pop(txt, None)
 
 def crop_top_right(img):
     h, w = img.shape[:2]
