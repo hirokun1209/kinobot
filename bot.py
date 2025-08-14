@@ -876,6 +876,23 @@ async def daily_reset_task():
         active_tasks.clear()
         # ✅ 通知は送らない（silent reset）
 
+# --- 追加: 自分のメッセージだけを一括削除するヘルパー ---
+async def purge_my_messages(channel_id: int, limit: int = 200):
+    if not channel_id:
+        return
+    ch = client.get_channel(channel_id)
+    if not ch:
+        return
+    try:
+        async for m in ch.history(limit=limit):
+            if m.author == client.user:
+                try:
+                    await m.delete()
+                except:
+                    pass
+    except:
+        pass
+
 # =======================
 # 過去予定の定期削除（1分ごと）
 # =======================
@@ -889,7 +906,7 @@ async def periodic_cleanup_task():
 # コマンドベースのリセット
 # =======================
 async def reset_all(message):
-    # 通知/コピーの個別メッセージ削除（登録分）
+    # 予定ごとの個別メッセージ削除（通知/コピー）
     for entry in list(pending_places.values()):
         if entry.get("main_msg_id"):
             ch = client.get_channel(NOTIFY_CHANNEL_ID)
@@ -906,8 +923,16 @@ async def reset_all(message):
             except:
                 pass
 
-    # まとめメッセージ削除
+    # まとめメッセージと「5分前メッセージ」を確実に削除
     for block in list(summary_blocks):
+        # ← これが重要（5分前通知の消し忘れ対策）
+        if block.get("msg_5min"):
+            try:
+                await block["msg_5min"].delete()
+            except:
+                pass
+            block["msg_5min"] = None
+
         if block.get("msg"):
             try:
                 await block["msg"].delete()
@@ -915,7 +940,7 @@ async def reset_all(message):
                 pass
     summary_blocks.clear()
 
-    # 手動通知(!s)まとめ削除
+    # 手動まとめ(!s)の削除
     if manual_summary_msg_ids:
         ch2 = client.get_channel(NOTIFY_CHANNEL_ID)
         if ch2:
@@ -927,29 +952,22 @@ async def reset_all(message):
                     pass
         manual_summary_msg_ids.clear()
 
-    # 予約タスクのキャンセル＆一覧クリア
+    # 通知予約タスク（2分前/15秒前）のキャンセル＆一覧クリア
     for key, task in list(sent_notifications_tasks.items()):
         task.cancel()
     sent_notifications_tasks.clear()
     sent_notifications.clear()
 
-    # 保険：コピー用チャンネルの直近bot投稿を軽くパージ（取りこぼし対策）
-    try:
-        ch_copy = client.get_channel(COPY_CHANNEL_ID)
-        if ch_copy:
-            async for m in ch_copy.history(limit=100):
-                if m.author == client.user:
-                    try:
-                        await m.delete()
-                    except:
-                        pass
-    except:
-        pass
+    # コピー用チャンネルを軽く掃除（保険）
+    await purge_my_messages(COPY_CHANNEL_ID, limit=100)
+
+    # ✅ 事前通知チャンネル（2分前/15秒前など）を掃除 ← これが重要
+    await purge_my_messages(PRE_NOTIFY_CHANNEL_ID, limit=200)
 
     # 状態クリア
     pending_places.clear()
 
-    # 他タスクキャンセル
+    # 他タスクも停止
     for t in list(active_tasks):
         t.cancel()
     active_tasks.clear()
