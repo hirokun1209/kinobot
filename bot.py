@@ -849,6 +849,7 @@ async def daily_reset_task():
                 except:
                     pass
                 block["msg_5min"] = None
+        await purge_my_messages(PRE_NOTIFY_CHANNEL_ID, limit=200)
 
         # 通知予約(2分前/15秒前)タスクのキャンセル
         for key, task in list(sent_notifications_tasks.items()):
