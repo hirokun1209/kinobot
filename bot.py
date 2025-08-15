@@ -81,7 +81,8 @@ sent_notifications = set()
 sent_notifications_tasks = {}
 SKIP_NOTIFY_START = 2
 SKIP_NOTIFY_END = 14
-
+# 1時間（3600秒）後に削除
+GLIST_TTL = int(os.getenv("GLIST_TTL", "3600"))  # 既定 1時間
 
 def store_copy_msg_id(txt, msg_id):
     if txt in pending_places:
@@ -232,6 +233,13 @@ async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     # 4) copy_msg_id を再ひも付け
     for txt, ent in list(pending_places.items()):
         ent["copy_msg_id"] = text_to_msgid.get(txt, None)
+
+async def auto_delete_after(msg, seconds: int):
+    try:
+        await asyncio.sleep(seconds)
+        await msg.delete()
+    except:
+        pass
 
 async def apply_adjust_for_server_place(server: str, place: str, sec_adj: int):
     # server/place に一致する予定を sec_adj 秒ずらす（早い時間だけ残す・同時刻は統合）
@@ -1453,14 +1461,18 @@ async def on_message(message):
     # ==== !glist 現在のグループ一覧表示 ====
     if message.content.strip() == "!glist":
         if not last_groups:
-            await message.channel.send("⚠️ 現在グループはありません。まず画像を送って解析してください。")
+            sent = await message.channel.send("⚠️ 現在グループはありません。まず画像を送って解析してください。")
+            asyncio.create_task(auto_delete_after(sent, GLIST_TTL))
             return
+
         lines = ["📸 現在の画像グループ:"]
         for gid, events in last_groups.items():
             lines.append(f"　G{gid}:")
             for e in events:
                 lines.append(f"　　・{e['server']}-{e['place']}-{e['dt'].strftime('%H:%M:%S')}")
-        await message.channel.send("\n".join(lines))
+
+        sent = await message.channel.send("\n".join(lines))
+        asyncio.create_task(auto_delete_after(sent, GLIST_TTL))
         return
         
     # ==== !a 奪取 1234-1-12:00:00 130000 or 13:00:00 ====
