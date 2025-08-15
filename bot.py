@@ -168,18 +168,7 @@ def parse_txt_fields(txt: str):
     m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
     return m.groups() if m else None
 
-async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
-    """
-    コピー用CHを「編集で」並べ替え＋挿入。
-    - 既存のbot投稿をチャンネルの現在順（古い→新しい）で取得
-    - desired(理想の順)を dt でソートして作る
-    - 既存[i] を desired[i] に edit で置き換え
-    - 足りない分は末尾に send
-    - pending_places の copy_msg_id を再ひも付け
-    """
-    ch = client.get_channel(COPY_CHANNEL_ID)
-    if not ch:
-        return
+
 
     # 1) いまチャンネルに出ている「自分の投稿」を古い順に取得
     existing_msgs = []
@@ -886,6 +875,9 @@ async def daily_reset_task():
         for task in list(active_tasks):
             task.cancel()
         active_tasks.clear()
+        global last_groups, last_groups_seq
+        last_groups.clear()
+        last_groups_seq = 0
         # ✅ 通知は送らない（silent reset）
 
 # --- 追加: 自分のメッセージだけを一括削除するヘルパー ---
@@ -983,6 +975,9 @@ async def reset_all(message):
     for t in list(active_tasks):
         t.cancel()
     active_tasks.clear()
+    global last_groups, last_groups_seq
+    last_groups.clear()
+    last_groups_seq = 0
 
     await message.channel.send("✅ 全ての予定と通知をリセットしました")
 # =======================
@@ -1283,17 +1278,33 @@ async def on_message(message):
                 if res: updated_pairs.append(res)
                 else: skipped += 1
 
+        # ここからレポート部分を置き換え
         await refresh_manual_summaries()
         batch = [(pending_places[n]["dt"], n) for _, n in updated_pairs if n in pending_places]
         if batch:
             await upsert_copy_channel_sorted(batch)
-        if updated_pairs:
-            msg = ["✅ 反映しました:"]
+
+        updated_cnt = len(updated_pairs)
+        skipped_cnt = skipped
+
+        if updated_cnt > 0:
+            msg = ["✅ !g の結果"]
+            msg.append(f"　更新: {updated_cnt} 件")
+            if skipped_cnt > 0:
+                msg.append(f"　対象外/見つからず: {skipped_cnt} 件")
+            # 変更一覧
+            msg.append("")
+            msg.append("🔧 変更一覧:")
             msg += [f"　{o} → {n}" for o, n in updated_pairs]
-            if skipped: msg.append(f"ℹ️ 一部スキップ: {skipped}件")
             await message.channel.send("\n".join(msg))
+
+        elif skipped_cnt > 0:
+            # 更新 0 件でも、対象が見つからなかった/既に消えていた等は明示する
+            await message.channel.send(f"（変更なし）対象が見つからなかった/既に削除済み: {skipped_cnt} 件")
+
         else:
-            await message.channel.send("（変更なし）")
+            # 本当に何もヒットしなかった（gID が不正、last_groups が空など）
+            await message.channel.send("（変更なし）該当グループが空か、pending に一致がありませんでした")
         return
         
     # ==== !s ====
