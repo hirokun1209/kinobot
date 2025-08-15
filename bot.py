@@ -1439,7 +1439,19 @@ async def on_message(message):
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
         )
         return
-
+    # ==== !glist 現在のグループ一覧表示 ====
+    if message.content.strip() == "!glist":
+        if not last_groups:
+            await message.channel.send("⚠️ 現在グループはありません。まず画像を送って解析してください。")
+            return
+        lines = ["📸 現在の画像グループ:"]
+        for gid, events in last_groups.items():
+            lines.append(f"　G{gid}:")
+            for e in events:
+                lines.append(f"　　・{e['server']}-{e['place']}-{e['dt'].strftime('%H:%M:%S')}")
+        await message.channel.send("\n".join(lines))
+        return
+        
     # ==== !a 奪取 1234-1-12:00:00 130000 or 13:00:00 ====
     match = re.fullmatch(
         r"!a\s+(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})\s+(\d{6}|\d{1,2}:\d{2}:\d{2})",
