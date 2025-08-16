@@ -11,7 +11,41 @@ from datetime import datetime, timedelta, timezone, time
 from PIL import Image
 from fastapi import FastAPI
 import uvicorn
-from threading import Thread
+# === ここを bot.py 冒頭の import 群のあとに追記 ===
+import json
+from google.cloud import vision
+from google.oauth2 import service_account
+
+# Google Vision クライアント（環境変数に埋めたJSONから作成）
+GV_CLIENT = None
+_creds_json = os.getenv("GOOGLE_CLOUD_VISION_JSON")
+if _creds_json:
+    try:
+        _creds = service_account.Credentials.from_service_account_info(json.loads(_creds_json))
+        GV_CLIENT = vision.ImageAnnotatorClient(credentials=_creds)
+        print("✅ Google Vision client ready")
+    except Exception as e:
+        print(f"⚠️ Vision init failed: {e}")
+
+def google_ocr_from_np(np_bgr) -> list[str]:
+    """
+    OpenCV(BGR)画像を PNG にして Vision API へ。
+    返り値は行ごと（Paddle の戻りに近づける）。
+    """
+    if GV_CLIENT is None:
+        return []
+    ok, buf = cv2.imencode(".png", np_bgr)
+    if not ok:
+        return []
+    image = vision.Image(content=buf.tobytes())
+    resp = GV_CLIENT.text_detection(image=image)
+    if getattr(resp, "error", None) and resp.error.message:
+        print("Vision error:", resp.error.message)
+        return []
+    if not resp.text_annotations:
+        return []
+    full = resp.text_annotations[0].description
+    return [line for line in full.splitlines() if line.strip()]
 
 # =======================
 # タイムゾーン設定
@@ -403,8 +437,6 @@ def preprocess_for_colon(img_bgr: np.ndarray) -> list[np.ndarray]:
 
     return outs
 
-
-import re
 def normalize_time_separators(s: str) -> str:
     """
     : を ; . ・ / などから復元。全角→半角、不要空白除去、1の誤読補正など。
@@ -426,11 +458,14 @@ def force_hhmmss_if_six_digits(s: str) -> str:
         return f"{h}:{m}:{sec}"
     return s
 
+# === ここからコピペ（既存の center_ocr 関連の上に置いてOK）===
 
-def ocr_center_with_colon(center_bgr: np.ndarray) -> list[str]:
-    """
-    中央領域を『コロン強調前処理』の複数候補でOCR → 正規化 → ユニーク化。
-    """
+# 正規表現（そのまま流用）
+TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
+IMSEN_RE = re.compile(r"免戦中")
+
+def ocr_center_paddle(center_bgr: np.ndarray) -> list[str]:
+    """中央領域をPaddleOCRだけで読む（前処理つき）"""
     candidates = preprocess_for_colon(center_bgr)
     results = []
     for cand in candidates:
@@ -439,21 +474,67 @@ def ocr_center_with_colon(center_bgr: np.ndarray) -> list[str]:
             if not r or not r[0]:
                 continue
             for line in r[0]:
-                text = line[1][0]
-                text = normalize_time_separators(text)
-                text = force_hhmmss_if_six_digits(text)
-                results.append(text)
+                t = line[1][0]
+                t = normalize_time_separators(t)
+                t = force_hhmmss_if_six_digits(t)
+                results.append(t)
         except Exception:
             pass
 
-    # 出現順を保ったユニーク
-    seen = set()
-    out = []
+    # ユニーク化（出現順保持）
+    seen, uniq = set(), []
     for t in results:
         if t not in seen:
             seen.add(t)
-            out.append(t)
-    return out
+            uniq.append(t)
+    return uniq
+
+
+def ocr_center_google(center_bgr: np.ndarray) -> list[str]:
+    """中央領域をGoogle Visionで読む（GV_CLIENTが無ければ空を返す）"""
+    if GV_CLIENT is None:
+        return []
+    try:
+        gv_lines = google_ocr_from_np(center_bgr)  # あなたの既存ヘルパー
+    except Exception as e:
+        print(f"[OCR] Vision error: {e}")
+        return []
+    # 軽く整形＋ユニーク化
+    fixed, seen = [], set()
+    for t in gv_lines:
+        t2 = normalize_time_separators(t)
+        t2 = force_hhmmss_if_six_digits(t2)
+        if t2 and t2 not in seen:
+            seen.add(t2)
+            fixed.append(t2)
+    return fixed
+
+
+def ocr_center_with_fallback(center_bgr: np.ndarray) -> list[str]:
+    """
+    1) まずPaddle
+    2) 弱ければGoogle Visionに自動フォールバック
+    """
+    paddle = ocr_center_paddle(center_bgr)
+    if not center_ocr_is_poor(paddle):
+        return paddle
+
+    print("[OCR] fallback → Google Vision")
+    google = ocr_center_google(center_bgr)
+    # Visionが空ならPaddleの結果を返しておく
+    return google or paddle
+
+def center_ocr_is_poor(lines: list[str]) -> bool:
+    """
+    中央OCRの品質判定：
+    - HH:MM:SS が1つも無い かつ 「免戦中」の出現が薄い ときは弱いとみなす
+    """
+    if any(TIME_RE.search(t) for t in lines):
+        return False
+    if sum(1 for t in lines if IMSEN_RE.search(t)) >= 1:
+        # 免戦文字は見えてるならとりあえずOK
+        return False
+    return True
 
 def extract_server_number(center_texts):
     for t in center_texts:
@@ -1453,7 +1534,7 @@ async def on_message(message):
 
         # OCRテキスト抽出
         top_txts = extract_text_from_image(top)
-        center_txts = ocr_center_with_colon(center)
+        center_txts = ocr_center_with_fallback(center)
         
         # 補正関数
         def extract_and_correct_base_time(txts):
@@ -1703,7 +1784,7 @@ async def on_message(message):
             top = crop_top_right(np_img)
             center = crop_center_area(np_img)
             top_txts = extract_text_from_image(top)
-            center_txts = ocr_center_with_colon(center)
+            center_txts = ocr_center_with_fallback(center)
             base_time = extract_and_correct_base_time(top_txts)
             parsed = parse_multiple_places(center_txts, top_txts)
 
@@ -1767,8 +1848,6 @@ async def on_message(message):
 # =======================
 # 起動
 # =======================
-import asyncio
-
 async def start_discord_bot():
     await client.start(TOKEN)
 
