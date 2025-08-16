@@ -31,6 +31,9 @@ RUN pip install --no-cache-dir discord.py
 # ✅ FastAPI + Uvicorn（ping用 HTTPサーバー）
 RUN pip install --no-cache-dir fastapi uvicorn
 
+# ✅ Google Vision 依存を追加 ← ここを追加
+RUN pip install --no-cache-dir google-cloud-vision google-auth
+
 # ---- numpy を最後に固定（ABI mismatch防止）----
 RUN pip uninstall -y numpy || true && \
     pip install --no-cache-dir numpy==1.23.5
