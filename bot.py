@@ -371,6 +371,90 @@ def extract_text_from_image(img):
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
 
+# ---- 中央OCR強化ユーティリティ ----
+def preprocess_for_colon(img_bgr: np.ndarray) -> list[np.ndarray]:
+    """
+    コロン(:)の2点が消えないように複数前処理を作成して返す（BGRのまま）。
+    """
+    outs = []
+
+    # 0) 原画像
+    outs.append(img_bgr)
+
+    # 1) 2倍拡大 + 軽いシャープ
+    up = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    blur = cv2.GaussianBlur(up, (0, 0), 1.0)
+    sharp = cv2.addWeighted(up, 1.5, blur, -0.5, 0)
+    outs.append(sharp)
+
+    # 2) CLAHE + 自適応二値化（白黒両方）
+    g = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+    th = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 5)
+    outs.append(cv2.cvtColor(th, cv2.COLOR_GRAY2BGR))
+    outs.append(cv2.cvtColor(255 - th, cv2.COLOR_GRAY2BGR))  # 反転版
+
+    # 3) 小粒点(:)が消えないようにclosing→opening
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+    outs.append(cv2.cvtColor(opened, cv2.COLOR_GRAY2BGR))
+
+    return outs
+
+
+import re
+def normalize_time_separators(s: str) -> str:
+    """
+    : を ; . ・ / などから復元。全角→半角、不要空白除去、1の誤読補正など。
+    """
+    s = s.replace("：", ":").replace("；", ";").replace("．", ".").replace("・", "・")
+    s = s.replace("’", ":").replace("‘", ":").replace("ː", ":")
+    s = s.replace("I", "1").replace("|", "1").replace("l", "1")
+    s = s.replace(";", ":").replace("･", ":").replace("・", ":").replace(".", ":").replace("/", ":")
+    s = re.sub(r"\s+", "", s)
+    return s
+
+def force_hhmmss_if_six_digits(s: str) -> str:
+    """
+    6桁数字だけ拾えたケースを HH:MM:SS に再構成。
+    """
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 6:
+        h, m, sec = digits[:2], digits[2:4], digits[4:]
+        return f"{h}:{m}:{sec}"
+    return s
+
+
+def ocr_center_with_colon(center_bgr: np.ndarray) -> list[str]:
+    """
+    中央領域を『コロン強調前処理』の複数候補でOCR → 正規化 → ユニーク化。
+    """
+    candidates = preprocess_for_colon(center_bgr)
+    results = []
+    for cand in candidates:
+        try:
+            r = ocr.ocr(cand, cls=True)
+            if not r or not r[0]:
+                continue
+            for line in r[0]:
+                text = line[1][0]
+                text = normalize_time_separators(text)
+                text = force_hhmmss_if_six_digits(text)
+                results.append(text)
+        except Exception:
+            pass
+
+    # 出現順を保ったユニーク
+    seen = set()
+    out = []
+    for t in results:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
 def extract_server_number(center_texts):
     for t in center_texts:
         m = re.search(r"[sS](\d{3,4})", t)
@@ -1369,8 +1453,8 @@ async def on_message(message):
 
         # OCRテキスト抽出
         top_txts = extract_text_from_image(top)
-        center_txts = extract_text_from_image(center)
-
+        center_txts = ocr_center_with_colon(center)
+        
         # 補正関数
         def extract_and_correct_base_time(txts):
             if not txts:
@@ -1619,8 +1703,7 @@ async def on_message(message):
             top = crop_top_right(np_img)
             center = crop_center_area(np_img)
             top_txts = extract_text_from_image(top)
-            center_txts = extract_text_from_image(center)
-
+            center_txts = ocr_center_with_colon(center)
             base_time = extract_and_correct_base_time(top_txts)
             parsed = parse_multiple_places(center_txts, top_txts)
 
