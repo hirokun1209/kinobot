@@ -203,6 +203,22 @@ def parse_txt_fields(txt: str):
     m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
     return m.groups() if m else None
 
+async def ping_google_vision() -> tuple[bool, str]:
+    """
+    Visionクライアントの有無と、実際に tiny 画像で text_detection を叩いてみた結果を返す。
+    戻り値: (成功したか, メッセージ)
+    """
+    if GV_CLIENT is None:
+        return False, "GV_CLIENT=None（環境変数 GOOGLE_CLOUD_VISION_JSON 未設定/壊れている可能性）"
+
+    # 1x1の黒画像で疎通テスト（文字は検出されなくてOK。例外が出ないかを見る）
+    tiny = np.zeros((1, 1, 3), dtype=np.uint8)
+    try:
+        lines = google_ocr_from_np(tiny)  # 例外がなければOK
+        # 成功。ただし返るテキストは通常空なので、その旨の文言にする
+        return True, f"API呼び出し成功（text_annotations={len(lines)}行・通常は0で正常）"
+    except Exception as e:
+        return False, f"API呼び出しで例外: {e!r}"
 
 async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     """
@@ -1305,6 +1321,15 @@ async def on_message(message):
             await message.channel.send("\n".join(lines))
         else:
             await message.channel.send("⚠️ 登録された予定はありません")
+        return
+
+    # ==== !gv ====
+    if message.content.strip() == "!gv":
+        ok, info = await ping_google_vision()
+        status = "✅ OK" if ok else "❌ NG"
+        # 初期化ログの補助情報
+        init_hint = "（起動時に『✅ Google Vision client ready』が表示されていれば初期化は成功）"
+        await message.channel.send(f"{status} Google Vision ステータス: {info}\n{init_hint}")
         return
 
     # ==== !1 駐騎場ナンバーで一括 -1 秒 ====
