@@ -421,6 +421,28 @@ def extract_text_from_image(img):
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
 
+def extract_text_from_image_google(np_bgr: np.ndarray) -> list[str]:
+    """
+    画像(np.ndarray BGR)を Google Vision だけでOCRして行ごとに返す。
+    """
+    if GV_CLIENT is None:
+        return []
+    try:
+        lines = google_ocr_from_np(np_bgr)
+        # 軽く整形
+        out = []
+        seen = set()
+        for t in lines:
+            t2 = normalize_time_separators(t)
+            t2 = force_hhmmss_if_six_digits(t2)
+            if t2 and t2 not in seen:
+                seen.add(t2)
+                out.append(t2)
+        return out
+    except Exception as e:
+        print(f"[GV-OCR] error: {e}")
+        return []
+
 # ---- 中央OCR強化ユーティリティ ----
 def preprocess_for_colon(img_bgr: np.ndarray) -> list[np.ndarray]:
     """
@@ -1617,6 +1639,50 @@ async def on_message(message):
             f"🧩 **中央OCR結果（補正前）**:\n```\n{center_txts_str}\n```\n"
             f"📋 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```\n"
             f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
+        )
+        return
+        
+    # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
+    if message.content.strip() == "!gvocr":
+        if GV_CLIENT is None:
+            await message.channel.send("⚠️ Google Vision が未初期化です（環境変数 GOOGLE_CLOUD_VISION_JSON を確認）")
+            return
+
+        if not message.attachments:
+            await message.channel.send("⚠️ 画像を添付してください（GVのみでOCRします）")
+            return
+
+        a = message.attachments[0]
+        b = await a.read()
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+        # トリミング
+        top = crop_top_right(np_img)
+        center = crop_center_area(np_img)
+
+        # ★ GV のみでOCR
+        top_txts = extract_text_from_image_google(top)
+        center_txts = ocr_center_google(center)  # ここもGV専用（Paddle不使用）
+
+        # 予定抽出（既存のパーサをそのまま利用）
+        parsed_preview = parse_multiple_places(center_txts, top_txts)
+        preview_lines = [f"・{txt}" for _, txt, _ in parsed_preview] if parsed_preview else ["(なし)"]
+        preview_text = "\n".join(preview_lines)
+
+        # 免戦時間（参考表示）
+        durations = extract_imsen_durations(center_txts)
+        duration_text = "\n".join(durations) if durations else "(抽出なし)"
+
+        # 出力
+        top_txts_str = "\n".join(top_txts) if top_txts else "(検出なし)"
+        center_txts_str = "\n".join(center_txts) if center_txts else "(検出なし)"
+
+        await message.channel.send(
+            f"📸 **[GV] 上部OCR（基準時刻）**:\n```\n{top_txts_str}\n```\n"
+            f"🧩 **[GV] 中央OCR（補正前）**:\n```\n{center_txts_str}\n```\n"
+            f"📋 **[GV] 補正後の予定一覧**:\n```\n{preview_text}\n```\n"
+            f"⏳ **[GV] 免戦時間候補**:\n```\n{duration_text}\n```"
         )
         return
         
