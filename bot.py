@@ -15,7 +15,8 @@ import uvicorn
 import json
 from google.cloud import vision
 from google.oauth2 import service_account
-
+from pathlib import Path
+import base64
 # ---- Shield/Sword 黒塗りヘルパー（貼り付け）----
 import io
 import numpy as np
@@ -824,6 +825,98 @@ def correct_imsen_text(text: str) -> str:
             pass
 
     return text
+
+# ==== 盾テンプレ生成・検出・黒塗り ====
+
+TEMPLATE_PATH = Path("shield_template.png")
+
+def _autobuild_shield_template(bgr: np.ndarray) -> np.ndarray | None:
+    """
+    画像から青盾らしき領域を1つ切り出してテンプレート化。
+    失敗時は None。
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # 青（やや広め）：端末差に備えて範囲広め
+    mask = cv2.inRange(hsv, (90, 60, 60), (130, 255, 255))
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    H,W = bgr.shape[:2]
+    # 盾は中央～下部のリスト行に出やすい＆サイズは中くらい
+    cand = []
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        area = w*h
+        if H*0.15 < y < H*0.85 and 18 < w < 120 and 18 < h < 120 and 300 < area < 15000:
+            # 楕円度で絞る（円に近いほど良い）
+            peri = cv2.arcLength(c, True)
+            if peri == 0: 
+                continue
+            circularity = 4*np.pi*cv2.contourArea(c)/(peri*peri)
+            cand.append((circularity, (x,y,w,h)))
+    if not cand:
+        return None
+
+    # 円っぽい順に
+    cand.sort(key=lambda t: t[0], reverse=True)
+    x,y,w,h = cand[0][1]
+    # 周囲に少しマージン
+    pad = 4
+    x1 = max(0, x-pad); y1 = max(0, y-pad)
+    x2 = min(W, x+w+pad); y2 = min(H, y+h+pad)
+    tpl = bgr[y1:y2, x1:x2].copy()
+    try:
+        cv2.imwrite(str(TEMPLATE_PATH), tpl)
+    except Exception:
+        pass
+    return tpl
+
+def _load_or_make_template(bgr_for_fallback: np.ndarray) -> np.ndarray | None:
+    if TEMPLATE_PATH.exists():
+        tpl = cv2.imread(str(TEMPLATE_PATH))
+        if tpl is not None:
+            return tpl
+    # 無ければ作る
+    return _autobuild_shield_template(bgr_for_fallback)
+
+def _nms_points(points: list[tuple[int,int]], min_dist: int) -> list[tuple[int,int]]:
+    """近接する検出点をまとめる簡易NMS（最小距離で間引く）"""
+    kept = []
+    for (x,y) in sorted(points, key=lambda p:(p[1], p[0])):
+        if all((abs(x-x0) > min_dist or abs(y-y0) > min_dist) for (x0,y0) in kept):
+            kept.append((x,y))
+    return kept
+
+def find_shields_by_template(bgr: np.ndarray, tpl: np.ndarray, thr: float = 0.78) -> list[tuple[int,int,int,int]]:
+    """
+    テンプレマッチで盾位置を返す [(x,y,w,h), ...]
+    解像度は固定前提（リサイズなし）。
+    """
+    th, tw = tpl.shape[:2]
+    # TM_CCOEFF_NORMED が安定しやすい
+    res = cv2.matchTemplate(bgr, tpl, cv2.TM_CCOEFF_NORMED)
+    ys, xs = np.where(res >= thr)
+    pts = list(zip(xs, ys))
+    if not pts:
+        return []
+    # 近い重複を削る
+    pts = _nms_points(pts, min_dist=max(8, min(th, tw)//2))
+    return [(x, y, tw, th) for (x, y) in pts]
+
+def mask_row_right(bgr: np.ndarray, boxes: list[tuple[int,int,int,int]], pad_y: int = 6) -> np.ndarray:
+    """
+    各盾ボックスの行を、画面右端まで黒塗り（縦は盾±pad_y）。
+    """
+    H, W = bgr.shape[:2]
+    out = bgr.copy()
+    for (x,y,w,h) in boxes:
+        y1 = max(0, y - pad_y)
+        y2 = min(H, y + h + pad_y)
+        cv2.rectangle(out, (x, y1), (W-1, y2), (0,0,0), -1)
+    return out
 
 # =======================
 # ブロック・通知処理
@@ -1688,79 +1781,47 @@ async def on_message(message):
         await message.channel.send(msg)
         return
 
-# ===== on_message 内の !maskicons ブロックを丸ごと置き換え =====
-    if message.content.strip().startswith("!maskicons"):
+    # ==== !maskshield [thr=0.78] [pad=6] ====
+    if message.content.strip().startswith("!maskshield"):
         parts = message.content.strip().split()
-        mask_percent = 18  # 画面幅の 18% を黒塗り（必要なら引数で変更）
-        if len(parts) >= 2 and parts[1].isdigit():
-            mask_percent = max(5, min(50, int(parts[1])))
+        thr = 0.78
+        pad = 6
+        if len(parts) >= 2:
+            try: thr = float(parts[1])
+            except: pass
+        if len(parts) >= 3 and parts[2].isdigit():
+            pad = int(parts[2])
 
         if not message.attachments:
-            await message.channel.send("🖼 画像を添付して `!maskicons` を実行してね（例: `!maskicons 18`）")
+            await message.channel.send("🖼 画像を添付して `!maskshield [閾値=0.78] [pad=6]` を実行してね")
             return
 
-        # Bytes -> BGR 変換（ヘルパー）
-        def _bytes_to_bgr(data: bytes) -> np.ndarray:
-            arr = np.frombuffer(data, np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError("cv2.imdecode が失敗しました（壊れた画像か非対応形式の可能性）")
-            return img
-
-        async def _encode_under_limit_no_resize(bgr, max_bytes=7_900_000):
-            """
-            リサイズはせず、JPEG品質のみ段階的に下げて 8MB 未満を目指す。
-            どうしても下回らない場合は最後に得られた buf を返す（上位側でサイズチェックしてエラー表示）。
-            """
-            last_buf = None
-            for q in (92, 85, 80, 72, 65, 60, 50, 40, 30):
-                ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-                if not ok:
-                    continue
-                last_buf = buf
-                if len(buf) <= max_bytes:
-                    return buf
-            return last_buf  # None の可能性もあり
-
         for att in message.attachments:
-            try:
-                data = await att.read()
-                bgr  = _bytes_to_bgr(data)
+            data = await att.read()
+            img  = Image.open(io.BytesIO(data)).convert("RGB")
+            bgr  = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-                # アイコン検出→右側黒塗り
-                boxes = detect_sword_shield_boxes(bgr)
-                h, w  = bgr.shape[:2]
-                mask_w = int(w * (mask_percent/100.0))
-                out_bgr = redact_right_of_boxes(bgr, boxes, right_width_px=mask_w, pad=6)
+            tpl = _load_or_make_template(bgr)
+            if tpl is None:
+                await message.channel.send("⚠️ 盾テンプレが作れませんでした（青い盾が見つからず）。別の画像で試してください。")
+                continue
 
-                # リサイズ禁止：品質のみ調整
-                buf = await _encode_under_limit_no_resize(out_bgr)
-                if buf is None:
-                    await message.channel.send("❌ エンコードに失敗しました（JPEG 生成不可）")
-                    continue
+            boxes = find_shields_by_template(bgr, tpl, thr=thr)
+            if not boxes:
+                await message.channel.send("⚠️ 盾が検出できませんでした。`!maskshield 0.72` のように閾値を下げて試してね。")
+                continue
 
-                # Discord 8MB 制限チェック（8,000,000byte 目安）
-                if len(buf) > 7_900_000:
-                    kb = len(buf) / 1024
-                    await message.channel.send(
-                        f"❌ ファイルが大きすぎます（{kb:.1f} KB）。リサイズ禁止モードのため送信できません。"
-                    )
-                    continue
+            out_bgr = mask_row_right(bgr, boxes, pad_y=pad)
 
-                bio = io.BytesIO(buf.tobytes()); bio.seek(0)
-                try:
-                    await message.channel.send(
-                        content=f"✅ 黒塗り完了（検出: {len(boxes)} 箇所 / 黒塗り幅: {mask_percent}% / 出力 {len(buf)/1024:.1f} KB）",
-                        file=discord.File(bio, filename=f"masked_{att.filename.rsplit('.',1)[0]}.jpg")
-                    )
-                except discord.Forbidden:
-                    await message.channel.send("❌ 画像を添付する権限（Attach Files）がありません。チャンネル権限を確認してください。")
-                except discord.HTTPException as e:
-                    await message.channel.send(f"❌ 送信失敗: {e}（サイズ {len(buf)/1024:.1f} KB）")
-            except Exception as e:
-                await message.channel.send(f"❌ 処理中にエラー: {type(e).__name__}: {e}")
+            ok, buf = cv2.imencode(".jpg", out_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if not ok:
+                await message.channel.send("⚠️ 画像のエンコードに失敗しました")
+                continue
+            await message.channel.send(
+                content=f"✅ 黒塗り完了: 盾{len(boxes)}個 / thr={thr} / pad={pad}  （右端まで横塗り）",
+                file=discord.File(io.BytesIO(buf.tobytes()), filename=f"masked_{att.filename.rsplit('.',1)[0]}.jpg")
+            )
         return
-
     # ==== !ocrdebug ====
     if message.content.strip() == "!ocrdebug":
         if not message.attachments:
