@@ -16,6 +16,65 @@ import json
 from google.cloud import vision
 from google.oauth2 import service_account
 
+# ---- Shield/Sword 黒塗りヘルパー（貼り付け）----
+import io
+import numpy as np
+import cv2
+from PIL import Image
+
+def _bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+# 色域（必要なら後で微調整）
+HSV_BLUE_RANGES = [((90, 60, 60), (125, 255, 255))]     # 盾（青）
+HSV_RED_RANGES  = [((0, 100, 80), (10, 255, 255)),
+                   ((170, 100, 80), (180, 255, 255))]   # 剣（赤）
+
+def _in_range_mask(hsv, ranges):
+    m = None
+    for lo, hi in ranges:
+        cur = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+        m = cur if m is None else (m | cur)
+    return m if m is not None else np.zeros(hsv.shape[:2], np.uint8)
+
+def detect_sword_shield_boxes(bgr: np.ndarray):
+    """盾/剣らしい色の塊を (x,y,w,h) で返す"""
+    H, W = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    blue = _in_range_mask(hsv, HSV_BLUE_RANGES)
+    red  = _in_range_mask(hsv, HSV_RED_RANGES)
+    mask = blue | red
+
+    # ノイズ除去・小さすぎる塊を排除
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+
+    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    min_wh = max(14, int(min(H, W)*0.03))
+    max_wh = int(min(H, W)*0.12)
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        if min_wh <= w <= max_wh and min_wh <= h <= max_wh:
+            # リスト行の帯っぽい高さだけ拾う（画面上部のUIを避ける）
+            if H*0.18 < y < H*0.9:
+                boxes.append((x,y,w,h))
+    return boxes
+
+def redact_right_of_boxes(bgr: np.ndarray, boxes, pad_y_ratio=0.15, pad_x=6):
+    """検出した箱の ‘x から右端まで’ を行幅で黒塗り"""
+    out = bgr.copy()
+    H, W = out.shape[:2]
+    for x,y,w,h in boxes:
+        pad_y = int(h*pad_y_ratio)
+        y0 = max(0, y - pad_y)
+        y1 = min(H, y + h + pad_y)
+        x0 = max(0, x - pad_x)
+        cv2.rectangle(out, (x0, y0), (W, y1), (0,0,0), -1)
+    return out
+
 # Google Vision クライアント（環境変数に埋めたJSONから作成）
 GV_CLIENT = None
 _creds_json = os.getenv("GOOGLE_CLOUD_VISION_JSON")
@@ -1629,10 +1688,11 @@ async def on_message(message):
         await message.channel.send(msg)
         return
 
-    # ==== !maskicons [mask_percent] ====
+    # ==== !maskicons [横幅%] ====
     if message.content.strip().startswith("!maskicons"):
         parts = message.content.strip().split()
-        mask_percent = 18  # 画面幅の 18% を黒塗り（数字は好みで）
+        # 右側に塗る「横幅%」は任意（デフォ 18%）
+        mask_percent = 18
         if len(parts) >= 2 and parts[1].isdigit():
             mask_percent = max(5, min(50, int(parts[1])))
 
@@ -1640,27 +1700,22 @@ async def on_message(message):
             await message.channel.send("🖼 画像を添付して `!maskicons` を実行してね（例: `!maskicons 18`）")
             return
 
-        # 1枚ずつ処理（複数可）
         for att in message.attachments:
             data = await att.read()
-            img  = Image.open(io.BytesIO(data)).convert("RGB")
-            bgr  = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            bgr  = _bytes_to_bgr(data)
 
             boxes = detect_sword_shield_boxes(bgr)
             h, w  = bgr.shape[:2]
-            mask_w = int(w * (mask_percent/100.0))
+            # 検出 x から ‘画面右端まで’ を塗るので、横幅%は「最低確保幅」として使いたい場合だけ利用
+            out = redact_right_of_boxes(bgr, boxes, pad_y_ratio=0.15, pad_x=6)
 
-            out_bgr = redact_right_of_boxes(bgr, boxes, right_width_px=mask_w, pad=6)
-
-            # 結果送信
-            ok, buf = cv2.imencode(".jpg", out_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
             if not ok:
                 await message.channel.send("⚠️ 画像のエンコードに失敗しました")
                 continue
-            fname = f"masked_{att.filename.rsplit('.',1)[0]}.jpg"
             await message.channel.send(
-                content=f"✅ 黒塗り完了（検出アイコン: {len(boxes)} / 幅: {mask_percent}%）",
-                file=discord.File(io.BytesIO(buf.tobytes()), filename=fname)
+                content=f"✅ 黒塗り完了（検出: {len(boxes)} 箇所）",
+                file=discord.File(io.BytesIO(buf.tobytes()), filename=f"masked_{att.filename}")
             )
         return
 
