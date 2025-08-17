@@ -220,6 +220,71 @@ async def ping_google_vision() -> tuple[bool, str]:
     except Exception as e:
         return False, f"API呼び出しで例外: {e!r}"
 
+# ===== 剣/盾検出 → 右側黒塗り ヘルパー =====
+import numpy as np, cv2
+
+# HSV 色域（端末差でズレることがあるので必要なら微調整）
+HSV_BLUE_LOW1  = (95,  80, 60)
+HSV_BLUE_HIGH1 = (125,255,255)
+HSV_BLUE_LOW2  = (85,  60, 60)   # 青の下側を少し拾う保険帯
+HSV_BLUE_HIGH2 = (95, 255,255)
+
+HSV_RED_LOW1   = (0,   100, 80)  # 赤は 0°/180° の両側を取る
+HSV_RED_HIGH1  = (10,  255,255)
+HSV_RED_LOW2   = (170, 100, 80)
+HSV_RED_HIGH2  = (180, 255,255)
+
+def detect_sword_shield_boxes(bgr: np.ndarray) -> list[tuple[int,int,int,int]]:
+    """剣(赤系)・盾(青系)の色域で候補矩形を返す (x,y,w,h) のリスト"""
+    h, w = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    blue  = cv2.inRange(hsv, HSV_BLUE_LOW1,  HSV_BLUE_HIGH1) | cv2.inRange(hsv, HSV_BLUE_LOW2, HSV_BLUE_HIGH2)
+    red   = cv2.inRange(hsv, HSV_RED_LOW1,   HSV_RED_HIGH1)  | cv2.inRange(hsv, HSV_RED_LOW2,  HSV_RED_HIGH2)
+    mask  = blue | red
+
+    # ノイズ整形
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+
+    # 中央のリストパネル付近だけに限定（任意：薄いベージュ領域）
+    panel = cv2.inRange(hsv, (0,0,180), (179,60,255))
+    cnts,_ = cv2.findContours(panel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        cand = [(cv2.boundingRect(c), cv2.contourArea(c)) for c in cnts]
+        # 画面内でそこそこ大きい矩形だけ
+        cand = [r for r,a in cand if (r[2]*r[3]) > (w*h)*0.05]
+        if cand:
+            x,y,ww,hh = sorted(cand, key=lambda r:r[1])[-1]
+            crop = np.zeros_like(mask); crop[y:y+hh, x:x+ww] = mask[y:y+hh, x:x+ww]
+            mask = crop
+
+    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes=[]
+    # 画面解像度に応じたサイズ帯（だいたいアイコン30〜70px四方想定）
+    min_wh = max(15, int(min(h,w)*0.03))
+    max_wh = int(min(h,w)*0.12)
+    for c in cnts:
+        x,y,ww,hh = cv2.boundingRect(c)
+        area = ww*hh
+        if min_wh <= ww <= max_wh and min_wh <= hh <= max_wh and 400 < area < 8000:
+            # 画面の中央～下部のリスト行だけ
+            if h*0.18 < y < h*0.9:
+                boxes.append((x,y,ww,hh))
+    return boxes
+
+def redact_right_of_boxes(bgr: np.ndarray, boxes: list[tuple[int,int,int,int]], right_width_px: int, pad: int = 6) -> np.ndarray:
+    """各ボックスの右側を right_width_px ぶん黒塗り"""
+    out = bgr.copy()
+    H, W = out.shape[:2]
+    for x,y,w,h in boxes:
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(W, x + w + right_width_px)
+        y2 = min(H, y + h + pad)
+        cv2.rectangle(out, (x1,y1), (x2,y2), (0,0,0), -1)
+    return out
+
 async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     """
     コピー用チャンネルを pending_places の内容と完全一致させる。
@@ -1562,6 +1627,41 @@ async def on_message(message):
 
         msg = "\n".join(two_min_lines + [""] + fifteen_sec_lines)
         await message.channel.send(msg)
+        return
+
+    # ==== !maskicons [mask_percent] ====
+    if message.content.strip().startswith("!maskicons"):
+        parts = message.content.strip().split()
+        mask_percent = 18  # 画面幅の 18% を黒塗り（数字は好みで）
+        if len(parts) >= 2 and parts[1].isdigit():
+            mask_percent = max(5, min(50, int(parts[1])))
+
+        if not message.attachments:
+            await message.channel.send("🖼 画像を添付して `!maskicons` を実行してね（例: `!maskicons 18`）")
+            return
+
+        # 1枚ずつ処理（複数可）
+        for att in message.attachments:
+            data = await att.read()
+            img  = Image.open(io.BytesIO(data)).convert("RGB")
+            bgr  = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+            boxes = detect_sword_shield_boxes(bgr)
+            h, w  = bgr.shape[:2]
+            mask_w = int(w * (mask_percent/100.0))
+
+            out_bgr = redact_right_of_boxes(bgr, boxes, right_width_px=mask_w, pad=6)
+
+            # 結果送信
+            ok, buf = cv2.imencode(".jpg", out_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            if not ok:
+                await message.channel.send("⚠️ 画像のエンコードに失敗しました")
+                continue
+            fname = f"masked_{att.filename.rsplit('.',1)[0]}.jpg"
+            await message.channel.send(
+                content=f"✅ 黒塗り完了（検出アイコン: {len(boxes)} / 幅: {mask_percent}%）",
+                file=discord.File(io.BytesIO(buf.tobytes()), filename=fname)
+            )
         return
 
     # ==== !ocrdebug ====
