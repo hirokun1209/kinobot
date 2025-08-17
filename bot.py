@@ -1688,11 +1688,10 @@ async def on_message(message):
         await message.channel.send(msg)
         return
 
-    # ==== !maskicons [横幅%] ====
+# ===== on_message 内の !maskicons ブロックを丸ごと置き換え =====
     if message.content.strip().startswith("!maskicons"):
         parts = message.content.strip().split()
-        # 右側に塗る「横幅%」は任意（デフォ 18%）
-        mask_percent = 18
+        mask_percent = 18  # 画面幅の 18% を黒塗り（必要なら引数で変更）
         if len(parts) >= 2 and parts[1].isdigit():
             mask_percent = max(5, min(50, int(parts[1])))
 
@@ -1700,23 +1699,66 @@ async def on_message(message):
             await message.channel.send("🖼 画像を添付して `!maskicons` を実行してね（例: `!maskicons 18`）")
             return
 
+        # Bytes -> BGR 変換（ヘルパー）
+        def _bytes_to_bgr(data: bytes) -> np.ndarray:
+            arr = np.frombuffer(data, np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError("cv2.imdecode が失敗しました（壊れた画像か非対応形式の可能性）")
+            return img
+
+        async def _encode_under_limit_no_resize(bgr, max_bytes=7_900_000):
+            """
+            リサイズはせず、JPEG品質のみ段階的に下げて 8MB 未満を目指す。
+            どうしても下回らない場合は最後に得られた buf を返す（上位側でサイズチェックしてエラー表示）。
+            """
+            last_buf = None
+            for q in (92, 85, 80, 72, 65, 60, 50, 40, 30):
+                ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+                if not ok:
+                    continue
+                last_buf = buf
+                if len(buf) <= max_bytes:
+                    return buf
+            return last_buf  # None の可能性もあり
+
         for att in message.attachments:
-            data = await att.read()
-            bgr  = _bytes_to_bgr(data)
+            try:
+                data = await att.read()
+                bgr  = _bytes_to_bgr(data)
 
-            boxes = detect_sword_shield_boxes(bgr)
-            h, w  = bgr.shape[:2]
-            # 検出 x から ‘画面右端まで’ を塗るので、横幅%は「最低確保幅」として使いたい場合だけ利用
-            out = redact_right_of_boxes(bgr, boxes, pad_y_ratio=0.15, pad_x=6)
+                # アイコン検出→右側黒塗り
+                boxes = detect_sword_shield_boxes(bgr)
+                h, w  = bgr.shape[:2]
+                mask_w = int(w * (mask_percent/100.0))
+                out_bgr = redact_right_of_boxes(bgr, boxes, right_width_px=mask_w, pad=6)
 
-            ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-            if not ok:
-                await message.channel.send("⚠️ 画像のエンコードに失敗しました")
-                continue
-            await message.channel.send(
-                content=f"✅ 黒塗り完了（検出: {len(boxes)} 箇所）",
-                file=discord.File(io.BytesIO(buf.tobytes()), filename=f"masked_{att.filename}")
-            )
+                # リサイズ禁止：品質のみ調整
+                buf = await _encode_under_limit_no_resize(out_bgr)
+                if buf is None:
+                    await message.channel.send("❌ エンコードに失敗しました（JPEG 生成不可）")
+                    continue
+
+                # Discord 8MB 制限チェック（8,000,000byte 目安）
+                if len(buf) > 7_900_000:
+                    kb = len(buf) / 1024
+                    await message.channel.send(
+                        f"❌ ファイルが大きすぎます（{kb:.1f} KB）。リサイズ禁止モードのため送信できません。"
+                    )
+                    continue
+
+                bio = io.BytesIO(buf.tobytes()); bio.seek(0)
+                try:
+                    await message.channel.send(
+                        content=f"✅ 黒塗り完了（検出: {len(boxes)} 箇所 / 黒塗り幅: {mask_percent}% / 出力 {len(buf)/1024:.1f} KB）",
+                        file=discord.File(bio, filename=f"masked_{att.filename.rsplit('.',1)[0]}.jpg")
+                    )
+                except discord.Forbidden:
+                    await message.channel.send("❌ 画像を添付する権限（Attach Files）がありません。チャンネル権限を確認してください。")
+                except discord.HTTPException as e:
+                    await message.channel.send(f"❌ 送信失敗: {e}（サイズ {len(buf)/1024:.1f} KB）")
+            except Exception as e:
+                await message.channel.send(f"❌ 処理中にエラー: {type(e).__name__}: {e}")
         return
 
     # ==== !ocrdebug ====
