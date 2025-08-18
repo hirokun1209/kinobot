@@ -380,7 +380,7 @@ def find_ime_sen_rows_full_img(bgr: np.ndarray) -> list[tuple[int,int,int,int]]:
         # 免戦中ボックスの「すぐ下」を帯にする
         y1 = int(y_max - h_txt * IME_ABOVE_RATIO)
         y2 = int(y_max + h_txt * IME_BELOW_RATIO)
-        x1 = min(W, int(x_max + IME_LEFT_MARGIN))
+        x1 = 0
         x2 = W
 
         # 画面外クリップ
