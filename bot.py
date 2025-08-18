@@ -345,6 +345,62 @@ def redact_right_of_boxes(bgr: np.ndarray, boxes: list[tuple[int,int,int,int]], 
         cv2.rectangle(out, (x1,y1), (x2,y2), (0,0,0), -1)
     return out
 
+# ===== 「免戦中」の直下を右端まで黒塗りするヘルパー =====
+# チューニング用の係数（必要に応じて微調整）
+IME_ABOVE_RATIO = 0.05   # 文字ボックス下端から少し上に戻す割合
+IME_BELOW_RATIO = 1.40   # 文字高さの何倍までを帯に含めるか
+IME_LEFT_MARGIN = 8      # 帯の開始X（免戦中ボックス右端からのマージンpx）
+
+def find_ime_sen_rows_full_img(bgr: np.ndarray) -> list[tuple[int,int,int,int]]:
+    """
+    画像全体に対して PaddleOCR を走らせ、'免戦中' を含むテキストボックスを見つけ、
+    その直下の横帯 (x1,y1,x2,y2) を返す。座標は画像そのもののピクセル座標。
+    """
+    rows = []
+    try:
+        result = ocr.ocr(bgr, cls=True)
+    except Exception:
+        result = None
+
+    if not result or not result[0]:
+        return rows
+
+    H, W = bgr.shape[:2]
+    for item in result[0]:
+        box, (text, conf) = item
+        if "免戦中" not in str(text):
+            continue
+
+        xs = [int(p[0]) for p in box]
+        ys = [int(p[1]) for p in box]
+        x_min, x_max = max(0, min(xs)), min(W, max(xs))
+        y_min, y_max = max(0, min(ys)), min(H, max(ys))
+        h_txt = max(8, y_max - y_min)
+
+        # 免戦中ボックスの「すぐ下」を帯にする
+        y1 = int(y_max - h_txt * IME_ABOVE_RATIO)
+        y2 = int(y_max + h_txt * IME_BELOW_RATIO)
+        x1 = min(W, int(x_max + IME_LEFT_MARGIN))
+        x2 = W
+
+        # 画面外クリップ
+        y1 = max(0, min(H, y1))
+        y2 = max(0, min(H, y2))
+        if y2 - y1 < max(10, int(h_txt*0.6)):   # あまりに薄い帯はスキップ
+            continue
+        if x1 >= x2:
+            continue
+
+        rows.append((x1, y1, x2, y2))
+
+    return rows
+
+def fill_rects_black(bgr: np.ndarray, rects: list[tuple[int,int,int,int]]) -> np.ndarray:
+    out = bgr.copy()
+    for (x1, y1, x2, y2) in rects:
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
+    return out
+
 async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     """
     コピー用チャンネルを pending_places の内容と完全一致させる。
@@ -1779,6 +1835,47 @@ async def on_message(message):
 
         msg = "\n".join(two_min_lines + [""] + fifteen_sec_lines)
         await message.channel.send(msg)
+        return
+
+    # ==== !maskime 免戦中の直下を右端まで黒塗り ====
+    if message.content.strip().startswith("!maskime"):
+        if not message.attachments:
+            await message.channel.send("🖼 画像を添付して `!maskime` を実行してね")
+            return
+
+        # 係数の上書き（オプション）: 例) !maskime 1.6 0.06 12
+        try:
+            parts = message.content.strip().split()
+            if len(parts) >= 2:  # BELOW_RATIO
+                globals()["IME_BELOW_RATIO"] = float(parts[1])
+            if len(parts) >= 3:  # ABOVE_RATIO
+                globals()["IME_ABOVE_RATIO"] = float(parts[2])
+            if len(parts) >= 4:  # LEFT_MARGIN(px)
+                globals()["IME_LEFT_MARGIN"] = int(parts[3])
+        except Exception:
+            pass
+
+        for att in message.attachments:
+            data = await att.read()
+            img  = Image.open(io.BytesIO(data)).convert("RGB")
+            bgr  = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+            rects = find_ime_sen_rows_full_img(bgr)
+            if not rects:
+                await message.channel.send("⚠️ '免戦中' が見つからず、黒塗りは行いませんでした。")
+                continue
+
+            out_bgr = fill_rects_black(bgr, rects)
+            ok, buf = cv2.imencode(".jpg", out_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            if not ok:
+                await message.channel.send("⚠️ 画像のエンコードに失敗しました")
+                continue
+
+            # デバッグ用に帯の本数も表示
+            await message.channel.send(
+                content=f"✅ 黒塗り完了（帯: {len(rects)} 本 / BELOW={IME_BELOW_RATIO} ABOVE={IME_ABOVE_RATIO} MARGIN={IME_LEFT_MARGIN}px）",
+                file=discord.File(io.BytesIO(buf.tobytes()), filename=f"maskime_{att.filename.rsplit('.',1)[0]}.jpg")
+            )
         return
 
     # ==== !maskshield [thr=0.78] [pad=6] ====
