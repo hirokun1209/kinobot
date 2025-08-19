@@ -1907,6 +1907,52 @@ async def on_message(message):
                 file=discord.File(io.BytesIO(buf.tobytes()), filename=f"masked_{att.filename.rsplit('.',1)[0]}.jpg")
             )
         return
+    # ==== !time 画像のEXIF撮影日時 or アップロード時刻を表示 ====
+    if message.content.strip().startswith("!time"):
+        if not message.attachments:
+            await message.channel.send("⚠️ 画像を添付して `!time` を実行してください")
+            return
+
+        lines = []
+        for i, att in enumerate(message.attachments, start=1):
+            try:
+                img_bytes = await att.read()
+            except Exception:
+                lines.append(f"#{i}: 画像を読み込めませんでした（{att.filename}）")
+                continue
+
+            exif_map = _get_exif_datetime_strings(img_bytes)
+
+            # 優先順で採用
+            picked_label, picked_raw = None, None
+            for k in EXIF_DT_KEYS:
+                if k in exif_map:
+                    picked_label, picked_raw = k, exif_map[k]
+                    break
+
+            if picked_raw:
+                parsed = _parse_exif_dt_to_jst(picked_raw)
+                if parsed:
+                    lines.append(
+                        f"#{i} {att.filename}\n"
+                        f"　📸 EXIF {picked_label}: `{parsed}`（raw: {picked_raw}）"
+                    )
+                else:
+                    # 解析できなかった場合は raw だけ見せる
+                    lines.append(
+                        f"#{i} {att.filename}\n"
+                        f"　📸 EXIF {picked_label}: `{picked_raw}`（書式を解釈できませんでした）"
+                    )
+            else:
+                # EXIFが無い/拾えない → Discordアップロード時刻(JST)
+                up_jst = message.created_at.replace(tzinfo=timezone.utc).astimezone(JST)
+                lines.append(
+                    f"#{i} {att.filename}\n"
+                    f"　🕒 EXIFなし → Discordアップロード時刻: `{up_jst.strftime('%Y-%m-%d %H:%M:%S')}`"
+                )
+
+        await message.channel.send("\n".join(lines))
+        return
     # ==== !ocrdebug ====
     if message.content.strip() == "!ocrdebug":
         if not message.attachments:
