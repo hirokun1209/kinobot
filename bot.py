@@ -401,6 +401,16 @@ def fill_rects_black(bgr: np.ndarray, rects: list[tuple[int,int,int,int]]) -> np
         cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
     return out
 
+def auto_mask_ime(bgr: np.ndarray) -> tuple[np.ndarray, int]:
+    """
+    '免戦中' を検出して、その直下の帯を右端まで黒塗り。
+    戻り値: (黒塗り後画像, 見つかった数)
+    """
+    rects = find_ime_sen_rows_full_img(bgr)
+    if not rects:
+        return bgr, 0
+    return fill_rects_black(bgr, rects), len(rects)
+
 async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     """
     コピー用チャンネルを pending_places の内容と完全一致させる。
@@ -1929,6 +1939,8 @@ async def on_message(message):
         b = await a.read()
         img = Image.open(io.BytesIO(b)).convert("RGB")
         np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        # OCR前に「免戦中」直下を黒塗り
+        np_img, _masked_cnt = auto_mask_ime(np_img)
 
         # トリミング
         top = crop_top_right(np_img)
@@ -1993,9 +2005,9 @@ async def on_message(message):
             f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_txts_str}\n```\n"
             f"🧩 **中央OCR結果（補正前）**:\n```\n{center_txts_str}\n```\n"
             f"📋 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```\n"
-            f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```"
+            f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```\n"
+            f"\n🧽 maskime: {_masked_cnt} 本"
         )
-        return
         
     # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
     if message.content.strip() == "!gvocr":
@@ -2010,7 +2022,8 @@ async def on_message(message):
         a = message.attachments[0]
         b = await a.read()
         img = Image.open(io.BytesIO(b)).convert("RGB")
-        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        # OCR前に「免戦中」直下を黒塗り（GV専用デバッグでも適用したい場合）
+        np_img, _ = auto_mask_ime(np_img)
 
         # トリミング
         top = crop_top_right(np_img)
@@ -2227,6 +2240,8 @@ async def on_message(message):
             b = await a.read()
             img = Image.open(io.BytesIO(b)).convert("RGB")
             np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            # OCR前に「免戦中」直下を黒塗り
+            np_img, _ = auto_mask_ime(np_img)
             top = crop_top_right(np_img)
             center = crop_center_area(np_img)
             top_txts = extract_text_from_image(top)
