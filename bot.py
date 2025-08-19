@@ -60,6 +60,57 @@ def _parse_exif_dt_to_jst(s: str) -> str | None:
         return dt_jst.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
+# --- PNGメタも見る撮影時刻推定ヘルパー ---
+def _parse_str_to_jst(s: str) -> datetime | None:
+    """よくある文字列日時をJST datetimeに（タイムゾーン無しはJSTとみなす）"""
+    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            dt = datetime.strptime(s.strip(), fmt)
+            return dt.astimezone(JST) if dt.tzinfo else dt.replace(tzinfo=JST)
+        except Exception:
+            pass
+    return None
+
+def get_taken_time_from_image_bytes(img_bytes: bytes) -> tuple[datetime|None, str, str]:
+    """
+    画像バイトから撮影/作成時刻を推定。
+    戻り値: (dt, how, raw)  howは取得元の説明、rawは元の文字列
+    優先: EXIF(DateTimeOriginal→Digitized→DateTime) → PNG(info['timestamp'等])
+    """
+    # 1) EXIF
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        exif = getattr(img, "_getexif", lambda: None)()
+        if exif:
+            from PIL.ExifTags import TAGS
+            tag_map = {TAGS.get(k, k): v for k, v in exif.items()}
+            for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                v = tag_map.get(key)
+                if isinstance(v, str) and v.strip():
+                    dt = _parse_str_to_jst(v)  # EXIFはTZ無し前提→JST扱い
+                    if dt: return dt, f"EXIF:{key}", v
+    except Exception:
+        pass
+
+    # 2) PNG/tIMEなど（Pillowは info に入ることがある）
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        info = getattr(img, "info", {}) or {}
+        for k in ("timestamp", "creation_time", "date:create", "date:modify"):
+            if k in info:
+                v = info[k]
+                if isinstance(v, datetime):
+                    dt = v.astimezone(JST) if v.tzinfo else v.replace(tzinfo=JST)
+                    return dt, f"PNG:{k}", v.isoformat(sep=" ")
+                if isinstance(v, str) and v.strip():
+                    dt = _parse_str_to_jst(v)
+                    if dt: return dt, f"PNG:{k}", v
+    except Exception:
+        pass
+
+    return None, "meta:none", ""
+
 
 def _bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -1951,52 +2002,55 @@ async def on_message(message):
                 file=discord.File(io.BytesIO(buf.tobytes()), filename=f"masked_{att.filename.rsplit('.',1)[0]}.jpg")
             )
         return
-    # ==== !time 画像のEXIF撮影日時 or アップロード時刻を表示 ====
+    # ==== !time 画像の撮影時刻を推定表示 ====
     if message.content.strip().startswith("!time"):
         if not message.attachments:
-            await message.channel.send("⚠️ 画像を添付して `!time` を実行してください")
+            await message.channel.send("🖼 画像を添付して `!time` を実行してね（`!time ocr` で画面内時計も表示）")
             return
 
-        lines = []
+        mode = message.content.strip().split(maxsplit=1)
+        mode = mode[1].lower() if len(mode) == 2 else ""
+        want_ocr = mode in ("ocr", "all")
+        show_all  = mode == "all"
+
+        lines = ["🕒 **撮影(作成)時刻の推定**"]
+        up_jst = message.created_at.replace(tzinfo=timezone.utc).astimezone(JST)
+
         for i, att in enumerate(message.attachments, start=1):
             try:
-                img_bytes = await att.read()
+                b = await att.read()
             except Exception:
-                lines.append(f"#{i}: 画像を読み込めませんでした（{att.filename}）")
+                lines.append(f"#{i}: 読み込み失敗（{att.filename}）")
                 continue
 
-            exif_map = _get_exif_datetime_strings(img_bytes)
+            # 1) EXIF / PNG
+            dt_meta, how, raw = get_taken_time_from_image_bytes(b)
 
-            # 優先順で採用
-            picked_label, picked_raw = None, None
-            for k in EXIF_DT_KEYS:
-                if k in exif_map:
-                    picked_label, picked_raw = k, exif_map[k]
-                    break
+            # 2) OCR（任意）
+            dt_ocr, ocr_raw = (None, "")
+            if want_ocr:
+                dt_ocr, ocr_raw = _ocr_clock_topright_to_jst(b)
 
-            if picked_raw:
-                parsed = _parse_exif_dt_to_jst(picked_raw)
-                if parsed:
-                    lines.append(
-                        f"#{i} {att.filename}\n"
-                        f"　📸 EXIF {picked_label}: `{parsed}`（raw: {picked_raw}）"
-                    )
-                else:
-                    # 解析できなかった場合は raw だけ見せる
-                    lines.append(
-                        f"#{i} {att.filename}\n"
-                        f"　📸 EXIF {picked_label}: `{picked_raw}`（書式を解釈できませんでした）"
-                    )
+            # 3) Discord アップロード時刻（常に用意）
+            dt_disc = up_jst
+
+            # 出力
+            head = f"#{i} {att.filename}"
+            if dt_meta:
+                lines.append(f"{head}\n　📸 `{dt_meta.strftime('%Y-%m-%d %H:%M:%S')}` 〔{how} raw:{raw}〕")
+                if show_all:
+                    lines.append(f"　🕒 Discord送信 `{dt_disc.strftime('%Y-%m-%d %H:%M:%S')}`")
+                    if want_ocr and dt_ocr:
+                        lines.append(f"　👀 OCR時計 `{dt_ocr.strftime('%Y-%m-%d %H:%M:%S')}` (raw:{ocr_raw})")
             else:
-                # EXIFが無い/拾えない → Discordアップロード時刻(JST)
-                up_jst = message.created_at.replace(tzinfo=timezone.utc).astimezone(JST)
-                lines.append(
-                    f"#{i} {att.filename}\n"
-                    f"　🕒 EXIFなし → Discordアップロード時刻: `{up_jst.strftime('%Y-%m-%d %H:%M:%S')}`"
-                )
+                # メタが無い → 代替を並べる
+                lines.append(f"{head}\n　🕒 EXIF/PNGなし → Discord送信 `{dt_disc.strftime('%Y-%m-%d %H:%M:%S')}`")
+                if want_ocr and dt_ocr:
+                    lines.append(f"　👀 OCR時計 `{dt_ocr.strftime('%Y-%m-%d %H:%M:%S')}` (raw:{ocr_raw})")
 
         await message.channel.send("\n".join(lines))
         return
+
     # ==== !ocrdebug ====
     if message.content.strip() == "!ocrdebug":
         if not message.attachments:
