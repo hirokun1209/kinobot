@@ -16,12 +16,6 @@ import json
 from google.cloud import vision
 from google.oauth2 import service_account
 from pathlib import Path
-import base64
-# ---- Shield/Sword 黒塗りヘルパー（貼り付け）----
-import io
-import numpy as np
-import cv2
-from PIL import Image
 
 def _bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -38,6 +32,43 @@ def _in_range_mask(hsv, ranges):
         cur = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
         m = cur if m is None else (m | cur)
     return m if m is not None else np.zeros(hsv.shape[:2], np.uint8)
+
+def detect_sword_shield_boxes(bgr: np.ndarray):
+    """盾/剣らしい色の塊を (x,y,w,h) で返す"""
+    H, W = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    blue = _in_range_mask(hsv, HSV_BLUE_RANGES)
+    red  = _in_range_mask(hsv, HSV_RED_RANGES)
+    mask = blue | red
+
+    # ノイズ除去・小さすぎる塊を排除
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+
+    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    min_wh = max(14, int(min(H, W)*0.03))
+    max_wh = int(min(H, W)*0.12)
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        if min_wh <= w <= max_wh and min_wh <= h <= max_wh:
+            # リスト行の帯っぽい高さだけ拾う（画面上部のUIを避ける）
+            if H*0.18 < y < H*0.9:
+                boxes.append((x,y,w,h))
+    return boxes
+
+def redact_right_of_boxes(bgr: np.ndarray, boxes, pad_y_ratio=0.15, pad_x=6):
+    """検出した箱の ‘x から右端まで’ を行幅で黒塗り"""
+    out = bgr.copy()
+    H, W = out.shape[:2]
+    for x,y,w,h in boxes:
+        pad_y = int(h*pad_y_ratio)
+        y0 = max(0, y - pad_y)
+        y1 = min(H, y + h + pad_y)
+        x0 = max(0, x - pad_x)
+        cv2.rectangle(out, (x0, y0), (W, y1), (0,0,0), -1)
+    return out
 
 # Google Vision クライアント（環境変数に埋めたJSONから作成）
 GV_CLIENT = None
@@ -763,48 +794,10 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
             durations.append(corrected)
     return durations
 
-# ===== 免戦が読めない時のフォールバック用ヘルパー =====
-TIME_RE2 = re.compile(r"\b(\d{1,2}):(\d{2}):(\d{2})\b")
-
-def _is_valid_hms(h: int, m: int, s: int) -> bool:
-    return 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60
-
-def _find_first_clock_in_lines(lines: list[str]) -> str | None:
-    for t in lines:
-        t_norm = normalize_time_separators(force_hhmmss_if_six_digits(t))
-        m = TIME_RE2.search(t_norm)
-        if not m:
-            continue
-        h, mm, ss = map(int, m.groups())
-        if _is_valid_hms(h, mm, ss):
-            return f"{h:02}:{mm:02}:{ss:02}"
-    return None
-
-def _build_dt_from_clock(clock_hms: str) -> tuple[datetime | None, str | None]:
-    try:
-        h, m, s = map(int, clock_hms.split(":"))
-        if not _is_valid_hms(h, m, s):
-            return None, None
-        t_obj = time(h, m, s)
-        base_date = now_jst().date()
-        dt = datetime.combine(base_date, t_obj, tzinfo=JST)
-        if t_obj < time(6, 0, 0):
-            dt += timedelta(days=1)
-        if dt <= now_jst():
-            dt += timedelta(days=1)
-        return dt, dt.strftime("%H:%M:%S")
-    except Exception:
-        return None, None
-
-# ===== ここから「置換」：parse_multiple_places =====
 def parse_multiple_places(center_texts, top_time_texts):
-    """
-    1) 通常: '免戦中' の後ろの持続時間を基準時刻に加算
-    2) フォールバック: グループ内の最初の HH:MM:SS を絶対時刻として採用
-    """
     res = []
 
-    # 上部時刻（通常ルート用・なくてもOK）
+    # 上部時間の抽出（補正後）
     def extract_top_time(txts):
         for t in txts:
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
@@ -816,51 +809,39 @@ def parse_multiple_places(center_texts, top_time_texts):
                 return f"{int(h):02}:{int(m):02}:{int(s):02}"
         return None
 
-    top_time = extract_top_time(top_time_texts)  # なくてもフォールバック動く
+    top_time = extract_top_time(top_time_texts)
     server = extract_server_number(center_texts)
-    if not server:
+    if not top_time or not server:
         return []
 
     mode = "警備" if server == "1268" else "奪取"
 
-    # グループ構築（「越域駐騎場<数字>」を見出しにして、その後の行を束ねる）
+    # ✅ グループ構築
     groups = []
-    current = {"place": None, "lines": []}
+    current_group = {"place": None, "lines": []}
 
     for line in center_texts:
-        m = re.search(r"越域駐騎場\s*(\d+)", line)  # 数字が次行でも拾いやすいように \s* を緩める
-        if m:
-            # 直前の束を確定
-            if current["place"] and current["lines"]:
-                groups.append(current)
-            current = {"place": m.group(1), "lines": []}
+        match = re.search(r"越域駐騎場(\d+)", line)
+        if match:
+            if current_group["place"] and current_group["lines"]:
+                groups.append(current_group)
+            current_group = {"place": match.group(1), "lines": []}
         else:
-            current["lines"].append(line)
+            current_group["lines"].append(line)
 
-    if current["place"] and current["lines"]:
-        groups.append(current)
+    if current_group["place"] and current_group["lines"]:
+        groups.append(current_group)
 
-    # 各グループ処理
+    # ✅ 各グループの免戦時間抽出
     for g in groups:
-        place = g["place"]
-        lines = g["lines"]
-
-        # まず通常ルート（免戦中の“持続時間”）
-        durations = extract_imsen_durations(lines)
-        if top_time and durations:
-            d = correct_imsen_text(durations[0])
-            dt, unlock = add_time(top_time, d)
-            if dt:
-                res.append((dt, f"{mode} {server}-{place}-{unlock}", d))
-                continue  # 正常取得できたら次のグループへ
-
-        # フォールバック：グループ内の“最初の HH:MM:SS”を絶対時刻として使う
-        clock = _find_first_clock_in_lines(lines)
-        if clock:
-            dt, unlock = _build_dt_from_clock(clock)
-            if dt:
-                # 第3要素（表示用）はフォールバックだとそのまま時刻を入れておく
-                res.append((dt, f"{mode} {server}-{place}-{unlock}", clock))
+        durations = extract_imsen_durations(g["lines"])
+        if not durations:
+            continue
+        raw_d = durations[0]
+        d = correct_imsen_text(raw_d)
+        dt, unlock = add_time(top_time, d)
+        if dt:
+            res.append((dt, f"{mode} {server}-{g['place']}-{unlock}", d))
 
     return res
 
@@ -1199,22 +1180,25 @@ async def retime_event_in_summary(old_txt: str, new_dt: datetime, new_txt: str, 
     if (new_dt, new_txt) not in target_block["events"]:
         target_block["events"].append((new_dt, new_txt))
     target_block["events"].sort(key=lambda x: x[0])
-    target_block["min"] = min(target_block["min"], new_dt)
-    target_block["max"] = max(target_block["max"], new_dt)
+    target_block["min"] = min(d for d, _ in target_block["events"])
+    target_block["max"] = max(d for d, _ in target_block["events"])
 
-    # 3) まとめメッセージを一括編集
-    for block in summary_blocks:
-        if block.get("events"):
-            block["events"].sort(key=lambda x: x[0])
-        if block.get("msg"):
-            try:
-                await block["msg"].edit(content=format_block_msg(block, True))
-            except:
-                pass
+    # 3) まとめメッセージを更新
+    if target_block.get("msg"):
+        try:
+            await target_block["msg"].edit(content=format_block_msg(target_block, with_footer=True))
+        except:
+            pass
+    else:
+        try:
+            target_block["msg"] = await channel.send(content=format_block_msg(target_block, with_footer=True))
+        except:
+            target_block["msg"] = None
 
-    # 4) pending_places の main_msg_id を新しいテキストにひも付け（ブロックにメッセージがある場合）
-    if target_block.get("msg") and new_txt in pending_places:
-        pending_places[new_txt]["main_msg_id"] = target_block["msg"].id
+    # 4) main_msg_id を再ひも付け
+    for d, t in target_block["events"]:
+        if t == new_txt and target_block.get("msg"):
+            pending_places[new_txt]["main_msg_id"] = target_block["msg"].id
 
 # === 手動まとめ(!s)メッセージを最新状態で上書き ===
 async def refresh_manual_summaries():
@@ -2055,8 +2039,9 @@ async def on_message(message):
         a = message.attachments[0]
         b = await a.read()
         img = Image.open(io.BytesIO(b)).convert("RGB")
-        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        # OCR前に「免戦中」直下を黒塗り（GV専用デバッグでも適用したい場合）
+        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)  # ← これが必要！
+
+        # OCR前に「免戦中」直下を黒塗り（GV専用デバッグでも適用）
         np_img, _ = auto_mask_ime(np_img)
 
         # トリミング
