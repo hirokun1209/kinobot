@@ -1939,17 +1939,18 @@ async def on_message(message):
         b = await a.read()
         img = Image.open(io.BytesIO(b)).convert("RGB")
         np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
         # OCR前に「免戦中」直下を黒塗り
-        np_img, _masked_cnt = auto_mask_ime(np_img)
+        np_img_masked, _masked_cnt = auto_mask_ime(np_img)
 
         # トリミング
-        top = crop_top_right(np_img)
-        center = crop_center_area(np_img)
+        top = crop_top_right(np_img_masked)
+        center = crop_center_area(np_img_masked)
 
         # OCRテキスト抽出
         top_txts = extract_text_from_image(top)
         center_txts = ocr_center_with_fallback(center)
-        
+
         # 補正関数
         def extract_and_correct_base_time(txts):
             if not txts:
@@ -1995,19 +1996,38 @@ async def on_message(message):
         durations = extract_imsen_durations(center_txts)
         duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
-        # 上部OCR結果を安全に整形
+        # OCR結果文字列
         top_txts_str = "\n".join(top_txts) if top_txts else "(検出なし)"
-
-        # 送信
         center_txts_str = "\n".join(center_txts) if center_txts else "(検出なし)"
 
+        # 画像を添付ファイル化
+        files = []
+
+        def _attach(bgr_img, filename, quality=92):
+            try:
+                ok, buf = cv2.imencode(".jpg", bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                if ok:
+                    files.append(discord.File(io.BytesIO(buf.tobytes()), filename=filename))
+            except Exception:
+                pass
+
+        _attach(np_img_masked, f"ocrdebug_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", quality=92)
+        _attach(top,        f"ocrdebug_top_{a.filename.rsplit('.',1)[0]}.jpg",              quality=92)
+        _attach(center,     f"ocrdebug_center_{a.filename.rsplit('.',1)[0]}.jpg",           quality=95)
+
+        # 送信（テキスト + 画像3枚）
         await message.channel.send(
-            f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_txts_str}\n```\n"
-            f"🧩 **中央OCR結果（補正前）**:\n```\n{center_txts_str}\n```\n"
-            f"📋 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```\n"
-            f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```\n"
-            f"\n🧽 maskime: {_masked_cnt} 本"
+            content=(
+                f"📸 **上部OCR結果（基準時刻）**:\n```\n{top_txts_str}\n```\n"
+                f"🧩 **中央OCR結果（補正前）**:\n```\n{center_txts_str}\n```\n"
+                f"📋 **補正後の予定一覧（奪取 or 警備）**:\n```\n{preview_text}\n```\n"
+                f"⏳ **補正後の免戦時間一覧**:\n```\n{duration_text}\n```\n"
+                f"🧽 maskime: {_masked_cnt} 本\n"
+                f"🖼 添付: 全体(黒塗り済) / 上部トリム / 中央トリム"
+            ),
+            files=files if files else None
         )
+        return
         
     # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
     if message.content.strip() == "!gvocr":
