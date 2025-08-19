@@ -2240,7 +2240,7 @@ async def on_message(message):
             b = await a.read()
             img = Image.open(io.BytesIO(b)).convert("RGB")
             np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            # OCR前に「免戦中」直下を黒塗り
+            # OCR前に「免戦中」直下を黒塗り（GV専用デバッグでも適用）
             np_img, _ = auto_mask_ime(np_img)
             top = crop_top_right(np_img)
             center = crop_center_area(np_img)
