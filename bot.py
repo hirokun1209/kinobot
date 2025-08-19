@@ -785,13 +785,19 @@ def add_time(base_time_str, duration_str):
     dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
     return dt, dt.strftime("%H:%M:%S")
 
+TIME_RE = re.compile(r"\b\d{1,2}[:：]\d{2}[:：]\d{2}\b")
+
 def extract_imsen_durations(texts: list[str]) -> list[str]:
     durations = []
     for text in texts:
-        matches = re.findall(r"免戦中([0-9:\-日分秒hmsHMShms％%日]+)", text)
-        for raw in matches:
-            corrected = correct_imsen_text(raw)
-            durations.append(corrected)
+        t = normalize_time_separators(text)
+        # ① 「免戦中 …」から優先して取る
+        for m in re.findall(r"免戦中\s*([0-9:：]{4,10})", t):
+            durations.append(correct_imsen_text(m))
+        # ② ①で取れなかったら、裸の時間をフォールバックで拾う
+        if not durations:
+            for m in TIME_RE.findall(t):
+                durations.append(correct_imsen_text(m))
     return durations
 
 def parse_multiple_places(center_texts, top_time_texts):
@@ -835,14 +841,22 @@ def parse_multiple_places(center_texts, top_time_texts):
     # ✅ 各グループの免戦時間抽出
     for g in groups:
         durations = extract_imsen_durations(g["lines"])
+
+        # ← これを追加（フォールバック）
+        if not durations:
+            for ln in g["lines"]:
+                mt = TIME_RE.search(normalize_time_separators(ln))
+                if mt:
+                    durations = [mt.group(0)]
+                    break
+
         if not durations:
             continue
-        raw_d = durations[0]
-        d = correct_imsen_text(raw_d)
+        raw = durations[0]
+        d = correct_imsen_text(raw)
         dt, unlock = add_time(top_time, d)
         if dt:
             res.append((dt, f"{mode} {server}-{g['place']}-{unlock}", d))
-
     return res
 
 def correct_imsen_text(text: str) -> str:
@@ -883,8 +897,14 @@ def correct_imsen_text(text: str) -> str:
                 return f"00:{m:02}:{s:02}"
         except:
             pass
-
-    return text
+    # --- 追加の保険: 時(HH)が23を超える場合、先頭が '5' 誤読なら 0 に補正 ---
+    m = re.match(r"(\d{1,2}):(\d{2}):(\d{2})", normalize_time_separators(text))
+    if m:
+        h, mi, se = map(int, m.groups())
+        s = normalize_time_separators(text)
+        if h > 23 and s.startswith("5"):
+            return f"0{h%10}:{mi:02d}:{se:02d}"
+    return normalize_time_separators(text)
 
 # ==== 盾テンプレ生成・検出・黒塗り ====
 
