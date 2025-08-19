@@ -11,6 +11,10 @@ from datetime import datetime, timedelta, timezone, time
 from PIL import Image
 from fastapi import FastAPI
 import uvicorn
+# 追加 import
+from fastapi import UploadFile, File, BackgroundTasks
+import aiofiles  # 使わないが、他所で使うなら残してOK（未使用なら削っても可）
+import struct
 # === ここを bot.py 冒頭の import 群のあとに追記 ===
 import json
 from google.cloud import vision
@@ -111,6 +115,40 @@ def get_taken_time_from_image_bytes(img_bytes: bytes) -> tuple[datetime|None, st
 
     return None, "meta:none", ""
 
+def _extract_png_time(raw: bytes) -> str | None:
+    """
+    PNGの tIME チャンク（作成/更新時刻）を生バイトから直接読む。
+    返り値: 'YYYY-MM-DD HH:MM:SS' or None
+    """
+    sig = b"\x89PNG\r\n\x1a\n"
+    if not raw.startswith(sig):
+        return None
+    i = len(sig)
+    try:
+        while i + 12 <= len(raw):
+            length = struct.unpack(">I", raw[i:i+4])[0]
+            ctype  = raw[i+4:i+8]
+            if ctype == b"tIME" and i+8+length <= len(raw):
+                data = raw[i+8:i+8+length]
+                if len(data) == 7:
+                    year, mon, day, hh, mm, ss = struct.unpack(">H5B", data)
+                    return f"{year:04d}-{mon:02d}-{day:02d} {hh:02d}:{mm:02d}:{ss:02d}"
+                return None
+            i += 12 + length  # length + type(4) + crc(4)
+    except Exception:
+        pass
+    return None
+
+def _extract_xmp(img: Image.Image) -> dict | None:
+    """
+    Pillow 9.2+ なら Image.getxmp() が使える。
+    返り値: dict or None
+    """
+    try:
+        x = img.getxmp()
+        return x or None
+    except Exception:
+        return None
 
 def _bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -189,6 +227,45 @@ from fastapi.responses import JSONResponse
 @app.get("/")
 @app.get("/ping")
 @app.get("/ping/")
+
+import tempfile, os
+@app.post("/upload")
+async def upload_image(background: BackgroundTasks, file: UploadFile = File(...)):
+    # 一時ファイルに保存
+    raw = await file.read()
+    fd, tmp_path = tempfile.mkstemp(prefix="up_", suffix=os.path.splitext(file.filename)[1], dir="/tmp")
+    os.close(fd)
+    with open(tmp_path, "wb") as f:
+        f.write(raw)
+
+    # 解析はメモリ上でOK
+    dt_meta, how, raw_str = get_taken_time_from_image_bytes(raw)
+    png_time = _extract_png_time(raw)
+    exif_dt_map = _get_exif_datetime_strings(raw)
+    xmp_short = None
+    try:
+        img = Image.open(io.BytesIO(raw))
+        xmp = _extract_xmp(img)
+        if xmp:
+            keys = ["xmp:CreateDate","xmp:ModifyDate","dc:title","dc:description"]
+            parts = [f"{k}={xmp[k]}" for k in keys if k in xmp]
+            xmp_short = ", ".join(parts)[:200] if parts else "(XMPあり)"
+    except Exception:
+        pass
+
+    meta = {"exif_dt_map": exif_dt_map, "png_time": png_time, "xmp_short": xmp_short}
+    if dt_meta:
+        meta["taken_guess"] = {"when": dt_meta.strftime("%Y-%m-%d %H:%M:%S"), "how": how, "raw": raw_str}
+
+    # Discord通知
+    background.add_task(_notify_discord_upload_meta, file.filename, meta)
+
+    # 直ちに削除
+    try: os.remove(tmp_path)
+    except: pass
+
+    return JSONResponse({"status": "ok", "meta": meta})
+
 def root():
     return JSONResponse(content={"status": "ok"})
 
@@ -460,6 +537,44 @@ def auto_mask_ime(bgr: np.ndarray) -> tuple[np.ndarray, int]:
     if not rects:
         return bgr, 0
     return fill_rects_black(bgr, rects), len(rects)
+
+async def _notify_discord_upload_meta(filename: str, meta: dict):
+    await client.wait_until_ready()
+    ch = client.get_channel(NOTIFY_CHANNEL_ID)
+    if not ch:
+        return
+    lines = [f"🗂 **アップロード解析** `{filename}`", ""]
+    # EXIF
+    exif = meta.get("exif_dt_map") or {}
+    if exif:
+        # 優先順で1つだけ強調表示
+        picked = False
+        for k in ("DateTimeOriginal","DateTimeDigitized","DateTime"):
+            if k in exif:
+                lines.append(f"📸 EXIF {k}: `{exif[k]}`")
+                picked = True
+                break
+        if not picked:
+            # 何かしらあるが上記3種なし
+            for k, v in list(exif.items())[:3]:
+                lines.append(f"📸 EXIF {k}: `{v}`")
+    else:
+        lines.append("📸 EXIF: なし/未取得")
+
+    # PNG tIME
+    if meta.get("png_time"):
+        lines.append(f"🧩 PNG tIME: `{meta['png_time']}`")
+
+    # XMP
+    if meta.get("xmp_short"):
+        lines.append(f"📝 XMP: {meta['xmp_short']}")
+
+    # 総合推定（既存ヘルパの get_taken_time_from_image_bytes）
+    if meta.get("taken_guess"):
+        dtg = meta["taken_guess"]
+        lines.append(f"🕒 推定撮影/作成: `{dtg['when']}` 〔{dtg['how']} raw:{dtg['raw']}〕")
+
+    await ch.send("\n".join(lines))
 
 async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     """
