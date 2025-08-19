@@ -33,43 +33,6 @@ def _in_range_mask(hsv, ranges):
         m = cur if m is None else (m | cur)
     return m if m is not None else np.zeros(hsv.shape[:2], np.uint8)
 
-def detect_sword_shield_boxes(bgr: np.ndarray):
-    """盾/剣らしい色の塊を (x,y,w,h) で返す"""
-    H, W = bgr.shape[:2]
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-
-    blue = _in_range_mask(hsv, HSV_BLUE_RANGES)
-    red  = _in_range_mask(hsv, HSV_RED_RANGES)
-    mask = blue | red
-
-    # ノイズ除去・小さすぎる塊を排除
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
-
-    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    min_wh = max(14, int(min(H, W)*0.03))
-    max_wh = int(min(H, W)*0.12)
-    for c in cnts:
-        x,y,w,h = cv2.boundingRect(c)
-        if min_wh <= w <= max_wh and min_wh <= h <= max_wh:
-            # リスト行の帯っぽい高さだけ拾う（画面上部のUIを避ける）
-            if H*0.18 < y < H*0.9:
-                boxes.append((x,y,w,h))
-    return boxes
-
-def redact_right_of_boxes(bgr: np.ndarray, boxes, pad_y_ratio=0.15, pad_x=6):
-    """検出した箱の ‘x から右端まで’ を行幅で黒塗り"""
-    out = bgr.copy()
-    H, W = out.shape[:2]
-    for x,y,w,h in boxes:
-        pad_y = int(h*pad_y_ratio)
-        y0 = max(0, y - pad_y)
-        y1 = min(H, y + h + pad_y)
-        x0 = max(0, x - pad_x)
-        cv2.rectangle(out, (x0, y0), (W, y1), (0,0,0), -1)
-    return out
-
 # Google Vision クライアント（環境変数に埋めたJSONから作成）
 GV_CLIENT = None
 _creds_json = os.getenv("GOOGLE_CLOUD_VISION_JSON")
@@ -275,8 +238,6 @@ async def ping_google_vision() -> tuple[bool, str]:
         return False, f"API呼び出しで例外: {e!r}"
 
 # ===== 剣/盾検出 → 右側黒塗り ヘルパー =====
-import numpy as np, cv2
-
 # HSV 色域（端末差でズレることがあるので必要なら微調整）
 HSV_BLUE_LOW1  = (95,  80, 60)
 HSV_BLUE_HIGH1 = (125,255,255)
