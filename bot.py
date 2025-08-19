@@ -17,6 +17,50 @@ from google.cloud import vision
 from google.oauth2 import service_account
 from pathlib import Path
 
+# === EXIF 日時取得ヘルパー ===
+from PIL.ExifTags import TAGS
+
+EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
+
+def _get_exif_datetime_strings(img_bytes: bytes) -> dict:
+    """
+    画像のEXIFから日時文字列（"YYYY:MM:DD HH:MM:SS" 等）を拾って返す。
+    戻り値: {"DateTimeOriginal": "...", "DateTimeDigitized": "...", "DateTime": "..."} のうち存在するキーのみ
+    """
+    out = {}
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        exif = getattr(img, "_getexif", lambda: None)()
+        if not exif:
+            return out
+        for tag_id, value in exif.items():
+            tag = TAGS.get(tag_id, tag_id)
+            if tag in EXIF_DT_KEYS and isinstance(value, str) and value.strip():
+                out[tag] = value.strip()
+    except Exception:
+        pass
+    return out
+
+def _parse_exif_dt_to_jst(s: str) -> str | None:
+    """
+    EXIFの典型書式 'YYYY:MM:DD HH:MM:SS' をJST文字列 'YYYY-MM-DD HH:MM:SS' に。
+    失敗時は None を返す。
+    """
+    try:
+        # 一部端末で 'YYYY-MM-DD HH:MM:SS' のこともあるので、':'→'-'補正は日付部だけに限定
+        # 基本ケース
+        if re.fullmatch(r"\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}", s):
+            dt_naive = datetime.strptime(s, "%Y:%m:%d %H:%M:%S")
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", s):
+            dt_naive = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        else:
+            return None
+        # EXIFはタイムゾーン情報を持たないことが多いので「端末ローカル=JST想定」で扱う
+        dt_jst = dt_naive.replace(tzinfo=JST)
+        return dt_jst.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
 def _bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
