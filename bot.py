@@ -227,6 +227,8 @@ from fastapi.responses import JSONResponse
 @app.get("/")
 @app.get("/ping")
 @app.get("/ping/")
+async def root():
+    return JSONResponse(content={"status": "ok"})
 
 import tempfile, os
 @app.post("/upload")
@@ -265,9 +267,6 @@ async def upload_image(background: BackgroundTasks, file: UploadFile = File(...)
     except: pass
 
     return JSONResponse({"status": "ok", "meta": meta})
-
-def root():
-    return JSONResponse(content={"status": "ok"})
 
 def run_server():
     import time as _time
@@ -851,14 +850,63 @@ def force_hhmmss_if_six_digits(s: str) -> str:
         h, m, sec = digits[:2], digits[2:4], digits[4:]
         return f"{h}:{m}:{sec}"
     return s
+    
+def _ocr_clock_topright_to_jst(img_bytes: bytes) -> tuple[datetime|None, str]:
+    """
+    画像右上の画面内時計をOCRして、JSTの datetime を返す。
+    戻り値: (datetime or None, raw_text)
+    """
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+        # 「免戦中」直下は黒塗り（他処理と合わせる）
+        bgr, _ = auto_mask_ime(bgr)
+
+        # 右上トリム
+        top = crop_top_right(bgr)
+
+        # まず Paddle、弱ければ Google Vision にフォールバック
+        texts = extract_text_from_image(top)
+        if not texts and GV_CLIENT is not None:
+            texts = extract_text_from_image_google(top)
+
+        raw = texts[0] if texts else ""
+        if not raw:
+            return None, ""
+
+        # 書式補正
+        fixed = normalize_time_separators(raw)
+        fixed = force_hhmmss_if_six_digits(fixed)
+
+        # HH:MM:SS を抽出
+        m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", fixed)
+        if m:
+            h, mi, se = map(int, m.groups())
+        else:
+            digits = re.sub(r"\D", "", fixed)
+            if len(digits) < 6:
+                return None, raw
+            h, mi, se = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
+
+        # 今日の日付で JST datetime に
+        today = now_jst().date()
+        base = datetime.combine(today, time(h % 24, mi, se), tzinfo=JST)
+
+        # 00:00〜05:59 は翌日扱いに寄せる（他ロジックと統一）
+        if base.time() < time(6, 0, 0):
+            base += timedelta(days=1)
+
+        return base, raw
+    except Exception:
+        return None, ""
 
 # === ここからコピペ（既存の center_ocr 関連の上に置いてOK）===
 
 # 正規表現（そのまま流用）
-TIME_RE = re.compile(r"\b\d{1,2}:\d{2}:\d{2}\b")
 IMSEN_RE = re.compile(r"免戦中")
 
-def ocr_center_paddle(center_bgr: np.ndarray) -> list[str]:
+def oct_center_paddle(center_bgr: np.ndarray) -> list[str]:
     """中央領域をPaddleOCRだけで読む（前処理つき）"""
     candidates = preprocess_for_colon(center_bgr)
     results = []
