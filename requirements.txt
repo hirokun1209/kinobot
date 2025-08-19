@@ -9,3 +9,4 @@ opencv-python-headless==4.7.0.72
 google-cloud-vision
 google-auth
 aiofiles
+python-multipart
