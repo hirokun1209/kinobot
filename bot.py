@@ -13,7 +13,6 @@ from fastapi import FastAPI
 import uvicorn
 # 追加 import
 from fastapi import UploadFile, File, BackgroundTasks
-import aiofiles  # 使わないが、他所で使うなら残してOK（未使用なら削っても可）
 import struct
 # === ここを bot.py 冒頭の import 群のあとに追記 ===
 import json
