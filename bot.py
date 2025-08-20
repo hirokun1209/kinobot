@@ -251,29 +251,24 @@ async def upload_form():
     </html>
     """
 import tempfile
+
 from typing import List
+from fastapi.responses import RedirectResponse
 
 @app.post("/upload")
-async def upload_images(background: BackgroundTasks, files: List[UploadFile] = File(...)):
-    results = []
-    for file in files:
-        raw = await file.read()
+async def upload_image(
+    background: BackgroundTasks,
+    files: List[UploadFile] = File(...),   # ← 複数受け取りに変更（name="files" と一致）
+):
+    # 各画像を非同期タスクでDiscord通知（解析はここで、送信はBGタスク）
+    for f in files:
+        raw = await f.read()
 
         dt_meta, how, raw_str = get_taken_time_from_image_bytes(raw)
         png_time = _extract_png_time(raw)
         exif_dt_map = _get_exif_datetime_strings(raw)
-        xmp_short = None
-        try:
-            img = Image.open(io.BytesIO(raw))
-            xmp = _extract_xmp(img)
-            if xmp:
-                keys = ["xmp:CreateDate","xmp:ModifyDate","dc:title","dc:description"]
-                parts = [f"{k}={xmp[k]}" for k in keys if k in xmp]
-                xmp_short = ", ".join(parts)[:200] if parts else "(XMPあり)"
-        except Exception:
-            pass
 
-        meta = {"exif_dt_map": exif_dt_map, "png_time": png_time, "xmp_short": xmp_short}
+        meta = {"exif_dt_map": exif_dt_map, "png_time": png_time}
         if dt_meta:
             meta["taken_guess"] = {
                 "when": dt_meta.strftime("%Y-%m-%d %H:%M:%S"),
@@ -281,11 +276,12 @@ async def upload_images(background: BackgroundTasks, files: List[UploadFile] = F
                 "raw": raw_str
             }
 
-        # Discord通知をスケジュール
-        background.add_task(notify_discord_upload_meta_threadsafe, file.filename, meta)
+        # Discord通知（バックグラウンド）
+        background.add_task(
+            notify_discord_upload_meta_threadsafe, f.filename, meta
+        )
 
-        results.append({"filename": file.filename, "meta": meta})
-
+    # ✅ 即リダイレクト（POST→GET 303）
     return RedirectResponse(url="/form", status_code=303)
 
 def run_server():
