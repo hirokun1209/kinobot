@@ -243,8 +243,7 @@ async def upload_form():
       <body style="font-family: system-ui; padding: 16px;">
         <h2>画像アップロード</h2>
         <form action="/upload" method="post" enctype="multipart/form-data">
-          <!-- captureを外して写真も選べるようにする -->
-          <input type="file" name="file" accept="image/*"><br><br>
+          <input type="file" name="files" accept="image/*" multiple><br><br>
           <button type="submit">送信</button>
         </form>
         <p>送信すると、EXIF/PNG/XMP を解析して Discord に通知します。</p>
@@ -252,35 +251,42 @@ async def upload_form():
     </html>
     """
 import tempfile
+from typing import List
+
 @app.post("/upload")
-async def upload_image(background: BackgroundTasks, file: UploadFile = File(...)):
-    # メモリで解析（ファイル保存は不要）
-    raw = await file.read()
+async def upload_images(background: BackgroundTasks, files: List[UploadFile] = File(...)):
+    results = []
+    for file in files:
+        raw = await file.read()
 
+        dt_meta, how, raw_str = get_taken_time_from_image_bytes(raw)
+        png_time = _extract_png_time(raw)
+        exif_dt_map = _get_exif_datetime_strings(raw)
+        xmp_short = None
+        try:
+            img = Image.open(io.BytesIO(raw))
+            xmp = _extract_xmp(img)
+            if xmp:
+                keys = ["xmp:CreateDate","xmp:ModifyDate","dc:title","dc:description"]
+                parts = [f"{k}={xmp[k]}" for k in keys if k in xmp]
+                xmp_short = ", ".join(parts)[:200] if parts else "(XMPあり)"
+        except Exception:
+            pass
 
-    # 解析はメモリ上でOK
-    dt_meta, how, raw_str = get_taken_time_from_image_bytes(raw)
-    png_time = _extract_png_time(raw)
-    exif_dt_map = _get_exif_datetime_strings(raw)
-    xmp_short = None
-    try:
-        img = Image.open(io.BytesIO(raw))
-        xmp = _extract_xmp(img)
-        if xmp:
-            keys = ["xmp:CreateDate","xmp:ModifyDate","dc:title","dc:description"]
-            parts = [f"{k}={xmp[k]}" for k in keys if k in xmp]
-            xmp_short = ", ".join(parts)[:200] if parts else "(XMPあり)"
-    except Exception:
-        pass
+        meta = {"exif_dt_map": exif_dt_map, "png_time": png_time, "xmp_short": xmp_short}
+        if dt_meta:
+            meta["taken_guess"] = {
+                "when": dt_meta.strftime("%Y-%m-%d %H:%M:%S"),
+                "how": how,
+                "raw": raw_str
+            }
 
-    meta = {"exif_dt_map": exif_dt_map, "png_time": png_time, "xmp_short": xmp_short}
-    if dt_meta:
-        meta["taken_guess"] = {"when": dt_meta.strftime("%Y-%m-%d %H:%M:%S"), "how": how, "raw": raw_str}
+        # Discord通知をスケジュール
+        background.add_task(notify_discord_upload_meta_threadsafe, file.filename, meta)
 
-    # Discord通知
-    # Discord通知（別スレッド→Discordループへ投げる）
-    background.add_task(notify_discord_upload_meta_threadsafe, file.filename, meta)
-    return JSONResponse({"status": "ok", "meta": meta})
+        results.append({"filename": file.filename, "meta": meta})
+
+    return JSONResponse({"status": "ok", "files": results})
 
 def run_server():
     import time as _time
