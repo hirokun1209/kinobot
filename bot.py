@@ -221,7 +221,23 @@ client = discord.Client(intents=intents)
 # =======================
 app = FastAPI()
 
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse
+
+@app.get("/upload", response_class=HTMLResponse)
+async def upload_form():
+    return """
+    <html>
+      <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+      <body style="font-family: system-ui; padding: 16px;">
+        <h2>画像アップロード</h2>
+        <form action="/upload" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" accept="image/*" capture="environment"><br><br>
+          <button type="submit">送信</button>
+        </form>
+        <p>送信すると、EXIF/PNG/XMP を解析して Discord に通知します。</p>
+      </body>
+    </html>
+    """
 
 @app.get("/")
 @app.get("/ping")
