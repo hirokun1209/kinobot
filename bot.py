@@ -243,7 +243,8 @@ async def upload_form():
       <body style="font-family: system-ui; padding: 16px;">
         <h2>画像アップロード</h2>
         <form action="/upload" method="post" enctype="multipart/form-data">
-          <input type="file" name="file" accept="image/*" capture="environment"><br><br>
+          <!-- captureを外して写真も選べるようにする -->
+          <input type="file" name="file" accept="image/*"><br><br>
           <button type="submit">送信</button>
         </form>
         <p>送信すると、EXIF/PNG/XMP を解析して Discord に通知します。</p>
