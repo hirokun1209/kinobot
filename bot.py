@@ -6,6 +6,8 @@ import cv2
 import re
 import asyncio
 import numpy as np
+from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from paddleocr import PaddleOCR
 from datetime import datetime, timedelta, timezone, time
 from PIL import Image
