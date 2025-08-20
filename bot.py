@@ -278,8 +278,8 @@ async def upload_image(background: BackgroundTasks, file: UploadFile = File(...)
         meta["taken_guess"] = {"when": dt_meta.strftime("%Y-%m-%d %H:%M:%S"), "how": how, "raw": raw_str}
 
     # Discord通知
-    background.add_task(_notify_discord_upload_meta, file.filename, meta)
-
+    # Discord通知（別スレッド→Discordループへ投げる）
+    background.add_task(notify_discord_upload_meta_threadsafe, file.filename, meta)
     return JSONResponse({"status": "ok", "meta": meta})
 
 def run_server():
@@ -588,6 +588,21 @@ async def _notify_discord_upload_meta(filename: str, meta: dict):
         lines.append(f"🕒 推定撮影/作成: `{dtg['when']}` 〔{dtg['how']} raw:{dtg['raw']}〕")
 
     await ch.send("\n".join(lines))
+
+def notify_discord_upload_meta_threadsafe(filename: str, meta: dict):
+    """
+    FastAPI（別スレッド）→ Discord のイベントループへ安全に投げ込む。
+    """
+    try:
+        fut = asyncio.run_coroutine_threadsafe(
+            _notify_discord_upload_meta(filename, meta),
+            client.loop  # Discord 側のイベントループで実行させる
+        )
+        # 投げっぱなしでもOK。結果を待ちたいならコメントアウト外す。
+        # fut.result(timeout=5)
+    except Exception:
+        # ここでログに流したければ print 等に置き換え
+        pass
 
 async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     """
