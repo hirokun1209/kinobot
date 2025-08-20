@@ -250,42 +250,12 @@ async def upload_form():
       </body>
     </html>
     """
-    
-async def upload_image(background: BackgroundTasks, file: UploadFile = File(...)):
-    raw = await file.read()
-
-    # 解析（メモリで完結）
-    dt_meta, how, raw_str = get_taken_time_from_image_bytes(raw)
-    png_time = _extract_png_time(raw)
-    exif_dt_map = _get_exif_datetime_strings(raw)
-    xmp_short = None
-    try:
-        img = Image.open(io.BytesIO(raw))
-        xmp = _extract_xmp(img)
-        if xmp:
-            keys = ["xmp:CreateDate","xmp:ModifyDate","dc:title","dc:description"]
-            parts = [f"{k}={xmp[k]}" for k in keys if k in xmp]
-            xmp_short = ", ".join(parts)[:200] if parts else "(XMPあり)"
-    except Exception:
-        pass
-
-    meta = {"exif_dt_map": exif_dt_map, "png_time": png_time, "xmp_short": xmp_short}
-    if dt_meta:
-        meta["taken_guess"] = {"when": dt_meta.strftime("%Y-%m-%d %H:%M:%S"), "how": how, "raw": raw_str}
-
-    background.add_task(_notify_discord_upload_meta, file.filename, meta)
-    return JSONResponse({"status": "ok", "meta": meta})
-# --- ここまで差分 ---
-
-import tempfile, os
+import tempfile
 @app.post("/upload")
 async def upload_image(background: BackgroundTasks, file: UploadFile = File(...)):
-    # 一時ファイルに保存
+    # メモリで解析（ファイル保存は不要）
     raw = await file.read()
-    fd, tmp_path = tempfile.mkstemp(prefix="up_", suffix=os.path.splitext(file.filename)[1], dir="/tmp")
-    os.close(fd)
-    with open(tmp_path, "wb") as f:
-        f.write(raw)
+
 
     # 解析はメモリ上でOK
     dt_meta, how, raw_str = get_taken_time_from_image_bytes(raw)
@@ -308,10 +278,6 @@ async def upload_image(background: BackgroundTasks, file: UploadFile = File(...)
 
     # Discord通知
     background.add_task(_notify_discord_upload_meta, file.filename, meta)
-
-    # 直ちに削除
-    try: os.remove(tmp_path)
-    except: pass
 
     return JSONResponse({"status": "ok", "meta": meta})
 
