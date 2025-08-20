@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir fastapi uvicorn paddleocr opencv-python-headless python-multipart
+RUN pip install --no-cache-dir -r requirements.txt
+# もし requirements.txt を使ってないなら個別に:
+# RUN pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles
 
 # ---- numpy は一度削除（ABI mismatch防止）----
 RUN pip uninstall -y numpy || true
