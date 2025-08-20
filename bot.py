@@ -286,7 +286,7 @@ async def upload_images(background: BackgroundTasks, files: List[UploadFile] = F
 
         results.append({"filename": file.filename, "meta": meta})
 
-    return JSONResponse({"status": "ok", "files": results})
+    return RedirectResponse(url="/form", status_code=303)
 
 def run_server():
     import time as _time
