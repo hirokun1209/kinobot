@@ -217,18 +217,22 @@ client = discord.Client(intents=intents)
 # =======================
 app = FastAPI()
 
-from fastapi.responses import HTMLResponse, JSONResponse
+def _build_health_meta():
+    return {
+        "gv_ready": GV_CLIENT is not None,
+        "notify_channel_id": NOTIFY_CHANNEL_ID,
+        "copy_channel_id": COPY_CHANNEL_ID,
+        "pre_notify_channel_id": PRE_NOTIFY_CHANNEL_ID,
+        "allowed_channels": READABLE_CHANNEL_IDS,
+        "ocr_lang": "japan",
+        "tz": "JST(+09:00)",
+    }
 
-# --- ここから差分イメージ ---
-
-# （重複していた） import tempfile, os は上部の1回に統一
-
-# ルート類：OK
 @app.get("/")
 @app.get("/ping")
 @app.get("/ping/")
 async def root():
-    return JSONResponse(content={"status": "ok", "meta": meta})  # ← content=
+    return JSONResponse(content={"status": "ok", "meta": _build_health_meta()})
 
 # フォーム用の GET をちゃんとルーティング
 @app.get("/form", response_class=HTMLResponse)
