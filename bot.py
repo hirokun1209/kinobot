@@ -1766,18 +1766,17 @@ async def reset_all(message):
 # =======================
 @client.event
 async def on_ready():
-    print("✅ ログイン成功！")
+    global DISCORD_LOOP
+    DISCORD_LOOP = asyncio.get_running_loop()  # Discordのイベントループを記録
+
+    print("✅ Discord ログイン成功！")
     print(f"📌 通知チャンネル: {NOTIFY_CHANNEL_ID}")
     print(f"📌 読み取り許可チャンネル: {READABLE_CHANNEL_IDS}")
-    asyncio.create_task(daily_reset_task())      # ✅ 自動リセット
-    asyncio.create_task(periodic_cleanup_task()) # ✅ 過去予定の削除
-    asyncio.create_task(process_copy_queue())    # ✅ コピーキュー処理
 
-@client.event
-async def on_ready():
-    global DISCORD_LOOP
-    DISCORD_LOOP = asyncio.get_running_loop()  # ← Discordのループを記録
-    print("✅ Discord ログイン成功！")
+    # 起動時にバックグラウンドタスクを立ち上げる
+    asyncio.create_task(daily_reset_task())      # 自動リセット（毎日02:00）
+    asyncio.create_task(periodic_cleanup_task()) # 過去予定の定期削除（1分おき）
+    asyncio.create_task(process_copy_queue())    # コピーキュー処理
 
 async def auto_dedup():
     seen = {}
