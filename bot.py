@@ -207,7 +207,7 @@ COPY_CHANNEL_ID = int(os.getenv("COPY_CHANNEL_ID", "0"))
 PRE_NOTIFY_CHANNEL_ID = int(os.getenv("PRE_NOTIFY_CHANNEL_ID", "0"))
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
-
+DISCORD_LOOP = None
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -594,15 +594,16 @@ def notify_discord_upload_meta_threadsafe(filename: str, meta: dict):
     FastAPI（別スレッド）→ Discord のイベントループへ安全に投げ込む。
     """
     try:
-        fut = asyncio.run_coroutine_threadsafe(
+        loop = DISCORD_LOOP  # ← on_ready で保存したループを使う
+        if loop is None:
+            print("[notify_threadsafe] Discord loop not ready; skip")
+            return
+        asyncio.run_coroutine_threadsafe(
             _notify_discord_upload_meta(filename, meta),
-            client.loop  # Discord 側のイベントループで実行させる
+            loop
         )
-        # 投げっぱなしでもOK。結果を待ちたいならコメントアウト外す。
-        # fut.result(timeout=5)
-    except Exception:
-        # ここでログに流したければ print 等に置き換え
-        pass
+    except Exception as e:
+        print(f"[notify_threadsafe] failed: {e}")
 
 async def upsert_copy_channel_sorted(new_entries: list[tuple[datetime, str]]):
     """
@@ -1771,6 +1772,12 @@ async def on_ready():
     asyncio.create_task(daily_reset_task())      # ✅ 自動リセット
     asyncio.create_task(periodic_cleanup_task()) # ✅ 過去予定の削除
     asyncio.create_task(process_copy_queue())    # ✅ コピーキュー処理
+
+@client.event
+async def on_ready():
+    global DISCORD_LOOP
+    DISCORD_LOOP = asyncio.get_running_loop()  # ← Discordのループを記録
+    print("✅ Discord ログイン成功！")
 
 async def auto_dedup():
     seen = {}
