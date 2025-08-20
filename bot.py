@@ -6,23 +6,17 @@ import cv2
 import re
 import asyncio
 import numpy as np
-from fastapi.responses import JSONResponse
-from fastapi.responses import HTMLResponse, JSONResponse
 from paddleocr import PaddleOCR
 from datetime import datetime, timedelta, timezone, time
 from PIL import Image
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.responses import HTMLResponse, JSONResponse  # ← ここでまとめて import
 import uvicorn
-# 追加 import
-from fastapi import UploadFile, File, BackgroundTasks
 import struct
-# === ここを bot.py 冒頭の import 群のあとに追記 ===
 import json
 from google.cloud import vision
 from google.oauth2 import service_account
 from pathlib import Path
-
-# === EXIF 日時取得ヘルパー ===
 from PIL.ExifTags import TAGS
 
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
@@ -234,7 +228,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 @app.get("/ping")
 @app.get("/ping/")
 async def root():
-    return JSONResponse(content={"status": "ok"})
+    return JSONResponse(content={"status": "ok", "meta": meta})  # ← content=
 
 # フォーム用の GET をちゃんとルーティング
 @app.get("/form", response_class=HTMLResponse)
