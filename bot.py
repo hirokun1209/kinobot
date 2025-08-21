@@ -973,7 +973,7 @@ def _ocr_clock_topright_to_jst(img_bytes: bytes) -> tuple[datetime|None, str]:
 # 正規表現（そのまま流用）
 IMSEN_RE = re.compile(r"免戦中")
 
-def oct_center_paddle(center_bgr: np.ndarray) -> list[str]:
+def ocr_center_paddle(center_bgr: np.ndarray) -> list[str]:
     """中央領域をPaddleOCRだけで読む（前処理つき）"""
     candidates = preprocess_for_colon(center_bgr)
     results = []
@@ -1650,15 +1650,17 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str):
     top_txts_ocr = extract_text_from_image(top)
     center_txts  = ocr_center_with_fallback(center)
 
-    # ★ 基準時刻：メタ優先 → 無ければ右上OCR（共通関数）
-    base_time, base_kind = choose_base_time(img_bytes)  # -> ("HH:MM:SS"|None, "meta"|"ocr"|"none")
+    # ★ 基準時刻：メタ優先 → 無ければ右上OCR
+    base_time, base_kind = choose_base_time(img_bytes)
 
-    # ★ 予定抽出：決めた基準時刻を明示的に注入
+    # 予定抽出（基準を明示注入）
     parsed = parse_multiple_places(center_txts, top_txts_ocr, base_time_override=base_time)
 
-    # ★ 登録処理（Discord 添付と同等）
+    # ここから追加 -----
     grouped_results = []
     structured_entries_for_this_image = []
+    image_results = []
+
     for dt, txt, raw in parsed:
         g = parse_txt_fields(txt)
         if g:
@@ -1672,30 +1674,27 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str):
 
         if txt not in pending_places:
             pending_places[txt] = {
-                "dt": dt,
-                "txt": txt,
-                "server": "",
+                "dt": dt, "txt": txt, "server": "",
                 "created_at": now_jst(),
-                "main_msg_id": None,
-                "copy_msg_id": None,
+                "main_msg_id": None, "copy_msg_id": None,
             }
             await auto_dedup()
             pending_copy_queue.append((dt, txt))
-            grouped_results.append(f"{txt} ({raw})")
+            image_results.append(f"{txt} ({raw})")
 
-            # 通知/まとめ
             task = asyncio.create_task(handle_new_event(dt, txt, ch))
             active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
             if txt.startswith("奪取"):
                 task2 = asyncio.create_task(schedule_notification(dt, txt, ch))
                 active_tasks.add(task2); task2.add_done_callback(lambda t: active_tasks.discard(t))
 
-    # !g 用のグループ採番
     if structured_entries_for_this_image:
         global last_groups_seq, last_groups
         last_groups_seq += 1
-        last_groups[last_groups_seq] = structured_entries_for_this_image
-
+        gid = last_groups_seq
+        last_groups[gid] = structured_entries_for_this_image
+        if image_results:
+            grouped_results.append((gid, f"{base_time or '??:??:??'} ({'メタ' if base_kind=='meta' else 'OCR' if base_kind=='ocr' else '未取得'})", image_results))
     # 表示ラベル
     base_label = f"{(base_time or '??:??:??')} ({'メタ' if base_kind=='meta' else 'OCR' if base_kind=='ocr' else '未取得'})"
 
