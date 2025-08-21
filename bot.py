@@ -1630,137 +1630,136 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id
     if not ch:
         return
 
-    # ★ まず「解析中…」を送信
-    status = await ch.send(f"🔄 解析中… `{filename}`")
+    # 解析中プレースホルダー
+    status_msg = await ch.send(f"🔄 解析中… `{filename}`")
 
     try:
+        # ---- 画像前処理 ----
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        np_img, _ = auto_mask_ime(np_img)  # 「免戦中」直下を黒塗り
 
-async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id: int):
-    await client.wait_until_ready()
-    ch = client.get_channel(channel_id)
-    if not ch:
-        return
+        # トリム
+        top = crop_top_right(np_img)        # 画面内時計エリア
+        center = crop_center_area(np_img)   # 本文エリア
 
-    # ---- 画像前処理 ----
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    np_img, _ = auto_mask_ime(np_img)  # 「免戦中」直下を黒塗り
+        # OCR（中央は Paddle→弱ければGV に自動フォールバック）
+        top_txts_ocr = extract_text_from_image(top)      # 右上時計（Paddle）
+        center_txts  = ocr_center_with_fallback(center)  # 中央（Paddle/GV）
 
-    # トリム
-    top = crop_top_right(np_img)        # 画面内時計エリア
-    center = crop_center_area(np_img)   # 本文エリア
+        # 基準時刻（メタ優先 → OCR → 無し）
+        base_time, base_kind = choose_base_time(img_bytes)  # ("HH:MM:SS"|None, "meta"|"ocr"|"none")
+        parsed = parse_multiple_places(center_txts, top_txts_ocr, base_time_override=base_time)
 
-    # OCR（中央は Paddle→弱ければGV に自動フォールバック）
-    top_txts_ocr = extract_text_from_image(top)      # 右上時計（Paddle）
-    center_txts  = ocr_center_with_fallback(center)  # 中央（Paddle/GV）
+        # ---- 登録処理 & !g 用グループ構築 ----
+        image_results = []
+        structured_entries_for_this_image = []
+        for dt, txt, raw in parsed:
+            g = parse_txt_fields(txt)
+            if g:
+                _mode, _server, _place, _ = g
+                structured_entries_for_this_image.append({
+                    "mode": _mode, "server": _server, "place": _place,
+                    "dt": dt, "txt": txt,
+                    "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
+                    "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
+                })
 
-    # 基準時刻（メタ優先 → OCR → 無し）
-    base_time, base_kind = choose_base_time(img_bytes)  # ("HH:MM:SS"|None, "meta"|"ocr"|"none")
-    parsed = parse_multiple_places(center_txts, top_txts_ocr, base_time_override=base_time)
+            if txt not in pending_places:
+                pending_places[txt] = {
+                    "dt": dt,
+                    "txt": txt,
+                    "server": "",
+                    "created_at": now_jst(),
+                    "main_msg_id": None,
+                    "copy_msg_id": None,
+                }
+                await auto_dedup()
+                pending_copy_queue.append((dt, txt))
+                image_results.append(f"{txt} ({raw})")
 
-    # ---- 登録処理 & !g 用グループ構築 ----
-    image_results = []
-    structured_entries_for_this_image = []
-    for dt, txt, raw in parsed:
-        g = parse_txt_fields(txt)
-        if g:
-            _mode, _server, _place, _ = g
-            structured_entries_for_this_image.append({
-                "mode": _mode, "server": _server, "place": _place,
-                "dt": dt, "txt": txt,
-                "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
-                "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
-            })
+                # 通知まとめ・事前通知のスケジュール
+                task = asyncio.create_task(handle_new_event(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
+                active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
+                if txt.startswith("奪取"):
+                    t2 = asyncio.create_task(schedule_notification(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
+                    active_tasks.add(t2); t2.add_done_callback(lambda t: active_tasks.discard(t))
 
-        if txt not in pending_places:
-            pending_places[txt] = {
-                "dt": dt,
-                "txt": txt,
-                "server": "",
-                "created_at": now_jst(),
-                "main_msg_id": None,
-                "copy_msg_id": None,
-            }
-            await auto_dedup()
-            pending_copy_queue.append((dt, txt))
-            image_results.append(f"{txt} ({raw})")
+        # !g グループ採番
+        gid = None
+        if structured_entries_for_this_image:
+            global last_groups_seq, last_groups
+            last_groups_seq += 1
+            gid = last_groups_seq
+            last_groups[gid] = structured_entries_for_this_image
 
-            # 通知まとめ・事前通知のスケジュール
-            task = asyncio.create_task(handle_new_event(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
-            active_tasks.add(task)
-            task.add_done_callback(lambda t: active_tasks.discard(t))
-            if txt.startswith("奪取"):
-                t2 = asyncio.create_task(schedule_notification(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
-                active_tasks.add(t2)
-                t2.add_done_callback(lambda t: active_tasks.discard(t))
+        # ---- 綺麗なEmbedで通知 ----
+        color_ok   = 0x2ECC71
+        color_none = 0x95A5A6
 
-    # !g グループ採番
-    gid = None
-    if structured_entries_for_this_image:
-        global last_groups_seq, last_groups
-        last_groups_seq += 1
-        gid = last_groups_seq
-        last_groups[gid] = structured_entries_for_this_image
+        kind_label = {"meta": "メタ", "ocr": "OCR", "none": "未取得"}[base_kind]
+        base_label = (base_time or "??:??:??") + f"（{kind_label}）"
 
-    # ---- 綺麗なEmbedで通知 ----
-    # 色：成功=グリーン、空=グレー
-    color_ok   = 0x2ECC71
-    color_none = 0x95A5A6
+        if image_results:
+            emb = discord.Embed(
+                title="✅ 解析完了（フォーム）",
+                description=f"`{filename}`",
+                color=color_ok
+            )
+            if gid is not None:
+                emb.add_field(name="グループ", value=f"G{gid}", inline=True)
+            emb.add_field(name="基準時間", value=base_label, inline=True)
 
-    # 基準時間のラベル
-    kind_label = {"meta": "メタ", "ocr": "OCR", "none": "未取得"}[base_kind]
-    base_label = (base_time or "??:??:??") + f"（{kind_label}）"
-
-    if image_results:
-        emb = discord.Embed(
-            title="✅ 解析完了（フォーム）",
-            description=f"`{filename}`",
-            color=color_ok
-        )
-        if gid is not None:
-            emb.add_field(name="グループ", value=f"G{gid}", inline=True)
-        emb.add_field(name="基準時間", value=base_label, inline=True)
-
-        # 予定一覧（最大1024文字制限に配慮して適度にまとめる）
-        joined = "\n".join(f"・{t}" for t in image_results)
-        if len(joined) > 1024:
-            # 長すぎる場合は分割
-            chunk = []
-            cur = ""
-            for line in image_results:
-                line = f"・{line}"
-                if len(cur) + 1 + len(line) > 1000:
+            # 予定一覧（最大1024文字対策して分割）
+            joined = "\n".join(f"・{t}" for t in image_results)
+            if len(joined) > 1024:
+                chunk = []
+                cur = ""
+                for line in image_results:
+                    line = f"・{line}"
+                    if len(cur) + 1 + len(line) > 1000:
+                        chunk.append(cur)
+                        cur = line
+                    else:
+                        cur = (cur + "\n" + line) if cur else line
+                if cur:
                     chunk.append(cur)
-                    cur = line
-                else:
-                    cur = (cur + "\n" + line) if cur else line
-            if cur:
-                chunk.append(cur)
-            # 最初のチャンクをフィールドに、残りは追記
-            for i, c in enumerate(chunk):
-                title = "登録された予定" if i == 0 else f"登録された予定（続き {i}）"
-                emb.add_field(name=title, value=c, inline=False)
+                for i, c in enumerate(chunk):
+                    title = "登録された予定" if i == 0 else f"登録された予定（続き {i}）"
+                    emb.add_field(name=title, value=c, inline=False)
+            else:
+                emb.add_field(name="登録された予定", value=joined, inline=False)
+
+            emb.add_field(
+                name="ヒント",
+                value="`!g <grp>` で±秒の微調整 / `!a` で時刻を直接修正\n"
+                      "実際の時間と違う場合はスクショを撮り直して再送してね",
+                inline=False
+            )
+            emb.set_footer(text="OCR: Paddle + GV fallback（免戦中は自動黒塗り）")
+
+            await ch.send(embed=emb)
         else:
-            emb.add_field(name="登録された予定", value=joined, inline=False)
+            emb = discord.Embed(
+                title="⚠️ 解析は完了しましたが新規登録はありませんでした",
+                description=f"`{filename}`\n基準時間: {base_label}",
+                color=color_none
+            )
+            emb.set_footer(text="OCR: Paddle + GV fallback（免戦中は自動黒塗り）")
+            await ch.send(embed=emb)
 
-        emb.add_field(
-            name="ヒント",
-            value="`!g <grp>` で±秒の微調整 / `!a` で時刻を直接修正\n"
-                  "実際の時間と違う場合はスクショを撮り直して再送してね",
-            inline=False
-        )
-        emb.set_footer(text="OCR: Paddle + GV fallback（免戦中は自動黒塗り）")
+        # 解析中メッセージは消す
+        try:
+            await status_msg.delete()
+        except:
+            pass
 
-        await ch.send(embed=emb)
-
-    else:
-        emb = discord.Embed(
-            title="⚠️ 解析は完了しましたが新規登録はありませんでした",
-            description=f"`{filename}`\n基準時間: {base_label}",
-            color=color_none
-        )
-        emb.set_footer(text="OCR: Paddle + GV fallback（免戦中は自動黒塗り）")
-        await ch.send(embed=emb)
+    except Exception as e:
+        # 失敗したらプレースホルダーをエラーメッセに置換
+        try:
+            await status_msg.edit(content=f"❌ 解析失敗 `{filename}`: {e}")
+        except:
+            pass
 
 
 def register_from_bytes_threadsafe(img_bytes: bytes, filename: str, channel_id: int):
