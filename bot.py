@@ -427,6 +427,19 @@ def parse_txt_fields(txt: str):
     m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
     return m.groups() if m else None
 
+def choose_base_time(img_bytes: bytes) -> tuple[str|None, str]:
+    """
+    戻り値: (HH:MM:SS または None, "meta"|"ocr"|"none")
+    メタ(EXIF/PNG/XMP)が取れなければ右上OCRにフォールバック。
+    """
+    dt_meta, _how, _raw = get_taken_time_from_image_bytes(img_bytes)
+    if dt_meta:
+        return dt_meta.strftime("%H:%M:%S"), "meta"
+    dt_ocr, _raw_ocr = _ocr_clock_topright_to_jst(img_bytes)
+    if dt_ocr:
+        return dt_ocr.strftime("%H:%M:%S"), "ocr"
+    return None, "none"
+
 async def ping_google_vision() -> tuple[bool, str]:
     """
     Visionクライアントの有無と、実際に tiny 画像で text_detection を叩いてみた結果を返す。
@@ -506,6 +519,8 @@ def redact_right_of_boxes(bgr: np.ndarray, boxes: list[tuple[int,int,int,int]], 
         y2 = min(H, y + h + pad)
         cv2.rectangle(out, (x1,y1), (x2,y2), (0,0,0), -1)
     return out
+
+
 
 # ===== 「免戦中」の直下を右端まで黒塗りするヘルパー =====
 # チューニング用の係数（必要に応じて微調整）
@@ -1071,10 +1086,9 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
                 durations.append(correct_imsen_text(m))
     return durations
 
-def parse_multiple_places(center_texts, top_time_texts):
+def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|None = None):
     res = []
 
-    # 上部時間の抽出（補正後）
     def extract_top_time(txts):
         for t in txts:
             if re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
@@ -1086,7 +1100,9 @@ def parse_multiple_places(center_texts, top_time_texts):
                 return f"{int(h):02}:{int(m):02}:{int(s):02}"
         return None
 
-    top_time = extract_top_time(top_time_texts)
+    # ★ 追加: メタ優先の上書き
+    top_time = base_time_override or extract_top_time(top_time_texts)
+
     server = extract_server_number(center_texts)
     if not top_time or not server:
         return []
