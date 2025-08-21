@@ -222,6 +222,7 @@ NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
 READABLE_CHANNEL_IDS = [int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip().isdigit()]
 COPY_CHANNEL_ID = int(os.getenv("COPY_CHANNEL_ID", "0"))
 PRE_NOTIFY_CHANNEL_ID = int(os.getenv("PRE_NOTIFY_CHANNEL_ID", "0"))
+FORM_NOTIFY_CHANNEL_ID = int(os.getenv("FORM_NOTIFY_CHANNEL_ID", str(NOTIFY_CHANNEL_ID)))
 if not TOKEN:
     raise ValueError("❌ DISCORD_TOKEN が設定されていません！")
 DISCORD_LOOP = None
@@ -294,12 +295,12 @@ async def upload_image(
 
         # 既存: メタ情報をDiscordに通知
         background.add_task(
-            notify_discord_upload_meta_threadsafe, f.filename, meta
+            notify_discord_upload_meta_threadsafe, f.filename, meta, FORM_NOTIFY_CHANNEL_ID
         )
 
-        # ★追加: フォーム経由もOCR→スケジュール登録（基準=メタ時刻）
+        # 画像もOCR→登録（フォーム経由）
         background.add_task(
-            register_from_bytes_threadsafe, raw, f.filename
+            register_from_bytes_threadsafe, raw, f.filename, FORM_NOTIFY_CHANNEL_ID
         )
 
     return RedirectResponse(url="/form", status_code=303)
@@ -588,9 +589,9 @@ def auto_mask_ime(bgr: np.ndarray) -> tuple[np.ndarray, int]:
         return bgr, 0
     return fill_rects_black(bgr, rects), len(rects)
 
-async def _notify_discord_upload_meta(filename: str, meta: dict):
+async def _notify_discord_upload_meta(filename: str, meta: dict, channel_id: int):
     await client.wait_until_ready()
-    ch = client.get_channel(NOTIFY_CHANNEL_ID)
+    ch = client.get_channel(channel_id)   # ← 渡されたチャンネルへ
     if not ch:
         return
     lines = [f"🗂 **アップロード解析** `{filename}`", ""]
@@ -626,17 +627,14 @@ async def _notify_discord_upload_meta(filename: str, meta: dict):
 
     await ch.send("\n".join(lines))
 
-def notify_discord_upload_meta_threadsafe(filename: str, meta: dict):
-    """
-    FastAPI（別スレッド）→ Discord のイベントループへ安全に投げ込む。
-    """
+def notify_discord_upload_meta_threadsafe(filename: str, meta: dict, channel_id: int):
     try:
-        loop = DISCORD_LOOP  # ← on_ready で保存したループを使う
+        loop = DISCORD_LOOP
         if loop is None:
             print("[notify_threadsafe] Discord loop not ready; skip")
             return
         asyncio.run_coroutine_threadsafe(
-            _notify_discord_upload_meta(filename, meta),
+            _notify_discord_upload_meta(filename, meta, channel_id),
             loop
         )
     except Exception as e:
@@ -1626,14 +1624,9 @@ async def process_copy_queue():
             await upsert_copy_channel_sorted(batch)
         await asyncio.sleep(2)   # ポーリング間隔を短く
 
-async def _register_from_image_bytes(img_bytes: bytes, filename: str):
-    """
-    フォームから送られた画像1枚を解析して pending_places へ登録。
-    基準時間はメタ優先、無ければ右上OCRにフォールバック。
-    Discordの通知チャンネルへも結果をポスト。
-    """
+async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id: int):
     await client.wait_until_ready()
-    ch = client.get_channel(NOTIFY_CHANNEL_ID)
+    ch = client.get_channel(channel_id)   # ← 渡されたチャンネルへ
     if not ch:
         return
 
@@ -2690,8 +2683,8 @@ async def on_message(message):
             # トリミング & OCR
             top = crop_top_right(np_img)
             center = crop_center_area(np_img)
-            top_txts = extract_text_from_image(top)
-            center_txts = ocr_center_with_fallback(center)
+            top_txts_ocr = extract_text_from_image_google(top)   # ← ここをGV固定に
+            center_txts   = ocr_center_google(center)            # ← ここもGV固定に
 
             # ★ 基準時刻：メタ優先
             meta_base = base_time_from_metadata(b)  # -> "HH:MM:SS" or None
