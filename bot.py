@@ -1646,21 +1646,57 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str):
     top = crop_top_right(np_img)        # フォールバック用（画面内時計）
     center = crop_center_area(np_img)   # 本文
 
-    # OCR
-    top_txts_ocr = extract_text_from_image(top)  # 右上時計（Paddle）
-    center_txts = ocr_center_with_fallback(center)
-
-    # OCR（既存維持）
-    top_txts_ocr = extract_text_from_image(top)  # 右上時計（Paddle）
+    # OCR（重複呼び出しは削除）
+    top_txts_ocr = extract_text_from_image(top)
     center_txts  = ocr_center_with_fallback(center)
 
     # ★ 基準時刻：メタ優先 → 無ければ右上OCR（共通関数）
     base_time, base_kind = choose_base_time(img_bytes)  # -> ("HH:MM:SS"|None, "meta"|"ocr"|"none")
 
-    # ★ 予定抽出：決めた基準時刻を明示的に注入（top側はそのまま渡してOK）
+    # ★ 予定抽出：決めた基準時刻を明示的に注入
     parsed = parse_multiple_places(center_txts, top_txts_ocr, base_time_override=base_time)
 
-    # 表示ラベル（メタ/OCR/未取得 を明示）
+    # ★ 登録処理（Discord 添付と同等）
+    grouped_results = []
+    structured_entries_for_this_image = []
+    for dt, txt, raw in parsed:
+        g = parse_txt_fields(txt)
+        if g:
+            _mode, _server, _place, _ = g
+            structured_entries_for_this_image.append({
+                "mode": _mode, "server": _server, "place": _place,
+                "dt": dt, "txt": txt,
+                "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
+                "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
+            })
+
+        if txt not in pending_places:
+            pending_places[txt] = {
+                "dt": dt,
+                "txt": txt,
+                "server": "",
+                "created_at": now_jst(),
+                "main_msg_id": None,
+                "copy_msg_id": None,
+            }
+            await auto_dedup()
+            pending_copy_queue.append((dt, txt))
+            grouped_results.append(f"{txt} ({raw})")
+
+            # 通知/まとめ
+            task = asyncio.create_task(handle_new_event(dt, txt, ch))
+            active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
+            if txt.startswith("奪取"):
+                task2 = asyncio.create_task(schedule_notification(dt, txt, ch))
+                active_tasks.add(task2); task2.add_done_callback(lambda t: active_tasks.discard(t))
+
+    # !g 用のグループ採番
+    if structured_entries_for_this_image:
+        global last_groups_seq, last_groups
+        last_groups_seq += 1
+        last_groups[last_groups_seq] = structured_entries_for_this_image
+
+    # 表示ラベル
     base_label = f"{(base_time or '??:??:??')} ({'メタ' if base_kind=='meta' else 'OCR' if base_kind=='ocr' else '未取得'})"
 
     # Discordへ結果ポスト
@@ -1670,8 +1706,7 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str):
             f"🖼 `{filename}`",
             f"📸 基準時間: {base_label}",
             "",
-        ]
-        lines += [f"・{t}" for t in grouped_results]
+        ] + [f"・{t}" for t in grouped_results]
         await ch.send("\n".join(lines))
     else:
         await ch.send(f"⚠️ 解析しましたが新規登録はありませんでした: `{filename}`")
@@ -2640,110 +2675,110 @@ async def on_message(message):
             await upsert_copy_channel_sorted(entries_to_copy)
         return
 
-# ==== 通常画像送信 ====
-if message.attachments:
-    status = await message.channel.send("🔄解析中…")
-    grouped_results = []
+    # ==== 通常画像送信 ====
+    if message.attachments:
+        status = await message.channel.send("🔄解析中…")
+        grouped_results = []
 
-    for a in message.attachments:
-        structured_entries_for_this_image = []  # ← !g用
-        b = await a.read()
-        img = Image.open(io.BytesIO(b)).convert("RGB")
-        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        # OCR前に「免戦中」直下を黒塗り
-        np_img, _ = auto_mask_ime(np_img)
+        for a in message.attachments:
+            structured_entries_for_this_image = []  # ← !g用
+            b = await a.read()
+            img = Image.open(io.BytesIO(b)).convert("RGB")
+            np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            # OCR前に「免戦中」直下を黒塗り
+            np_img, _ = auto_mask_ime(np_img)
 
-        # トリミング & OCR
-        top = crop_top_right(np_img)
-        center = crop_center_area(np_img)
-        top_txts = extract_text_from_image(top)
-        center_txts = ocr_center_with_fallback(center)
+            # トリミング & OCR
+            top = crop_top_right(np_img)
+            center = crop_center_area(np_img)
+            top_txts = extract_text_from_image(top)
+            center_txts = ocr_center_with_fallback(center)
 
-        # ★ 基準時刻：メタ優先
-        meta_base = base_time_from_metadata(b)  # -> "HH:MM:SS" or None
-        if meta_base:
-            base_time = meta_base
-            parsed = parse_multiple_places(center_txts, [meta_base])
-            base_annot = "(meta)"
+            # ★ 基準時刻：メタ優先
+            meta_base = base_time_from_metadata(b)  # -> "HH:MM:SS" or None
+            if meta_base:
+                base_time = meta_base
+                parsed = parse_multiple_places(center_txts, top_txts, base_time_override=base_time)
+                base_annot = "(meta)"
+            else:
+                # 右上OCRの先頭行から HH:MM:SS を復元（フォールバック）
+                def _extract_and_correct_base_time(txts):
+                    if not txts: return "??:??:??"
+                    raw = normalize_time_separators(txts[0].strip())
+                    raw = force_hhmmss_if_six_digits(raw)
+                    m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
+                    if m:
+                        h, mi, se = map(int, m.groups())
+                        if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
+                            return f"{h:02}:{mi:02}:{se:02}"
+                    digits = re.sub(r"\D","", raw)
+                    if len(digits) == 4:
+                        m_, s_ = int(digits[:2]), int(digits[2:])
+                        if 0 <= m_ < 60 and 0 <= s_ < 60:
+                            return f"00:{m_:02}:{s_:02}"
+                    return "??:??:??"
+
+                base_time = _extract_and_correct_base_time(top_txts)
+                parsed = parse_multiple_places(center_txts, top_txts)
+                base_annot = "(ocr)"
+
+            image_results = []
+            for dt, txt, raw in parsed:
+                g = parse_txt_fields(txt)
+                if g:
+                    _mode, _server, _place, _ = g
+                    structured_entries_for_this_image.append({
+                        "mode": _mode, "server": _server, "place": _place,
+                        "dt": dt, "txt": txt,
+                        "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
+                        "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
+                    })
+                if txt not in pending_places:
+                    pending_places[txt] = {
+                        "dt": dt,
+                        "txt": txt,
+                        "server": "",
+                        "created_at": now_jst(),
+                        "main_msg_id": None,
+                        "copy_msg_id": None,
+                    }
+                    # ✅ 自動重複除去（同じサーバー・駐騎場で後の時刻を削除）
+                    await auto_dedup()
+                    pending_copy_queue.append((dt, txt))
+                    display_txt = f"{txt} ({raw})"
+                    image_results.append(display_txt)
+
+                    task = asyncio.create_task(handle_new_event(dt, txt, channel))
+                    active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
+                    if txt.startswith("奪取"):
+                        task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
+                        active_tasks.add(task2); task2.add_done_callback(lambda t: active_tasks.discard(t))
+
+            if structured_entries_for_this_image:
+                last_groups_seq += 1
+                gid = last_groups_seq
+                last_groups[gid] = structured_entries_for_this_image
+                if image_results:
+                    # 注記を表示に反映
+                    grouped_results.append((gid, f"{base_time} {base_annot}", image_results))
+
+        if grouped_results:
+            lines = [
+                "✅ 解析完了！登録されました",
+                "",
+                "🖼 実際の時間と異なる場合は、スクリーンショットを撮り直して再送信してください  ",
+                "⏱ 1秒程度のズレなら、🔧 `!g` コマンドで修正できます  ",
+                "🛠 大幅なズレは、`!a` コマンドで修正してください",
+                "",
+            ]
+            for gid, base_time_str, txts in grouped_results:
+                lines.append(f"📸 [G{gid} | 基準時間: {base_time_str}]")
+                lines += [f"・{txt}" for txt in txts]
+                lines.append("")
+            await status.edit(content="\n".join(lines))
         else:
-            # 右上OCRの先頭行から HH:MM:SS を復元（フォールバック）
-            def _extract_and_correct_base_time(txts):
-                if not txts: return "??:??:??"
-                raw = normalize_time_separators(txts[0].strip())
-                raw = force_hhmmss_if_six_digits(raw)
-                m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
-                if m:
-                    h, mi, se = map(int, m.groups())
-                    if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
-                        return f"{h:02}:{mi:02}:{se:02}"
-                digits = re.sub(r"\D","", raw)
-                if len(digits) == 4:
-                    m_, s_ = int(digits[:2]), int(digits[2:])
-                    if 0 <= m_ < 60 and 0 <= s_ < 60:
-                        return f"00:{m_:02}:{s_:02}"
-                return "??:??:??"
-
-            base_time = _extract_and_correct_base_time(top_txts)
-            parsed = parse_multiple_places(center_txts, top_txts)
-            base_annot = "(ocr)"
-
-        image_results = []
-        for dt, txt, raw in parsed:
-            g = parse_txt_fields(txt)
-            if g:
-                _mode, _server, _place, _ = g
-                structured_entries_for_this_image.append({
-                    "mode": _mode, "server": _server, "place": _place,
-                    "dt": dt, "txt": txt,
-                    "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
-                    "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
-                })
-            if txt not in pending_places:
-                pending_places[txt] = {
-                    "dt": dt,
-                    "txt": txt,
-                    "server": "",
-                    "created_at": now_jst(),
-                    "main_msg_id": None,
-                    "copy_msg_id": None,
-                }
-                # ✅ 自動重複除去（同じサーバー・駐騎場で後の時刻を削除）
-                await auto_dedup()
-                pending_copy_queue.append((dt, txt))
-                display_txt = f"{txt} ({raw})"
-                image_results.append(display_txt)
-
-                task = asyncio.create_task(handle_new_event(dt, txt, channel))
-                active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
-                if txt.startswith("奪取"):
-                    task2 = asyncio.create_task(schedule_notification(dt, txt, channel))
-                    active_tasks.add(task2); task2.add_done_callback(lambda t: active_tasks.discard(t))
-
-        if structured_entries_for_this_image:
-            last_groups_seq += 1
-            gid = last_groups_seq
-            last_groups[gid] = structured_entries_for_this_image
-            if image_results:
-                # 注記を表示に反映
-                grouped_results.append((gid, f"{base_time} {base_annot}", image_results))
-
-    if grouped_results:
-        lines = [
-            "✅ 解析完了！登録されました",
-            "",
-            "🖼 実際の時間と異なる場合は、スクリーンショットを撮り直して再送信してください  ",
-            "⏱ 1秒程度のズレなら、🔧 `!g` コマンドで修正できます  ",
-            "🛠 大幅なズレは、`!a` コマンドで修正してください",
-            "",
-        ]
-        for gid, base_time_str, txts in grouped_results:
-            lines.append(f"📸 [G{gid} | 基準時間: {base_time_str}]")
-            lines += [f"・{txt}" for txt in txts]
-            lines.append("")
-        await status.edit(content="\n".join(lines))
-    else:
-        await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。")
-    return
+            await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。")
+        return
 
 # =======================
 # 起動
