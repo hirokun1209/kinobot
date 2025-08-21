@@ -617,8 +617,8 @@ async def _notify_discord_upload_meta(filename: str, meta: dict, channel_id: int
         lines.append(f"🧩 PNG tIME: `{meta['png_time']}`")
 
     # XMP
-    if meta.get("xmp_short"):
-        lines.append(f"📝 XMP: {meta['xmp_short']}")
+    #if meta.get("xmp_short"):
+    #    lines.append(f"📝 XMP: {meta['xmp_short']}")
 
     # 総合推定（既存ヘルパの get_taken_time_from_image_bytes）
     if meta.get("taken_guess"):
@@ -1625,13 +1625,17 @@ async def process_copy_queue():
         await asyncio.sleep(2)   # ポーリング間隔を短く
 
 async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id: int):
-    """
-    フォームから送られた画像1枚を解析して pending_places へ登録し、
-    固定チャンネルに“綺麗なEmbed”で通知する。
-    - 基準時間は EXIF/PNGメタ > 右上OCR の優先
-    - 免戦中直下は黒塗り済み
-    - !g 用のグルーピングも維持
-    """
+    await client.wait_until_ready()
+    ch = client.get_channel(channel_id)
+    if not ch:
+        return
+
+    # ★ まず「解析中…」を送信
+    status = await ch.send(f"🔄 解析中… `{filename}`")
+
+    try:
+
+async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id: int):
     await client.wait_until_ready()
     ch = client.get_channel(channel_id)
     if not ch:
@@ -1683,10 +1687,12 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id
 
             # 通知まとめ・事前通知のスケジュール
             task = asyncio.create_task(handle_new_event(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
-            active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
+            active_tasks.add(task)
+            task.add_done_callback(lambda t: active_tasks.discard(t))
             if txt.startswith("奪取"):
                 t2 = asyncio.create_task(schedule_notification(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
-                active_tasks.add(t2); t2.add_done_callback(lambda t: active_tasks.discard(t))
+                active_tasks.add(t2)
+                t2.add_done_callback(lambda t: active_tasks.discard(t))
 
     # !g グループ採番
     gid = None
@@ -1757,15 +1763,14 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id
         await ch.send(embed=emb)
 
 
-def register_from_bytes_threadsafe(img_bytes: bytes, filename: str):
-    """FastAPIスレッド→Discordイベントループへスレッドセーフに投げる"""
+def register_from_bytes_threadsafe(img_bytes: bytes, filename: str, channel_id: int):
     try:
         loop = DISCORD_LOOP
         if loop is None:
             print("[register_threadsafe] Discord loop not ready; skip")
             return
         asyncio.run_coroutine_threadsafe(
-            _register_from_image_bytes(img_bytes, filename),
+            _register_from_image_bytes(img_bytes, filename, channel_id),
             loop
         )
     except Exception as e:
@@ -2724,7 +2729,8 @@ async def on_message(message):
     if message.attachments:
         status = await message.channel.send("🔄解析中…")
         grouped_results = []
-
+        filenames = [att.filename for att in message.attachments]
+        
         for a in message.attachments:
             structured_entries_for_this_image = []  # ← !g用
             b = await a.read()
@@ -2736,14 +2742,14 @@ async def on_message(message):
             # トリミング & OCR
             top = crop_top_right(np_img)
             center = crop_center_area(np_img)
-            top_txts_ocr = extract_text_from_image_google(top)   # ← ここをGV固定に
-            center_txts   = ocr_center_google(center)            # ← ここもGV固定に
+            top_txts_ocr = extract_text_from_image(top)          # まず Paddle
+            center_txts  = ocr_center_with_fallback(center)      # Paddle→GV
 
             # ★ 基準時刻：メタ優先
             meta_base = base_time_from_metadata(b)  # -> "HH:MM:SS" or None
             if meta_base:
                 base_time = meta_base
-                parsed = parse_multiple_places(center_txts, top_txts, base_time_override=base_time)
+                parsed = parse_multiple_places(center_txts, top_txts_ocr, base_time_override=base_time)
                 base_annot = "(meta)"
             else:
                 # 右上OCRの先頭行から HH:MM:SS を復元（フォールバック）
@@ -2763,8 +2769,8 @@ async def on_message(message):
                             return f"00:{m_:02}:{s_:02}"
                     return "??:??:??"
 
-                base_time = _extract_and_correct_base_time(top_txts)
-                parsed = parse_multiple_places(center_txts, top_txts)
+                base_time = _extract_and_correct_base_time(top_txts_ocr)
+                parsed = parse_multiple_places(center_txts, top_txts_ocr)
                 base_annot = "(ocr)"
 
             image_results = []
@@ -2809,11 +2815,11 @@ async def on_message(message):
 
         if grouped_results:
             lines = [
-                "✅ 解析完了！登録されました",
+                f"✅ 解析完了！ `{filename}` 登録されました",
                 "",
-                "🖼 実際の時間と異なる場合は、スクリーンショットを撮り直して再送信してください  ",
-                "⏱ 1秒程度のズレなら、🔧 `!g` コマンドで修正できます  ",
-                "🛠 大幅なズレは、`!a` コマンドで修正してください",
+                "🖼 実際の時間と異なる場合はスクショを撮り直してください",
+                "⏱ 1秒程度のズレは 🔧 `!g` で修正可能",
+                "🛠 大幅なズレは `!a` で修正してください",
                 "",
             ]
             for gid, base_time_str, txts in grouped_results:
@@ -2821,9 +2827,6 @@ async def on_message(message):
                 lines += [f"・{txt}" for txt in txts]
                 lines.append("")
             await status.edit(content="\n".join(lines))
-        else:
-            await status.edit(content="⚠️ 解析完了しましたが、新しい予定は見つかりませんでした。")
-        return
 
 # =======================
 # 起動
