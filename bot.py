@@ -110,6 +110,23 @@ def get_taken_time_from_image_bytes(img_bytes: bytes) -> tuple[datetime|None, st
 
     return None, "meta:none", ""
 
+def base_time_from_metadata(img_bytes: bytes) -> str | None:
+    """
+    EXIF/PNGなどのメタ日時から、時刻部だけを HH:MM:SS で返す。
+    取れないときは None。
+    """
+    dt, _how, _raw = get_taken_time_from_image_bytes(img_bytes)
+    if dt:
+        return dt.strftime("%H:%M:%S")
+
+    # PNG tIME の素フォールバック（文字列から時刻部だけ抜く）
+    t = _extract_png_time(img_bytes)
+    if t:
+        m = re.search(r"\b(\d{2}:\d{2}:\d{2})\b", t)
+        if m:
+            return m.group(1)
+    return None
+
 def _extract_png_time(raw: bytes) -> str | None:
     """
     PNGの tIME チャンク（作成/更新時刻）を生バイトから直接読む。
@@ -258,9 +275,8 @@ from fastapi.responses import RedirectResponse
 @app.post("/upload")
 async def upload_image(
     background: BackgroundTasks,
-    files: List[UploadFile] = File(...),   # ← 複数受け取りに変更（name="files" と一致）
+    files: List[UploadFile] = File(...),
 ):
-    # 各画像を非同期タスクでDiscord通知（解析はここで、送信はBGタスク）
     for f in files:
         raw = await f.read()
 
@@ -276,12 +292,16 @@ async def upload_image(
                 "raw": raw_str
             }
 
-        # Discord通知（バックグラウンド）
+        # 既存: メタ情報をDiscordに通知
         background.add_task(
             notify_discord_upload_meta_threadsafe, f.filename, meta
         )
 
-    # ✅ 即リダイレクト（POST→GET 303）
+        # ★追加: フォーム経由もOCR→スケジュール登録（基準=メタ時刻）
+        background.add_task(
+            register_from_bytes_threadsafe, raw, f.filename
+        )
+
     return RedirectResponse(url="/form", status_code=303)
 
 def run_server():
@@ -1589,6 +1609,130 @@ async def process_copy_queue():
             pending_copy_queue.clear()
             await upsert_copy_channel_sorted(batch)
         await asyncio.sleep(2)   # ポーリング間隔を短く
+
+async def _register_from_image_bytes(img_bytes: bytes, filename: str):
+    """
+    フォームから送られた画像1枚を解析して pending_places へ登録。
+    基準時間はメタ優先、無ければ右上OCRにフォールバック。
+    Discordの通知チャンネルへも結果をポスト。
+    """
+    await client.wait_until_ready()
+    ch = client.get_channel(NOTIFY_CHANNEL_ID)
+    if not ch:
+        return
+
+    # 画像読み込み & 「免戦中」直下の黒塗り
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    np_img, _ = auto_mask_ime(np_img)
+
+    # トリム
+    top = crop_top_right(np_img)        # フォールバック用（画面内時計）
+    center = crop_center_area(np_img)   # 本文
+
+    # OCR
+    top_txts_ocr = extract_text_from_image(top)  # 右上時計（Paddle）
+    center_txts = ocr_center_with_fallback(center)
+
+    # ★ 基準時刻：メタ優先
+    meta_base = base_time_from_metadata(img_bytes)  # -> "HH:MM:SS" or None
+    if meta_base:
+        base_time = meta_base
+        parsed = parse_multiple_places(center_txts, [meta_base])
+        base_annot = "(meta)"
+    else:
+        # 右上OCRの先頭行から HH:MM:SS を復元
+        def _extract_and_correct_base_time(txts):
+            if not txts: return "??:??:??"
+            raw = normalize_time_separators(txts[0].strip())
+            raw = force_hhmmss_if_six_digits(raw)
+            m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
+            if m:
+                h, mi, se = map(int, m.groups()); 
+                if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
+                    return f"{h:02}:{mi:02}:{se:02}"
+            digits = re.sub(r"\D","", raw)
+            if len(digits) == 4:
+                m, s = int(digits[:2]), int(digits[2:])
+                if 0 <= m < 60 and 0 <= s < 60:
+                    return f"00:{m:02}:{s:02}"
+            return "??:??:??"
+
+        base_time = _extract_and_correct_base_time(top_txts_ocr)
+        parsed = parse_multiple_places(center_txts, top_txts_ocr)
+        base_annot = "(ocr)"
+
+    # 登録処理
+    grouped_results = []
+    structured_entries = []
+    for dt, txt, raw in parsed:
+        g = parse_txt_fields(txt)
+        if g:
+            _mode, _server, _place, _ = g
+            structured_entries.append({
+                "mode": _mode, "server": _server, "place": _place,
+                "dt": dt, "txt": txt,
+                "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
+                "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
+            })
+
+        if txt not in pending_places:
+            pending_places[txt] = {
+                "dt": dt,
+                "txt": txt,
+                "server": "",
+                "created_at": now_jst(),
+                "main_msg_id": None,
+                "copy_msg_id": None,
+            }
+            # 同server-placeは早い方を残す
+            await auto_dedup()
+
+            # コピー用チャンネルはキューへ（まとめて同期）
+            pending_copy_queue.append((dt, txt))
+
+            # まとめ＆通知
+            task = asyncio.create_task(handle_new_event(dt, txt, ch))
+            active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
+            if txt.startswith("奪取"):
+                task2 = asyncio.create_task(schedule_notification(dt, txt, ch))
+                active_tasks.add(task2); task2.add_done_callback(lambda t: active_tasks.discard(t))
+
+            grouped_results.append(f"{txt} ({raw})")
+
+    # !g 用にグルーピング採番
+    global last_groups_seq, last_groups
+    if structured_entries:
+        last_groups_seq += 1
+        last_groups[last_groups_seq] = structured_entries
+
+    # Discordへ結果ポスト
+    if grouped_results:
+        lines = [
+            "✅ 解析完了！（フォーム経由）登録しました",
+            f"🖼 `{filename}`",
+            f"📸 基準時間: {base_time} {base_annot}",
+            "",
+        ]
+        lines += [f"・{t}" for t in grouped_results]
+        await ch.send("\n".join(lines))
+    else:
+        await ch.send(f"⚠️ 解析しましたが新規登録はありませんでした: `{filename}`")
+
+
+def register_from_bytes_threadsafe(img_bytes: bytes, filename: str):
+    """FastAPIスレッド→Discordイベントループへスレッドセーフに投げる"""
+    try:
+        loop = DISCORD_LOOP
+        if loop is None:
+            print("[register_threadsafe] Discord loop not ready; skip")
+            return
+        asyncio.run_coroutine_threadsafe(
+            _register_from_image_bytes(img_bytes, filename),
+            loop
+        )
+    except Exception as e:
+        print(f"[register_threadsafe] failed: {e}")
 # =======================
 # 自動リセット処理（毎日02:00）
 # =======================
