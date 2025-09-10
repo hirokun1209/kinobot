@@ -462,48 +462,70 @@ def _bgr_to_png_base64(np_bgr: np.ndarray) -> tuple[str|None, int]:
 
 def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
     """
-    OpenAI (GPT-5 Mini) で画像からテキストを抽出。
-    purpose: "general"（本文） / "clock"（右上の時計）
+    OpenAI (Responses API) でOCR。
+    - 画像は Data URI (image_url) で渡す（image_data は使わない）
+    - 原寸と2xシャープの2パスで試す
+    - gpt-5-mini → gpt-4o-mini にフォールバック
     """
     if OA_CLIENT is None:
         return []
-    b64, _ = _bgr_to_png_base64(np_bgr)
-    if not b64:
-        return []
 
-    model = os.getenv("OPENAI_OCR_MODEL", "gpt-5-mini")
-    if purpose == "clock":
-        user_text = "画像の時計の時刻だけを抽出して、可能なら HH:MM:SS の1行で返して。説明は不要。"
-    else:
-        user_text = ("画像から見える文字を行単位で抽出して返してください。"
-                     "時間は 05:00:15 / 55:12 などコロン区切り。説明は不要。")
+    def _upsample_and_sharpen(img_bgr: np.ndarray) -> np.ndarray:
+        up = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        blur = cv2.GaussianBlur(up, (0, 0), 1.0)
+        return cv2.addWeighted(up, 1.6, blur, -0.6, 0)
 
-    try:
-        res = OA_CLIENT.responses.create(
-            model=model,
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": f"[目的:{purpose}] {user_text}"},
-                    {"type": "input_image", "image_data": b64, "mime_type": "image/png"},
-                ],
-            }],
-        )
-        text = (res.output_text or "").strip()
-        lines = [t.strip() for t in text.splitlines() if t.strip()]
+    def _bgr_to_data_uri(img_bgr: np.ndarray) -> str | None:
+        ok, buf = cv2.imencode(".png", img_bgr)
+        if not ok:
+            return None
+        b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        return f"data:image/png;base64,{b64}"
 
-        # 既存の補正で整形
-        out, seen = [], set()
-        for t in lines:
-            t2 = normalize_time_separators(t)
-            t2 = force_hhmmss_if_six_digits(t2)
-            if t2 and t2 not in seen:
-                seen.add(t2)
-                out.append(t2)
-        return out
-    except Exception as e:
-        print(f"[OpenAI OCR] error: {e}")
-        return []
+    model_chain = [os.getenv("OPENAI_OCR_MODEL", "gpt-5-mini"), "gpt-4o-mini"]
+    variants = [np_bgr, _upsample_and_sharpen(np_bgr)]
+
+    user_text = (
+        "画像から見える文字を行単位で抽出して返してください。"
+        "時間は 05:00:15 / 55:12 のようにコロン区切り。説明は不要。"
+        if purpose != "clock"
+        else "画像の時計の時刻だけを抽出。可能なら HH:MM:SS を1行で返して。説明は不要。"
+    )
+
+    outputs: list[str] = []
+
+    for var in variants:
+        data_uri = _bgr_to_data_uri(var)
+        if not data_uri:
+            continue
+        # Responses API: image は image_url で渡す
+        content = [
+            {"type": "input_text", "text": f"[目的:{purpose}] {user_text}"},
+            {"type": "input_image", "image_url": {"url": data_uri, "detail": "high"}},
+        ]
+        for model_name in model_chain:
+            try:
+                res = OA_CLIENT.responses.create(
+                    model=model_name,
+                    input=[{"role": "user", "content": content}],
+                    max_output_tokens=256,
+                )
+                txt = (res.output_text or "").strip()
+                if txt:
+                    outputs.extend([t.strip() for t in txt.splitlines() if t.strip()])
+            except Exception as e:
+                # ここで 400 unknown_parameter が出なくなっているはず
+                print(f"[OpenAI OCR] {model_name} error: {e}")
+
+    # 正規化＋重複排除
+    out, seen = [], set()
+    for t in outputs:
+        t2 = normalize_time_separators(t)
+        t2 = force_hhmmss_if_six_digits(t2)
+        if t2 and t2 not in seen:
+            seen.add(t2)
+            out.append(t2)
+    return out
 
 async def ping_google_vision() -> tuple[bool, str]:
     """
