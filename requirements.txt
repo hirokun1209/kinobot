@@ -10,3 +10,4 @@ google-cloud-vision
 google-auth
 aiofiles
 python-multipart
+openai>=1.40.0
