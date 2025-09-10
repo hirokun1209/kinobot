@@ -498,7 +498,6 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
         if not data_uri:
             continue
 
-        # ← ここがポイント：image_url は "文字列" で渡す
         content = [
             {"type": "input_text", "text": f"[目的:{purpose}] {user_text}"},
             {"type": "input_image", "image_url": data_uri, "detail": "high"},
@@ -514,19 +513,29 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
                 txt = (res.output_text or "").strip()
                 if txt:
                     outputs.extend([t.strip() for t in txt.splitlines() if t.strip()])
+                break  # このモデルで取れたら次のモデルへは行かない
             except Exception as e:
                 print(f"[OpenAI OCR] {model_name} error: {e}")
+
+    # 正規化＋重複排除
+    out, seen = [], set()
+    for t in outputs:
+        t2 = normalize_time_separators(t)
+        t2 = force_hhmmss_if_six_digits(t2)
+        if t2 and t2 not in seen:
+            seen.add(t2)
+            out.append(t2)
+    return out
 
 def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
     """
     中央リストから『越域駐騎場<番号>』と『免戦中 HH:MM:SS』を JSON で抽出。
     返り値例:
-      {"server":"s1296","rows":[{"place":2,"status":"免戦中","duration":"02:00:38"}, ...]}
+      {"server":"s1296","rows":[{"place":2,"status":"免戦中","duration":"02:00:38"}]}
     """
     if OA_CLIENT is None:
         return None
 
-    # 画像を Data URI 文字列に
     ok, buf = cv2.imencode(".png", center_bgr)
     if not ok:
         return None
@@ -535,9 +544,17 @@ def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
     prompt = (
         "ゲーム画面の中央リストから、各行の『越域駐騎場<番号>』と、その行にある『免戦中』の残り時間を抽出して、"
         "JSONで返してください。サーバー番号（例: [s1296]）が見えれば server として含めてください。"
-        "フォーマットは次の通り。追加の説明や余計なキーは入れないでください：\n"
+        "フォーマットは厳守。追加の説明・前置き・コードフェンス禁止：\n"
         '{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}'
     )
+
+    def _strip_code_fences(s: str) -> str:
+        s = s.strip()
+        if s.startswith("```"):
+            # ```json ... ``` / ``` ... ```
+            s = re.sub(r"^```(?:json)?\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
+        return s.strip()
 
     try:
         res = OA_CLIENT.responses.create(
@@ -550,23 +567,16 @@ def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
                 ],
             }],
             response_format={"type": "json_object"},
+            temperature=0,
             max_output_tokens=512,
         )
         txt = (res.output_text or "").strip()
+        txt = _strip_code_fences(txt)
         return json.loads(txt) if txt.startswith("{") else None
+
     except Exception as e:
         print(f"[OpenAI OCR JSON] error: {e}")
         return None
-
-    # 正規化＋重複排除（あなたの既存補正を活用）
-    out, seen = [], set()
-    for t in outputs:
-        t2 = normalize_time_separators(t)
-        t2 = force_hhmmss_if_six_digits(t2)
-        if t2 and t2 not in seen:
-            seen.add(t2)
-            out.append(t2)
-    return out
 
 async def ping_google_vision() -> tuple[bool, str]:
     """
@@ -2714,10 +2724,16 @@ async def on_message(message):
         _attach(center,          f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",      95)
         # --- OpenAI構造化抽出(JSON) ---
         j = oai_extract_parking_json(center)
-        server = (j or {}).get("server") or extract_server_number([])  # 取れなければ後で補完
+
+        # サーバー番号（JSON が 's1296' でもOKに）
+        server_raw = (j or {}).get("server")
+        if isinstance(server_raw, str) and server_raw.strip():
+            server_digits = re.sub(r"^[sS]", "", server_raw.strip())
+        else:
+            server_digits = extract_server_number(center_txts)  # ← フォールバックは OCR 行から
         rows = (j or {}).get("rows") or []
 
-        # 上部時計（基準時刻）は既存の top_txts / またはメタから
+        # 上部時計（基準時刻）
         base = None
         if top_txts:
             raw = normalize_time_separators(top_txts[0])
@@ -2729,8 +2745,8 @@ async def on_message(message):
 
         # プレビュー生成（JSON → テキスト）
         preview = []
-        if rows and base:
-            mode = "警備" if server == "s1268" or server == "1268" else "奪取"
+        if rows and base and server_digits:
+            mode = "警備" if server_digits == "1268" else "奪取"
             for row in rows:
                 place = str(row.get("place"))
                 dur   = correct_imsen_text(str(row.get("duration","")))
@@ -2738,7 +2754,7 @@ async def on_message(message):
                     continue
                 dt, unlock = add_time(base, dur)
                 if dt:
-                    preview.append(f"{mode} {server.replace('s','')}-{place}-{unlock}")
+                    preview.append(f"{mode} {server_digits}-{place}-{unlock}")
 
         # 画面表示に追加
         if preview:
@@ -3041,7 +3057,7 @@ async def on_message(message):
 
         if grouped_results:
             lines = [
-                f"✅ 解析完了！ `{filename}` 登録されました",
+                f"✅ 解析完了！ `{' ,'.join(filenames)}` を登録しました",
                 "",
                 "🖼 実際の時間と異なる場合はスクショを撮り直してください",
                 "⏱ 1秒程度のズレは 🔧 `!g` で修正可能",
