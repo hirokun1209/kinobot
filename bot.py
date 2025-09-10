@@ -517,6 +517,47 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
             except Exception as e:
                 print(f"[OpenAI OCR] {model_name} error: {e}")
 
+def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
+    """
+    中央リストから『越域駐騎場<番号>』と『免戦中 HH:MM:SS』を JSON で抽出。
+    返り値例:
+      {"server":"s1296","rows":[{"place":2,"status":"免戦中","duration":"02:00:38"}, ...]}
+    """
+    if OA_CLIENT is None:
+        return None
+
+    # 画像を Data URI 文字列に
+    ok, buf = cv2.imencode(".png", center_bgr)
+    if not ok:
+        return None
+    data_uri = "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    prompt = (
+        "ゲーム画面の中央リストから、各行の『越域駐騎場<番号>』と、その行にある『免戦中』の残り時間を抽出して、"
+        "JSONで返してください。サーバー番号（例: [s1296]）が見えれば server として含めてください。"
+        "フォーマットは次の通り。追加の説明や余計なキーは入れないでください：\n"
+        '{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}'
+    )
+
+    try:
+        res = OA_CLIENT.responses.create(
+            model=os.getenv("OPENAI_OCR_MODEL", "gpt-5-mini"),
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_uri, "detail": "high"},
+                ],
+            }],
+            response_format={"type": "json_object"},
+            max_output_tokens=512,
+        )
+        txt = (res.output_text or "").strip()
+        return json.loads(txt) if txt.startswith("{") else None
+    except Exception as e:
+        print(f"[OpenAI OCR JSON] error: {e}")
+        return None
+
     # 正規化＋重複排除（あなたの既存補正を活用）
     out, seen = [], set()
     for t in outputs:
@@ -2671,6 +2712,43 @@ async def on_message(message):
         _attach(np_img_masked, f"oai_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", 92)
         _attach(top,             f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",         92)
         _attach(center,          f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",      95)
+        # --- OpenAI構造化抽出(JSON) ---
+        j = oai_extract_parking_json(center)
+        server = (j or {}).get("server") or extract_server_number([])  # 取れなければ後で補完
+        rows = (j or {}).get("rows") or []
+
+        # 上部時計（基準時刻）は既存の top_txts / またはメタから
+        base = None
+        if top_txts:
+            raw = normalize_time_separators(top_txts[0])
+            raw = force_hhmmss_if_six_digits(raw)
+            m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
+            if m:
+                h, mi, se = map(int, m.groups())
+                base = f"{h:02}:{mi:02}:{se:02}"
+
+        # プレビュー生成（JSON → テキスト）
+        preview = []
+        if rows and base:
+            mode = "警備" if server == "s1268" or server == "1268" else "奪取"
+            for row in rows:
+                place = str(row.get("place"))
+                dur   = correct_imsen_text(str(row.get("duration","")))
+                if not place or dur == "":
+                    continue
+                dt, unlock = add_time(base, dur)
+                if dt:
+                    preview.append(f"{mode} {server.replace('s','')}-{place}-{unlock}")
+
+        # 画面表示に追加
+        if preview:
+            preview_text = "\n".join(f"・{p}" for p in preview)
+        else:
+            preview_text = "(なし)"
+
+        # 既存の送信テキストに上書き/追記
+        # top_txts_str / center_txts_str はそのまま
+        # 下の送信部分の preview_text をこの preview_text で差し替える
 
         await message.channel.send(
             content=(
