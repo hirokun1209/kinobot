@@ -463,9 +463,9 @@ def _bgr_to_png_base64(np_bgr: np.ndarray) -> tuple[str|None, int]:
 def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
     """
     OpenAI (Responses API) でOCR。
-    - 画像は Data URI (image_url) で渡す（image_data は使わない）
-    - 原寸と2xシャープの2パスで試す
-    - gpt-5-mini → gpt-4o-mini にフォールバック
+    - 画像は Data URI を image_url に「文字列」で渡す
+    - 原寸と2xシャープの2パス
+    - gpt-5-mini → gpt-4o-mini の順でフォールバック
     """
     if OA_CLIENT is None:
         return []
@@ -486,8 +486,7 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
     variants = [np_bgr, _upsample_and_sharpen(np_bgr)]
 
     user_text = (
-        "画像から見える文字を行単位で抽出して返してください。"
-        "時間は 05:00:15 / 55:12 のようにコロン区切り。説明は不要。"
+        "画像から見える文字を行単位で抽出して返してください。時間は 05:00:15 / 55:12 のようにコロン区切り。説明は不要。"
         if purpose != "clock"
         else "画像の時計の時刻だけを抽出。可能なら HH:MM:SS を1行で返して。説明は不要。"
     )
@@ -498,11 +497,13 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
         data_uri = _bgr_to_data_uri(var)
         if not data_uri:
             continue
-        # Responses API: image は image_url で渡す
+
+        # ← ここがポイント：image_url は "文字列" で渡す
         content = [
             {"type": "input_text", "text": f"[目的:{purpose}] {user_text}"},
-            {"type": "input_image", "image_url": {"url": data_uri, "detail": "high"}},
+            {"type": "input_image", "image_url": data_uri, "detail": "high"},
         ]
+
         for model_name in model_chain:
             try:
                 res = OA_CLIENT.responses.create(
@@ -514,10 +515,9 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
                 if txt:
                     outputs.extend([t.strip() for t in txt.splitlines() if t.strip()])
             except Exception as e:
-                # ここで 400 unknown_parameter が出なくなっているはず
                 print(f"[OpenAI OCR] {model_name} error: {e}")
 
-    # 正規化＋重複排除
+    # 正規化＋重複排除（あなたの既存補正を活用）
     out, seen = [], set()
     for t in outputs:
         t2 = normalize_time_separators(t)
