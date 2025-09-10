@@ -18,6 +18,8 @@ from google.cloud import vision
 from google.oauth2 import service_account
 from pathlib import Path
 from PIL.ExifTags import TAGS
+import base64
+from openai import OpenAI  # ← 追加
 
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
 
@@ -188,6 +190,16 @@ if _creds_json:
         print("✅ Google Vision client ready")
     except Exception as e:
         print(f"⚠️ Vision init failed: {e}")
+        
+# OpenAI クライアント
+OA_CLIENT = None
+_openai_key = os.getenv("OPENAI_API_KEY")
+if _openai_key:
+    try:
+        OA_CLIENT = OpenAI(api_key=_openai_key)
+        print("✅ OpenAI client ready (OCR fallback: gpt-5-mini)")
+    except Exception as e:
+        print(f"⚠️ OpenAI init failed: {e}")
 
 def google_ocr_from_np(np_bgr) -> list[str]:
     """
@@ -440,6 +452,58 @@ def choose_base_time(img_bytes: bytes) -> tuple[str|None, str]:
     if dt_ocr:
         return dt_ocr.strftime("%H:%M:%S"), "ocr"
     return None, "none"
+
+def _bgr_to_png_base64(np_bgr: np.ndarray) -> tuple[str|None, int]:
+    ok, buf = cv2.imencode(".png", np_bgr)
+    if not ok:
+        return None, 0
+    b = buf.tobytes()
+    return base64.b64encode(b).decode("utf-8"), len(b)
+
+def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
+    """
+    OpenAI (GPT-5 Mini) で画像からテキストを抽出。
+    purpose: "general"（本文） / "clock"（右上の時計）
+    """
+    if OA_CLIENT is None:
+        return []
+    b64, _ = _bgr_to_png_base64(np_bgr)
+    if not b64:
+        return []
+
+    model = os.getenv("OPENAI_OCR_MODEL", "gpt-5-mini")
+    if purpose == "clock":
+        user_text = "画像の時計の時刻だけを抽出して、可能なら HH:MM:SS の1行で返して。説明は不要。"
+    else:
+        user_text = ("画像から見える文字を行単位で抽出して返してください。"
+                     "時間は 05:00:15 / 55:12 などコロン区切り。説明は不要。")
+
+    try:
+        res = OA_CLIENT.responses.create(
+            model=model,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"[目的:{purpose}] {user_text}"},
+                    {"type": "input_image", "image_data": b64, "mime_type": "image/png"},
+                ],
+            }],
+        )
+        text = (res.output_text or "").strip()
+        lines = [t.strip() for t in text.splitlines() if t.strip()]
+
+        # 既存の補正で整形
+        out, seen = [], set()
+        for t in lines:
+            t2 = normalize_time_separators(t)
+            t2 = force_hhmmss_if_six_digits(t2)
+            if t2 and t2 not in seen:
+                seen.add(t2)
+                out.append(t2)
+        return out
+    except Exception as e:
+        print(f"[OpenAI OCR] error: {e}")
+        return []
 
 async def ping_google_vision() -> tuple[bool, str]:
     """
@@ -2535,7 +2599,70 @@ async def on_message(message):
             files=files if files else None
         )
         return
-        
+
+    # ==== !oaiocr（OpenAIのみでOCRデバッグ） ====
+    if message.content.strip() == "!oaiocr":
+        if OA_CLIENT is None:
+            await message.channel.send("⚠️ OpenAI が未初期化です。Railway Variables に OPENAI_API_KEY を設定して再起動してください。")
+            return
+        if not message.attachments:
+            await message.channel.send("🖼 画像を添付して `!oaiocr` を実行してね")
+            return
+
+        a = message.attachments[0]
+        b = await a.read()
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+        # 免戦中の帯を黒塗り（既存の処理と同じ前処理）
+        np_img_masked, masked_cnt = auto_mask_ime(np_img)
+
+        # トリムして OpenAI のみで OCR
+        top = crop_top_right(np_img_masked)
+        center = crop_center_area(np_img_masked)
+        top_txts    = oai_ocr_lines(top, purpose="clock")
+        center_txts = oai_ocr_lines(center, purpose="general")
+
+        # 予定プレビュー（既存のパーサをOpenAI出力で再利用）
+        parsed_preview = parse_multiple_places(center_txts, top_txts)
+        preview_lines = [f"・{txt}" for _, txt, _ in parsed_preview] if parsed_preview else ["(なし)"]
+
+        # 免戦時間の候補（参考）
+        durations = extract_imsen_durations(center_txts)
+        duration_text = "\n".join(durations) if durations else "(抽出なし)"
+
+        # 文字列整形
+        top_txts_str    = "\n".join(top_txts) if top_txts else "(検出なし)"
+        center_txts_str = "\n".join(center_txts) if center_txts else "(検出なし)"
+        preview_text    = "\n".join(preview_lines)
+
+        # クロップ画像も添付（見比べやすい）
+        files = []
+        def _attach(bgr_img, filename, quality=92):
+            try:
+                ok, buf = cv2.imencode(".jpg", bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                if ok:
+                    files.append(discord.File(io.BytesIO(buf.tobytes()), filename=filename))
+            except Exception:
+                pass
+
+        _attach(np_img_masked, f"oai_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", 92)
+        _attach(top,             f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",         92)
+        _attach(center,          f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",      95)
+
+        await message.channel.send(
+            content=(
+                f"🤖 **OpenAI OCR（gpt-5-mini）の結果**\n"
+                f"📸 上部（時計）:\n```\n{top_txts_str}\n```\n"
+                f"🧩 中央（本文）:\n```\n{center_txts_str}\n```\n"
+                f"📋 予定プレビュー:\n```\n{preview_text}\n```\n"
+                f"⏳ 免戦時間候補:\n```\n{duration_text}\n```\n"
+                f"🧽 maskime: {masked_cnt} 本"
+            ),
+            files=files if files else None
+        )
+        return
+
     # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
     if message.content.strip() == "!gvocr":
         if GV_CLIENT is None:
