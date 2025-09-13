@@ -527,7 +527,7 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
 
 # ===== 1画像ルート：合成 → OpenAI OCR =====
 
-SINGLEIMG_MAX_SIDE = int(os.getenv("SINGLEIMG_MAX_SIDE", "960"))  # 送信用に縮小してトークン節約
+SINGLEIMG_MAX_SIDE = int(os.getenv("SINGLEIMG_MAX_SIDE", "1280"))  # 送信用に縮小してトークン節約
 CLOCK_SCALE_W      = float(os.getenv("CLOCK_SCALE_W", "0.32"))    # 右上時計の横幅(ベース比)
 MARGIN_PX          = int(os.getenv("COMPOSE_MARGIN_PX", "10"))    # 貼り付けマージンpx
 
@@ -603,9 +603,10 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
         ' 数字/コロンは正規化して。'
     )
 
+    # oai_ocr_oneimg_async 内：送信コンテンツの detail を high に
     content = [
         {"type": "input_text",  "text": instruction},
-        {"type": "input_image", "image_url": data_uri, "detail": "low"},
+        {"type": "input_image", "image_url": data_uri, "detail": "high"},  # low→high
     ]
 
     await _ensure_openai_slot()
