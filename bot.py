@@ -729,7 +729,7 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
     if full_bgr is not None:
         rects = find_ceasefire_regions_full_img(
             full_bgr,
-            y_shift_ratio=0.45,
+            y_shift_ratio=0.70,
             pad_bottom=100,
             pad_x=CEASE_PAD_X,
             pad_top=CEASE_PAD_TOP,
