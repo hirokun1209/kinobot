@@ -484,6 +484,28 @@ def parse_txt_fields(txt: str):
     m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
     return m.groups() if m else None
 
+# === 低コスト化ヘルパー（追加） ===
+def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
+    """長辺を max_side に縮小（総ピクセル数を減らす）"""
+    h, w = bgr.shape[:2]
+    s = max(h, w)
+    if s <= max_side:
+        return bgr
+    r = max_side / s
+    return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
+
+def crop_cease_banner(bgr: np.ndarray) -> np.ndarray | None:
+    """
+    『停戦終了 HH:MM:SS』の帯あたりを大雑把に切り抜く。
+    端末差がある場合は比率を微調整してください。
+    """
+    h, w = bgr.shape[:2]
+    y1, y2 = int(h*0.17), int(h*0.25)
+    x1, x2 = int(w*0.12), int(w*0.88)
+    if y2 - y1 < 12 or x2 - x1 < 12:
+        return None
+    return bgr[y1:y2, x1:x2]
+
 def choose_base_time(img_bytes: bytes) -> tuple[str|None, str]:
     """
     戻り値: (HH:MM:SS または None, "meta"|"ocr"|"none")
@@ -622,13 +644,14 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
     outputs: list[str] = []
 
     for var in variants:
-        data_uri = _bgr_to_data_uri(var)
+        var_small = shrink_long_side(var, 768)
+        data_uri = _bgr_to_data_uri(var_small)
         if not data_uri:
             continue
 
         content = [
             {"type": "input_text", "text": f"[目的:{purpose}] {user_text}"},
-            {"type": "input_image", "image_url": data_uri, "detail": "high"},
+            {"type": "input_image", "image_url": data_uri, "detail": "low"},
         ]
 
         for model_name in model_chain:
@@ -685,34 +708,50 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
     if now < _oa_circuit_until:
         return None  # quota休止中
 
-    img1 = _bgr_to_data_uri_np(top_bgr)
-    img2 = _bgr_to_data_uri_np(center_bgr)
-    img3 = _bgr_to_data_uri_np(full_bgr) if full_bgr is not None else None
+    # ⬇ 送る前に縮小（画素数＝コスト）
+    top_small    = shrink_long_side(top_bgr,    640)
+    center_small = shrink_long_side(center_bgr, 768)
+
+    # ⬇ full の代わりに『停戦終了』帯だけ切り出して小さく
+    cease_small = None
+    if full_bgr is not None:
+        try:
+            band = crop_cease_banner(full_bgr)
+            if band is not None:
+                cease_small = shrink_long_side(band, 512)
+        except Exception:
+            cease_small = None
+
+    img1 = _bgr_to_data_uri_np(top_small)
+    img2 = _bgr_to_data_uri_np(center_small)
+    img3 = _bgr_to_data_uri_np(cease_small) if cease_small is not None else None
     if not img1 or not img2:
         return None
 
+    # ⬇ 説明を短く（入力トークンも節約）
     instruction = (
-        "次のJSONだけを返して（前置き/説明/コードフェンス禁止）。数値とコロンは正規化：\n"
-        '{"top_clock_lines":[<上部(時計)の行文字列>],'
-        '"center_lines":[<中央リストの行文字列>],'
-        '"ceasefire_end":"HH:MM:SS" | null,'
-        '"structured":{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}}'
-        "\n※ もし全体画像で『停戦終了 HH:MM:SS』が読めたら、ceasefire_end にその時刻を入れる。無ければ null。"
+        '{"top_clock_lines":[],"center_lines":[],"ceasefire_end":null,'
+        '"structured":{"server":"","rows":[{"place":0,"status":"免戦中","duration":"00:00:00"}]}}'
+        ' 以上のJSONだけを返す。数値とコロンは正規化。'
+        ' 帯から「停戦終了 HH:MM:SS」を読めたら ceasefire_end に入れる。'
     )
 
-    content_responses = [{"type":"input_text","text":instruction},
-                         {"type":"input_image","image_url":img1},
-                         {"type":"input_image","image_url":img2}]
-    if img3:
-        content_responses.append({"type":"input_image","image_url":img3})
-
-    content_chat = [
-        {"type":"text","text":instruction},
-        {"type":"image_url","image_url":{"url":img1}},
-        {"type":"image_url","image_url":{"url":img2}},
+    # ⬇ detail は "low"
+    content_responses = [
+        {"type": "input_text", "text": instruction},
+        {"type": "input_image", "image_url": img1, "detail": "low"},
+        {"type": "input_image", "image_url": img2, "detail": "low"},
     ]
     if img3:
-        content_chat.append({"type":"image_url","image_url":{"url":img3}})
+        content_responses.append({"type": "input_image", "image_url": img3, "detail": "low"})
+
+    content_chat = [
+        {"type": "text", "text": instruction},
+        {"type": "image_url", "image_url": {"url": img1, "detail": "low"}},
+        {"type": "image_url", "image_url": {"url": img2, "detail": "low"}},
+    ]
+    if img3:
+        content_chat.append({"type": "image_url", "image_url": {"url": img3, "detail": "low"}})
 
     backoff = 1.0
     for _ in range(5):
@@ -721,15 +760,16 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
             if OA_SUPPORTS_RESPONSES:
                 res = await OA_ASYNC.responses.create(
                     model=OPENAI_MODEL,
-                    input=[{"role":"user","content":content_responses}],
-                    max_output_tokens=700,
+                    input=[{"role": "user", "content": content_responses}],
+                    # ⬇ 出力上限も小さく（JSONだけ）
+                    max_output_tokens=200,
                 )
                 txt = (res.output_text or "").strip()
             else:
                 res = await OA_ASYNC.chat.completions.create(
                     model=OPENAI_MODEL,
-                    messages=[{"role":"user","content":content_chat}],
-                    max_tokens=700,
+                    messages=[{"role": "user", "content": content_chat}],
+                    max_tokens=200,
                 )
                 txt = (res.choices[0].message.content or "").strip()
 
