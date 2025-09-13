@@ -34,6 +34,37 @@ PLACE_RE = re.compile(
 )
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
 
+# === JSONの曖昧な出力を吸収する正規化 ===
+def _coerce_str_lines(x) -> list[str]:
+    """str / list[str] / list[dict{text|value|content|line}] / dict を全部 list[str] に揃える"""
+    if x is None:
+        return []
+    if isinstance(x, str):
+        return [x]
+    out = []
+    if isinstance(x, dict):
+        for k in ("text", "value", "content", "line"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                out.append(v.strip())
+        return out
+    if isinstance(x, (list, tuple)):
+        for it in x:
+            if isinstance(it, str) and it.strip():
+                out.append(it.strip())
+            elif isinstance(it, dict):
+                for k in ("text", "value", "content", "line"):
+                    v = it.get(k)
+                    if isinstance(v, str) and v.strip():
+                        out.append(v.strip())
+                        break
+    return out
+
+def _first_str(x) -> str | None:
+    """単一値を取りたいとき用の安全版"""
+    ls = _coerce_str_lines(x)
+    return ls[0] if ls else (x if isinstance(x, str) else None)
+
 def _get_exif_datetime_strings(img_bytes: bytes) -> dict:
     """
     画像のEXIFから日時文字列（"YYYY:MM:DD HH:MM:SS" 等）を拾って返す。
@@ -688,9 +719,9 @@ def pick_duration_from_group(lines: list[str]) -> str | None:
     # フォールバック：一番短い時間
     return min(cand, key=lambda x: _sec_from_hhmmss(x[1]))[1]
 
-def _extract_clock_from_top_txts(txts: list[str]) -> str | None:
-    """右上時計OCR（複数行）から最初に見つかった HH:MM:SS（なければ HH:MM→秒0埋め）を返す"""
-    for s in txts or []:
+def _extract_clock_from_top_txts(txts) -> str | None:
+    """右上時計OCR（何型でもOK）から HH:MM:SS（なければ HH:MM→秒0）を返す"""
+    for s in _coerce_str_lines(txts):
         s = force_hhmmss_if_six_digits(normalize_time_separators(s.strip()))
         m = TIME_HHMMSS.search(s) or TIME_HHMM.search(s)
         if m:
@@ -3171,13 +3202,11 @@ async def on_message(message):
             # （省略：あなたの元の !oaiocr のレポート部分をそのまま使ってOK）
             return
     
-        # ==== 以降は“既存のレポート生成ロジック”をそのまま利用 ====
-        top_txts    = j.get("top_clock_lines") or []
-        center_txts = j.get("center_lines")    or []
-    
-        # 右上時計を基準（無ければEXIF/PNG）
+        top_txts    = _coerce_str_lines(j.get("top_clock_lines"))
+        center_txts = _coerce_str_lines(j.get("center_lines"))
+        cease_str   = _first_str(j.get("ceasefire_end"))
         base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(raw)
-    
+            
         # 補正前のプレビュー
         parsed_preview = parse_multiple_places(center_txts, top_txts, base_time_override=base_clock_str)
         parsed = list(parsed_preview)
