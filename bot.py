@@ -1531,7 +1531,7 @@ def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|
             current_group["lines"].append(line)
 
     if current_group["place"] and current_group["lines"]:
-        groups.append(current_group
+        groups.append(current_group)
 
     # ✅ 各グループの免戦時間抽出（免戦中の近傍±2行 & 上限時間でフィルタ）
     for g in groups:
