@@ -1021,7 +1021,7 @@ def auto_mask_ime(bgr: np.ndarray) -> tuple[np.ndarray, int]:
 CEASE_PAD_X            = int(os.getenv("CEASE_PAD_X", "20"))      # 左右の余白(px)
 CEASE_PAD_TOP          = int(os.getenv("CEASE_PAD_TOP", "6"))     # 上側の余白(px)
 CEASE_PAD_BOTTOM       = int(os.getenv("CEASE_PAD_BOTTOM", "68")) # 下側の余白(px) ← 少し多め
-CEASE_Y_SHIFT_RATIO    = float(os.getenv("CEASE_Y_SHIFT_RATIO", "0.30"))  # テキスト高さに対する下方向オフセット比
+CEASE_Y_SHIFT_RATIO    = float(os.getenv("CEASE_Y_SHIFT_RATIO", "0.45"))  # テキスト高さに対する下方向オフセット比
 
 def find_ceasefire_regions_full_img(
     bgr: np.ndarray,
