@@ -546,7 +546,7 @@ def _extract_clock_from_top_txts(txts: list[str]) -> str | None:
     """右上時計OCR（複数行）から最初に見つかった HH:MM:SS を返す"""
     for t in txts or []:
         s = force_hhmmss_if_six_digits(normalize_time_separators(t.strip()))
-        m = TIME_HHMMSS.search(s)
+        m = re.search(r"(\d{1,2})[:：](\d{2})[:：](\d{2})", s)
         if m:
             h, mi, se = map(int, m.groups())
             if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
