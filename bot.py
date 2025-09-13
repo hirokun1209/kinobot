@@ -199,7 +199,7 @@ _openai_key = os.getenv("OPENAI_API_KEY")
 if _openai_key:
     try:
         OA_CLIENT = OpenAI(api_key=_openai_key)
-        print("✅ OpenAI client ready (OCR fallback: gpt-5-mini)")
+        print(f"✅ OpenAI client ready (OCR model: {os.getenv('OPENAI_OCR_MODEL','gpt-4o-mini')})")
     except Exception as e:
         print(f"⚠️ OpenAI init failed: {e}")
 # === OpenAI Async クライアント（無ければ None で動く）===
@@ -1318,7 +1318,8 @@ def center_ocr_is_poor(lines: list[str]) -> bool:
 
 def extract_server_number(center_texts):
     for t in center_texts:
-        m = re.search(r"[sS](\d{3,4})", t)
+        # [] の有無どちらでも OK にする
+        m = re.search(r"\[?[sS](\d{3,4})\]?", t)
         if m:
             return m.group(1)
     return None
@@ -2720,6 +2721,12 @@ async def on_message(message):
         img = Image.open(io.BytesIO(b)).convert("RGB")
         np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
+        h, w = np_img.shape[:2]
+        longer = max(h, w)
+        if longer > 1024:
+            scale = 1024 / longer
+            np_img = cv2.resize(np_img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+
         # OCR前に「免戦中」直下を黒塗り
         np_img_masked, _masked_cnt = auto_mask_ime(np_img)
 
@@ -2735,36 +2742,28 @@ async def on_message(message):
         def extract_and_correct_base_time(txts):
             if not txts:
                 return "??:??:??"
-            raw = txts[0].strip()
+            raw = normalize_time_separators(txts[0])
+
+            # まず HH:MM:SS を素直に拾う
+            m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
+            if m:
+                h, mi, se = map(int, m.groups())
+                if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
+                    return f"{h:02}:{mi:02}:{se:02}"
+
+            # 次に 6桁数字だけを HH:MM:SS に再構成
             digits = re.sub(r"\D", "", raw)
-            if len(digits) >= 8:
-                try:
-                    h = int(digits[0:2]); m = int(digits[2:4]); s = int(digits[6:8])
-                    if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                        return f"{h:02}:{m:02}:{s:02}"
-                except:
-                    pass
-            if len(digits) >= 6:
-                try:
-                    h, m, s = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
-                    if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                        return f"{h:02}:{m:02}:{s:02}"
-                except:
-                    pass
-            if len(digits) == 5:
-                try:
-                    h, m, s = int(digits[0]), int(digits[1:3]), int(digits[3:])
-                    if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
-                        return f"{h:02}:{m:02}:{s:02}"
-                except:
-                    pass
+            if len(digits) == 6:
+                h, mi, se = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
+                if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
+                    return f"{h:02}:{mi:02}:{se:02}"
+
+            # 4桁だけ見える場合は 00:MM:SS 扱い
             if len(digits) == 4:
-                try:
-                    m, s = int(digits[:2]), int(digits[2:])
-                    if 0 <= m < 60 and 0 <= s < 60:
-                        return f"00:{m:02}:{s:02}"
-                except:
-                    pass
+                m_, s_ = int(digits[:2]), int(digits[2:])
+                if 0 <= m_ < 60 and 0 <= s_ < 60:
+                    return f"00:{m_:02}:{s_:02}"
+    
             return "??:??:??"
 
         # 予定抽出
@@ -2814,12 +2813,6 @@ async def on_message(message):
         if OA_CLIENT is None:
             await message.channel.send("⚠️ OpenAI が未初期化です。Railway Variables に OPENAI_API_KEY を設定して再起動してください。")
             return
-        # 入力画像の長辺を1024pxにリサイズ（必要時のみ）
-        h, w = np_bgr.shape[:2]
-        longer = max(h, w)
-        if longer > 1024:
-            scale = 1024 / longer
-            np_bgr = cv2.resize(np_bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
         if not message.attachments:
             await message.channel.send("🖼 画像を添付して `!oaiocr` を実行してね")
             return
