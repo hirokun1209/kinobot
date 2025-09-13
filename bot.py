@@ -491,8 +491,56 @@ def choose_base_time(img_bytes: bytes) -> tuple[str|None, str]:
 # 停戦終了での自動補正：許容誤差（既定1秒）
 CEASEFIX_MAX_SEC = int(os.getenv("CEASEFIX_MAX_SEC", "1"))
 
-# HH:MM:SS 抽出用（既存 TIME_RE は検索向け、こちらはグルーピング抽出に使用）
-TIME_HHMMSS = re.compile(r"\b(\d{1,2})[:：](\d{2})[:：](\d{2})\b")
+# 免戦の最大想定時間（h）: これより長い時間は誤読として弾く
+IMSEN_MAX_HOURS = int(os.getenv("IMSEN_MAX_HOURS", "5"))
+
+def _sec_from_hhmmss(s: str) -> int:
+    try:
+        h, m, se = map(int, s.split(":"))
+        return h*3600 + m*60 + se
+    except Exception:
+        return 10**9  # 大きめ
+
+def pick_duration_from_group(lines: list[str]) -> str | None:
+    """
+    与えられた行グループから免戦時間を1つ選ぶ規則:
+      1) '免戦中' を含む行の近傍（±2行）にある HH:MM:SS を最優先
+      2) それでも見つからなければ、グループ内の HH:MM:SS のうち最小を採用
+    ただし、h > IMSEN_MAX_HOURS は誤読として除外（例: 11:00:06 など）
+    """
+    fixed = [normalize_time_separators(x) for x in lines]
+    im_idx = [i for i, t in enumerate(fixed) if "免戦中" in t]
+
+    # グループ内の全候補 (行番号, "HH:MM:SS")
+    cand: list[tuple[int, str]] = []
+    for i, t in enumerate(fixed):
+        for m in TIME_HHMMSS.finditer(force_hhmmss_if_six_digits(t)):
+            s = correct_imsen_text(m.group(0))
+            if not s:
+                continue
+            try:
+                h = int(s.split(":")[0])
+            except:
+                continue
+            if h <= IMSEN_MAX_HOURS:
+                cand.append((i, s))
+
+    if not cand:
+        return None
+
+    # 免戦中の近傍（±2行）を最優先
+    if im_idx:
+        near: list[tuple[int, int, str]] = []  # (距離, 秒, 文字列)
+        for i, s in cand:
+            dist = min(abs(i - k) for k in im_idx)
+            if dist <= 2:
+                near.append((dist, _sec_from_hhmmss(s), s))
+        if near:
+            near.sort()
+            return near[0][2]
+
+    # フォールバック：一番短い時間
+    return min(cand, key=lambda x: _sec_from_hhmmss(x[1]))[1]
 
 def _extract_clock_from_top_txts(txts: list[str]) -> str | None:
     """右上時計OCR（複数行）から最初に見つかった HH:MM:SS を返す"""
@@ -1429,22 +1477,11 @@ def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|
     if current_group["place"] and current_group["lines"]:
         groups.append(current_group)
 
-    # ✅ 各グループの免戦時間抽出
+    # ✅ 各グループの免戦時間抽出（免戦中の近傍±2行 & 上限時間でフィルタ）
     for g in groups:
-        durations = extract_imsen_durations(g["lines"])
-
-        # ← これを追加（フォールバック）
-        if not durations:
-            for ln in g["lines"]:
-                mt = TIME_RE.search(normalize_time_separators(ln))
-                if mt:
-                    durations = [mt.group(0)]
-                    break
-
-        if not durations:
+        d = pick_duration_from_group(g["lines"])
+        if not d:
             continue
-        raw = durations[0]
-        d = correct_imsen_text(raw)
         dt, unlock = add_time(top_time, d)
         if dt:
             res.append((dt, f"{mode} {server}-{g['place']}-{unlock}", d))
