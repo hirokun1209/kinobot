@@ -723,15 +723,35 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
     top_small    = shrink_long_side(top_bgr,    640)
     center_small = shrink_long_side(center_bgr, 768)
 
+    # oai_ocr_all_in_one_async 内の cease_small 作成部をこの形に
     cease_small = None
     if full_bgr is not None:
-        try:
-            band = crop_cease_banner(full_bgr)
-            if band is not None:
-                cease_small = shrink_long_side(band, 512)
-        except Exception:
-            cease_small = None
-
+        rects = find_ceasefire_regions_full_img(
+            full_bgr,
+            y_shift_ratio=0.45,   # 既存の“下寄せ”はそのまま
+            pad_bottom=100,
+            pad_x=CEASE_PAD_X,
+            pad_top=CEASE_PAD_TOP,
+        )
+        if rects:
+            x1, y1, x2, y2 = rects[0]
+    
+            # ★ ここで「画像一枚分」下へズラす
+            H = full_bgr.shape[0]
+            band_h = (y2 - y1)
+            y1 += band_h
+            y2 += band_h
+            # 画面外に出たら下端に合わせて調整
+            if y2 > H:
+                shift_back = y2 - H
+                y1 -= shift_back
+                y2 = H
+                if y1 < 0:
+                    y1 = 0  # 最悪の保険
+    
+            band = full_bgr[y1:y2, x1:x2]
+            cease_small = shrink_long_side(band, 512)
+    
     # ★ ここを置換：OpenAI用の data_uri と Discord用の png bytes を同時に作成
     top_png,    img1 = _bgr_to_png_bytes_and_data_uri(top_small)
     center_png, img2 = _bgr_to_png_bytes_and_data_uri(center_small)
