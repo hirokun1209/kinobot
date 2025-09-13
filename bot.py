@@ -488,6 +488,37 @@ def choose_base_time(img_bytes: bytes) -> tuple[str|None, str]:
         return dt_ocr.strftime("%H:%M:%S"), "ocr"
     return None, "none"
 
+# 停戦終了での自動補正：許容誤差（既定1秒）
+CEASEFIX_MAX_SEC = int(os.getenv("CEASEFIX_MAX_SEC", "1"))
+
+# HH:MM:SS 抽出用（既存 TIME_RE は検索向け、こちらはグルーピング抽出に使用）
+TIME_HHMMSS = re.compile(r"\b(\d{1,2})[:：](\d{2})[:：](\d{2})\b")
+
+def _extract_clock_from_top_txts(txts: list[str]) -> str | None:
+    """右上時計OCR（複数行）から最初に見つかった HH:MM:SS を返す"""
+    for t in txts or []:
+        s = force_hhmmss_if_six_digits(normalize_time_separators(t.strip()))
+        m = TIME_HHMMSS.search(s)
+        if m:
+            h, mi, se = map(int, m.groups())
+            if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
+                return f"{h:02}:{mi:02}:{se:02}"
+    return None
+
+def _parse_hhmmss_to_dt_jst(timestr: str) -> datetime | None:
+    """'HH:MM:SS' を今日の日付の JST datetime に。深夜(〜05:59)は翌日扱い。"""
+    s = force_hhmmss_if_six_digits(normalize_time_separators(timestr or ""))
+    m = TIME_HHMMSS.search(s)
+    if not m:
+        return None
+    h, mi, se = map(int, m.groups())
+    if not (0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60):
+        return None
+    base = datetime.combine(now_jst().date(), time(h, mi, se), tzinfo=JST)
+    if base.time() < time(6, 0, 0):
+        base += timedelta(days=1)
+    return base
+
 def _bgr_to_png_base64(np_bgr: np.ndarray) -> tuple[str|None, int]:
     ok, buf = cv2.imencode(".png", np_bgr)
     if not ok:
@@ -575,50 +606,51 @@ def _strip_code_fences(s: str) -> str:
         s = re.sub(r"\s*```$", "", s)
     return s.strip()
 
-async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray) -> dict | None:
+async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, full_bgr: np.ndarray | None = None) -> dict | None:
     """
-    単一リクエストで2領域をOCRし、JSONで返す:
-      {"top_clock_lines":[...], "center_lines":[...],
-       "structured":{"server":"s####","rows":[{"place":int,"status":"免戦中","duration":"HH:MM:SS"}]}}
-    - 非同期SDK/Responsesが無い場合は chat.completions に自動フォールバック
-    - RPM制御 / 429バックオフ / quotaサーキットブレーカ
+    単一リクエストで 2〜3領域をOCRし、JSONで返す:
+      {
+        "top_clock_lines":[...],
+        "center_lines":[...],
+        "ceasefire_end":"HH:MM:SS" | null,
+        "structured":{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}
+      }
     """
     if OA_ASYNC is None:
         return None
 
     now = _now_mono()
     if now < _oa_circuit_until:
-        return None  # quota 休止中
+        return None  # quota休止中
 
     img1 = _bgr_to_data_uri_np(top_bgr)
     img2 = _bgr_to_data_uri_np(center_bgr)
+    img3 = _bgr_to_data_uri_np(full_bgr) if full_bgr is not None else None
     if not img1 or not img2:
         return None
 
-    # Responses 用コンテンツ
-    content_responses = [
-        {"type": "input_text", "text": (
-            "与えられた2枚の画像について、次のJSONで返して。説明不要・必ずJSONのみ：\n"
-            '{"top_clock_lines":[<上部(時計)の行文字列>],'
-            '"center_lines":[<中央リストの行文字列>],'
-            '"structured":{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}}\n'
-            "中央の構造化は見えた範囲でOK。数値/コロンは正規化して。"
-        )},
-        {"type": "input_image", "image_url": img1},
-        {"type": "input_image", "image_url": img2},
-    ]
-    # Chat Completions 用コンテンツ
+    instruction = (
+        "次のJSONだけを返して（前置き/説明/コードフェンス禁止）。数値とコロンは正規化：\n"
+        '{"top_clock_lines":[<上部(時計)の行文字列>],'
+        '"center_lines":[<中央リストの行文字列>],'
+        '"ceasefire_end":"HH:MM:SS" | null,'
+        '"structured":{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}}'
+        "\n※ もし全体画像で『停戦終了 HH:MM:SS』が読めたら、ceasefire_end にその時刻を入れる。無ければ null。"
+    )
+
+    content_responses = [{"type":"input_text","text":instruction},
+                         {"type":"input_image","image_url":img1},
+                         {"type":"input_image","image_url":img2}]
+    if img3:
+        content_responses.append({"type":"input_image","image_url":img3})
+
     content_chat = [
-        {"type": "text", "text": (
-            "与えられた2枚の画像について、次のJSONで返して。説明不要・必ずJSONのみ：\n"
-            '{"top_clock_lines":[<上部(時計)の行文字列>],'
-            '"center_lines":[<中央リストの行文字列>],'
-            '"structured":{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}}\n'
-            "中央の構造化は見えた範囲でOK。数値/コロンは正規化して。"
-        )},
-        {"type": "image_url", "image_url": {"url": img1}},
-        {"type": "image_url", "image_url": {"url": img2}},
+        {"type":"text","text":instruction},
+        {"type":"image_url","image_url":{"url":img1}},
+        {"type":"image_url","image_url":{"url":img2}},
     ]
+    if img3:
+        content_chat.append({"type":"image_url","image_url":{"url":img3}})
 
     backoff = 1.0
     for _ in range(5):
@@ -627,14 +659,14 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray) 
             if OA_SUPPORTS_RESPONSES:
                 res = await OA_ASYNC.responses.create(
                     model=OPENAI_MODEL,
-                    input=[{"role": "user", "content": content_responses}],
+                    input=[{"role":"user","content":content_responses}],
                     max_output_tokens=700,
                 )
                 txt = (res.output_text or "").strip()
             else:
                 res = await OA_ASYNC.chat.completions.create(
                     model=OPENAI_MODEL,
-                    messages=[{"role": "user", "content": content_chat}],
+                    messages=[{"role":"user","content":content_chat}],
                     max_tokens=700,
                 )
                 txt = (res.choices[0].message.content or "").strip()
@@ -652,8 +684,8 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray) 
                 print(f"[OpenAI] quota exhausted → circuit open for {cooldown}s")
                 return None
             if "rate_limit" in msg or "429" in msg:
-                await asyncio.sleep(backoff + random.random() * 0.3)
-                backoff = min(backoff * 2, 8.0)
+                await asyncio.sleep(backoff + random.random()*0.3)
+                backoff = min(backoff*2, 8.0)
                 continue
             raise
     return None
@@ -2808,7 +2840,7 @@ async def on_message(message):
         )
         return
 
-    # ==== !oaiocr（OpenAIのみでOCRデバッグ） ====
+    # ==== !oaiocr（OpenAIのみでOCR + 停戦終了補正） ====
     if message.content.strip() == "!oaiocr":
         if OA_CLIENT is None:
             await message.channel.send("⚠️ OpenAI が未初期化です。Railway Variables に OPENAI_API_KEY を設定して再起動してください。")
@@ -2822,84 +2854,80 @@ async def on_message(message):
         img = Image.open(io.BytesIO(b)).convert("RGB")
         np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        # 免戦中の帯を黒塗り（既存処理と同じ）
+        # 免戦中の帯を黒塗り（誤読抑止）
         np_img_masked, masked_cnt = auto_mask_ime(np_img)
 
-        # トリム → 単一APIで top/center/structured を同時取得
-        top = crop_top_right(np_img_masked)
+        # トリム
+        top    = crop_top_right(np_img_masked)
         center = crop_center_area(np_img_masked)
-        j = await oai_ocr_all_in_one_async(top, center)
 
-        top_txts    = (j or {}).get("top_clock_lines", []) or []
-        center_txts = (j or {}).get("center_lines", []) or []
+        # OAで top/center/全体 = 3枚を同時OCR（停戦終了も拾う）
+        j = await oai_ocr_all_in_one_async(top, center, np_img_masked)
 
-        # 予定プレビュー（既存パーサ再利用）
-        parsed_preview = parse_multiple_places(center_txts, top_txts)
-        preview_lines = [f"・{txt}" for _, txt, _ in parsed_preview] if parsed_preview else ["(なし)"]
+        # テキスト群（フォールバックも用意）
+        top_txts    = (j or {}).get("top_clock_lines") or extract_text_from_image(top) or []
+        center_txts = (j or {}).get("center_lines")    or ocr_center_with_fallback(center) or []
 
-        # 免戦時間の候補（参考）
-        durations = extract_imsen_durations(center_txts)
-        duration_text = "\n".join(durations) if durations else "(抽出なし)"
+        # 右上時計を基準（取れない時だけメタにフォールバック）
+        base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(b)
 
-        # サーバー番号（JSON優先→テキストフォールバック）
-        server_raw = (((j or {}).get("structured") or {}).get("server"))
-        if isinstance(server_raw, str) and server_raw.strip():
-            server_digits = re.sub(r"^[sS]", "", server_raw.strip())
-        else:
-            server_digits = extract_server_number(center_txts)
+        # 予定（右上基準）を生成
+        parsed = parse_multiple_places(center_txts, top_txts, base_time_override=base_clock_str)
 
-        # 上部時計の基準時刻（先頭を補正して抽出）
-        base = None
-        if top_txts:
-            raw = normalize_time_separators(top_txts[0])
-            raw = force_hhmmss_if_six_digits(raw)
-            m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
-            if m:
-                h, mi, se = map(int, m.groups())
-                base = f"{h:02}:{mi:02}:{se:02}"
+        # 停戦終了のJST化
+        cease_str = ((j or {}).get("ceasefire_end")) or None
+        cease_dt  = _parse_hhmmss_to_dt_jst(cease_str) if cease_str else None
 
-        # JSONの structured → テキストプレビュー（補助）
-        rows = (((j or {}).get("structured") or {}).get("rows")) or []
-        if rows and base and server_digits:
-            mode = "警備" if server_digits == "1268" else "奪取"
-            preview_extra = []
-            for row in rows:
-                place = str(row.get("place"))
-                dur   = correct_imsen_text(str(row.get("duration", "")))
-                if not place or dur == "":
-                    continue
-                dt, unlock = add_time(base, dur)
-                if dt:
-                    preview_extra.append(f"{mode} {server_digits}-{place}-{unlock}")
-            if preview_extra:
-                preview_lines = [f"・{p}" for p in preview_extra]
+        # === 補正: 画像で一番上の行（最上段の駐騎ナンバー）をアンカーに ===
+        delta_sec = 0
+        if cease_dt and parsed:
+            # parsed[0] はOCR順＝上から順と想定（Paddle/GVの戻りは通常上→下）
+            top_unlock_dt = parsed[0][0]
+            delta_sec = int((cease_dt - top_unlock_dt).total_seconds())
 
-        # 文字列整形
-        top_txts_str    = "\n".join(top_txts) if top_txts else "(検出なし)"
-        center_txts_str = "\n".join(center_txts) if center_txts else "(検出なし)"
-        preview_text    = "\n".join(preview_lines)
+            if abs(delta_sec) <= CEASEFIX_MAX_SEC:
+                adjusted = []
+                for dt, txt, raw in parsed:
+                    m = parse_txt_fields(txt)
+                    if not m:
+                        adjusted.append((dt, txt, raw))
+                        continue
+                    mode, server, place, _ = m
+                    new_dt  = dt + timedelta(seconds=delta_sec)
+                    new_txt = f"{mode} {server}-{place}-{new_dt.strftime('%H:%M:%S')}"
+                    adjusted.append((new_dt, new_txt, raw))
+                parsed = adjusted
+            else:
+                # 閾値超過なら安全側で補正しない
+                delta_sec = 0
 
-        # クロップ画像も添付
+        # 出力文面
+        base_show  = base_clock_str or "??:??:??"
+        cease_show = cease_str or (cease_dt.strftime("%H:%M:%S") if cease_dt else "(検出なし)")
+        delta_show = f"{delta_sec:+d}秒" if delta_sec else "±0秒"
+        preview    = "\n".join([f"・{t}" for _, t, _ in parsed]) if parsed else "(なし)"
+
+        # デバッグ添付
         files = []
         def _attach(bgr_img, filename, quality=92):
             try:
                 ok, buf = cv2.imencode(".jpg", bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-                if ok:
-                    files.append(discord.File(io.BytesIO(buf.tobytes()), filename=filename))
-            except Exception:
-                pass
+                if ok: files.append(discord.File(io.BytesIO(buf.tobytes()), filename=filename))
+            except Exception: pass
 
         _attach(np_img_masked, f"oai_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", 92)
-        _attach(top,             f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",         92)
-        _attach(center,          f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",      95)
+        _attach(top,          f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",           92)
+        _attach(center,       f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",        95)
 
+        # 送信
         await message.channel.send(
             content=(
                 f"🤖 **OpenAI OCR（{OPENAI_MODEL}）の結果**\n"
-                f"📸 上部（時計）:\n```\n{top_txts_str}\n```\n"
-                f"🧩 中央（本文）:\n```\n{center_txts_str}\n```\n"
-                f"📋 予定プレビュー:\n```\n{preview_text}\n```\n"
-                f"⏳ 免戦時間候補:\n```\n{duration_text}\n```\n"
+                f"📸 上部（時計）:\n```\n{chr(10).join(top_txts) if top_txts else '(検出なし)'}\n```\n"
+                f"🧩 中央（本文）:\n```\n{chr(10).join(center_txts) if center_txts else '(検出なし)'}\n```\n"
+                f"🕒 基準(右上時計): `{base_show}`\n"
+                f"🛡 停戦終了: `{cease_show}` / 自動補正: {delta_show}（閾値±{CEASEFIX_MAX_SEC}s）\n"
+                f"📋 **補正後の予定**:\n```\n{preview}\n```\n"
                 f"🧽 maskime: {masked_cnt} 本"
             ),
             files=files if files else None
