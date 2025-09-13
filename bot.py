@@ -517,8 +517,8 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
         b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
         return f"data:image/png;base64,{b64}"
 
-    model_chain = [os.getenv("OPENAI_OCR_MODEL", "gpt-5-mini"), "gpt-4o-mini"]
-    variants = [np_bgr, _upsample_and_sharpen(np_bgr)]
+    model_chain = [os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini")]
+    variants = [np_bgr]
 
     user_text = (
         "画像から見える文字を行単位で抽出して返してください。時間は 05:00:15 / 55:12 のようにコロン区切り。説明は不要。"
@@ -543,7 +543,7 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
                 res = OA_CLIENT.responses.create(
                     model=model_name,
                     input=[{"role": "user", "content": content}],
-                    max_output_tokens=256,
+                    max_output_tokens=64,
                 )
                 txt = (res.output_text or "").strip()
                 if txt:
@@ -697,7 +697,6 @@ def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
                     {"type": "input_image", "image_url": data_uri, "detail": "high"},
                 ],
             }],
-            response_format={"type": "json_object"},
             temperature=0,
             max_output_tokens=512,
         )
@@ -2815,6 +2814,12 @@ async def on_message(message):
         if OA_CLIENT is None:
             await message.channel.send("⚠️ OpenAI が未初期化です。Railway Variables に OPENAI_API_KEY を設定して再起動してください。")
             return
+        # 入力画像の長辺を1024pxにリサイズ（必要時のみ）
+        h, w = np_bgr.shape[:2]
+        longer = max(h, w)
+        if longer > 1024:
+            scale = 1024 / longer
+            np_bgr = cv2.resize(np_bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
         if not message.attachments:
             await message.channel.send("🖼 画像を添付して `!oaiocr` を実行してね")
             return
