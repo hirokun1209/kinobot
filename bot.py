@@ -3296,40 +3296,55 @@ async def on_message(message):
                 if task:
                     task.cancel()
 
-        # ---- 新エントリを登録（ID は引き継ぐ、無ければ None のまま）----
-        pending_places[new_txt] = {
-            "dt": new_dt,
-            "txt": new_txt,
-            "server": server,
-            "created_at": now_jst(),
-            "main_msg_id": old_main_msg_id,  # まとめメッセのID（retime側で再設定される）
-            "copy_msg_id": old_copy_msg_id,  # コピー用メッセのID（あれば編集する）
-        }
+        # ---- new_txt が既に存在する場合はマージ（重複防止）----
+        existed = new_txt in pending_places
+        if existed:
+            tgt = pending_places[new_txt]
+            # 可能なら旧のIDを引き継ぎ（空欄のみ上書き）
+            if old_main_msg_id and not tgt.get("main_msg_id"):
+                tgt["main_msg_id"] = old_main_msg_id
+            if old_copy_msg_id and not tgt.get("copy_msg_id"):
+                tgt["copy_msg_id"] = old_copy_msg_id
+            # 時刻は新指定で上書き（同一キーなので実質同時刻のはずだが念のため）
+            tgt["dt"] = new_dt
+        else:
+            pending_places[new_txt] = {
+                "dt": new_dt,
+                "txt": new_txt,
+                "server": server,
+                "created_at": now_jst(),
+                "main_msg_id": old_main_msg_id,  # まとめメッセのID（retime側で再設定されうる）
+                "copy_msg_id": old_copy_msg_id,  # コピー用メッセのID（あれば編集で使う）
+            }
 
-        # ---- 通知チャンネルのまとめメッセ：古い行を削除→新行を時刻順に追加（削除はせず編集で更新） ----
+        # ---- 通知チャンネルのまとめメッセ：古い行を削除→新行を時刻順に追加（編集で更新） ----
         await retime_event_in_summary(old_txt, new_dt, new_txt, channel)
 
-        # ---- コピーチャンネル：存在する場合のみ「編集」。無ければ何もしない（自動新規送信しない）----
+        # ---- コピーチャンネル：旧メッセがあれば内容だけ new に編集（自動新規はしない）----
         if old_copy_msg_id:
             copy_ch = client.get_channel(COPY_CHANNEL_ID)
             if copy_ch:
                 try:
                     msg = await copy_ch.fetch_message(old_copy_msg_id)
                     await msg.edit(content=new_txt.replace("🕒 ", ""))
+                    pending_places[new_txt]["copy_msg_id"] = msg.id
                 except discord.NotFound:
+                    # 見つからない場合は諦める（同期タスクで再整合される）
                     pending_places[new_txt]["copy_msg_id"] = None
                 except Exception:
                     pass
 
-        # ---- 通知予約を新しい時間で再登録（!n に反映）----
-        notify_ch = client.get_channel(NOTIFY_CHANNEL_ID)
-        if notify_ch:
-            await schedule_notification(new_dt, new_txt, notify_ch)
+        # ---- 通知再登録（奪取のみ）----
+        if mode == "奪取":
+            # new_txt がすでに存在していた場合は既存予約が生きている可能性が高いので二重登録しない
+            if not existed:
+                await schedule_notification(new_dt, new_txt, channel)
 
-            # 手動まとめ(!s)が既に送られている場合は、編集で最新化
-            await refresh_manual_summaries()
-        await upsert_copy_channel_sorted([(new_dt, new_txt)])
-        await message.channel.send(f"✅ 更新しました → `{new_txt}`")
+        # 手動まとめ(!s)があれば編集で最新化。コピーチャンネルも定期同期で整合。
+        await refresh_manual_summaries()
+        await upsert_copy_channel_sorted([])
+
+        await message.channel.send(f"🛠 修正しました: {old_txt} → {new_txt}")
         return
 
     # ==== 手動追加（例: 1234-1-12:34:56）====
