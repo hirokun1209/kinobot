@@ -2871,17 +2871,24 @@ async def on_message(message):
         # 右上時計を基準（取れない時だけメタにフォールバック）
         base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(b)
 
-        # 予定（右上基準）を生成
-        parsed = parse_multiple_places(center_txts, top_txts, base_time_override=base_clock_str)
+        # =========================
+        # 1) 補正「前」プレビューを作る
+        # =========================
+        parsed_preview = parse_multiple_places(center_txts, top_txts, base_time_override=base_clock_str)
+        preview_text = "\n".join([f"・{t}" for _, t, _ in parsed_preview]) if parsed_preview else "(なし)"
 
-        # 停戦終了のJST化
+        # 以降の計算はこのコピーをベースに（安全のため別リストにする）
+        parsed = list(parsed_preview)
+
+        # =========================
+        # 2) 停戦終了を見て ±秒の自動補正
+        # =========================
         cease_str = ((j or {}).get("ceasefire_end")) or None
         cease_dt  = _parse_hhmmss_to_dt_jst(cease_str) if cease_str else None
 
-        # === 補正: 画像で一番上の行（最上段の駐騎ナンバー）をアンカーに ===
         delta_sec = 0
         if cease_dt and parsed:
-            # parsed[0] はOCR順＝上から順と想定（Paddle/GVの戻りは通常上→下）
+            # parsed[0] は画面最上段の行に相当（OCRは通常上から下）
             top_unlock_dt = parsed[0][0]
             delta_sec = int((cease_dt - top_unlock_dt).total_seconds())
 
@@ -2898,14 +2905,22 @@ async def on_message(message):
                     adjusted.append((new_dt, new_txt, raw))
                 parsed = adjusted
             else:
-                # 閾値超過なら安全側で補正しない
+                # 閾値を超えるズレは安全側で補正しない
                 delta_sec = 0
+
+        # =========================
+        # 3) “最終出力（登録される行）” を作る
+        # =========================
+        final_text = "\n".join([f"・{t}" for _, t, _ in parsed]) if parsed else "(なし)"
+
+        # 参考: 免戦時間候補の一覧も表示（任意）
+        durations = extract_imsen_durations(center_txts)
+        duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
         # 出力文面
         base_show  = base_clock_str or "??:??:??"
         cease_show = cease_str or (cease_dt.strftime("%H:%M:%S") if cease_dt else "(検出なし)")
         delta_show = f"{delta_sec:+d}秒" if delta_sec else "±0秒"
-        preview    = "\n".join([f"・{t}" for _, t, _ in parsed]) if parsed else "(なし)"
 
         # デバッグ添付
         files = []
@@ -2919,7 +2934,7 @@ async def on_message(message):
         _attach(top,          f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",           92)
         _attach(center,       f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",        95)
 
-        # 送信
+        # 送信（補正前と最終出力を両方表示）
         await message.channel.send(
             content=(
                 f"🤖 **OpenAI OCR（{OPENAI_MODEL}）の結果**\n"
@@ -2927,12 +2942,16 @@ async def on_message(message):
                 f"🧩 中央（本文）:\n```\n{chr(10).join(center_txts) if center_txts else '(検出なし)'}\n```\n"
                 f"🕒 基準(右上時計): `{base_show}`\n"
                 f"🛡 停戦終了: `{cease_show}` / 自動補正: {delta_show}（閾値±{CEASEFIX_MAX_SEC}s）\n"
-                f"📋 **補正後の予定**:\n```\n{preview}\n```\n"
+                f"📋 **補正前の予定プレビュー**:\n```\n{preview_text}\n```\n"
+                f"🧾 **最終出力（登録される行）**:\n```\n{final_text}\n```\n"
+                f"⏳ 免戦時間候補:\n```\n{duration_text}\n```\n"
                 f"🧽 maskime: {masked_cnt} 本"
             ),
             files=files if files else None
         )
         return
+
+
 
     # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
     if message.content.strip() == "!gvocr":
