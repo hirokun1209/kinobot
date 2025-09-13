@@ -23,6 +23,9 @@ from openai import OpenAI  # ← 追加
 from collections import deque
 import random
 
+# 共通の時刻パターン（HH:MM:SS / HH:MM）
+TIME_HHMMSS = re.compile(r"\b(\d{1,2})[:：](\d{2})[:：](\d{2})\b")
+TIME_HHMM   = re.compile(r"\b(\d{1,2})[:：](\d{2})\b")
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
 
 def _get_exif_datetime_strings(img_bytes: bytes) -> dict:
@@ -514,7 +517,8 @@ def pick_duration_from_group(lines: list[str]) -> str | None:
     # グループ内の全候補 (行番号, "HH:MM:SS")
     cand: list[tuple[int, str]] = []
     for i, t in enumerate(fixed):
-        for m in TIME_HHMMSS.finditer(force_hhmmss_if_six_digits(t)):
+        s = force_hhmmss_if_six_digits(t)
+        for m in list(TIME_HHMMSS.finditer(s)) + list(TIME_HHMM.finditer(s)):
             s = correct_imsen_text(m.group(0))
             if not s:
                 continue
@@ -543,23 +547,27 @@ def pick_duration_from_group(lines: list[str]) -> str | None:
     return min(cand, key=lambda x: _sec_from_hhmmss(x[1]))[1]
 
 def _extract_clock_from_top_txts(txts: list[str]) -> str | None:
-    """右上時計OCR（複数行）から最初に見つかった HH:MM:SS を返す"""
-    for t in txts or []:
-        s = force_hhmmss_if_six_digits(normalize_time_separators(t.strip()))
-        m = re.search(r"(\d{1,2})[:：](\d{2})[:：](\d{2})", s)
+    """右上時計OCR（複数行）から最初に見つかった HH:MM:SS（なければ HH:MM→秒0埋め）を返す"""
+    for s in txts or []:
+        s = force_hhmmss_if_six_digits(normalize_time_separators(s.strip()))
+        m = TIME_HHMMSS.search(s) or TIME_HHMM.search(s)
         if m:
-            h, mi, se = map(int, m.groups())
+            h  = int(m.group(1))
+            mi = int(m.group(2))
+            se = int(m.group(3)) if m.re is TIME_HHMMSS else 0
             if 0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60:
                 return f"{h:02}:{mi:02}:{se:02}"
     return None
 
 def _parse_hhmmss_to_dt_jst(timestr: str) -> datetime | None:
-    """'HH:MM:SS' を今日の日付の JST datetime に。深夜(〜05:59)は翌日扱い。"""
+    """'HH:MM:SS' もしくは 'HH:MM' を今日の日付の JST datetime に。深夜(〜05:59)は翌日扱い。"""
     s = force_hhmmss_if_six_digits(normalize_time_separators(timestr or ""))
-    m = TIME_HHMMSS.search(s)
+    m = TIME_HHMMSS.search(s) or TIME_HHMM.search(s)
     if not m:
         return None
-    h, mi, se = map(int, m.groups())
+    h  = int(m.group(1))
+    mi = int(m.group(2))
+    se = int(m.group(3)) if m.re is TIME_HHMMSS else 0
     if not (0 <= h < 24 and 0 <= mi < 60 and 0 <= se < 60):
         return None
     base = datetime.combine(now_jst().date(), time(h, mi, se), tzinfo=JST)
@@ -1423,7 +1431,7 @@ def add_time(base_time_str, duration_str):
     dt = base_dt + timedelta(hours=h, minutes=m, seconds=s)
     return dt, dt.strftime("%H:%M:%S")
 
-TIME_RE = re.compile(r"\b\d{1,2}[:：]\d{2}[:：]\d{2}\b")
+TIME_RE = TIME_HHMMSS   # 後方互換のため
 
 def extract_imsen_durations(texts: list[str]) -> list[str]:
     durations = []
