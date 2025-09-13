@@ -20,6 +20,8 @@ from pathlib import Path
 from PIL.ExifTags import TAGS
 import base64
 from openai import OpenAI  # ← 追加
+from collections import deque
+import random
 
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
 
@@ -200,6 +202,39 @@ if _openai_key:
         print("✅ OpenAI client ready (OCR fallback: gpt-5-mini)")
     except Exception as e:
         print(f"⚠️ OpenAI init failed: {e}")
+# === OpenAI Async クライアント（無ければ None で動く）===
+try:
+    from openai import AsyncOpenAI
+    OA_ASYNC = AsyncOpenAI(api_key=_openai_key) if _openai_key else None
+except Exception:
+    OA_ASYNC = None
+
+# Responses API を使えるか？
+OA_SUPPORTS_RESPONSES = bool(getattr(OA_ASYNC, "responses", None))
+
+# ---- レートリミット/RPM(60秒窓) & バックオフ設定 ----
+OPENAI_RPM = int(os.getenv("OPENAI_RPM", "3"))  # 例: gpt-4o-mini は 3RPM
+OPENAI_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini")
+_oa_calls = deque()
+_oa_lock = asyncio.Lock()
+_oa_circuit_until = 0.0  # quota 切れ時の休止期限（event loop monotonic 秒）
+
+def _now_mono():
+    return asyncio.get_event_loop().time()
+
+async def _ensure_openai_slot():
+    """60秒窓で RPM を守る。枠が空くまで await で待機。"""
+    async with _oa_lock:
+        now = _now_mono()
+        while _oa_calls and now - _oa_calls[0] > 60:
+            _oa_calls.popleft()
+        if len(_oa_calls) >= OPENAI_RPM:
+            wait = 60 - (now - _oa_calls[0]) + 0.01
+            await asyncio.sleep(max(0.0, wait))
+            now = _now_mono()
+            while _oa_calls and now - _oa_calls[0] > 60:
+                _oa_calls.popleft()
+        _oa_calls.append(_now_mono())
 
 def google_ocr_from_np(np_bgr) -> list[str]:
     """
@@ -527,6 +562,102 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
             out.append(t2)
     return out
 
+def _bgr_to_data_uri_np(bgr: np.ndarray) -> str | None:
+    ok, buf = cv2.imencode(".png", bgr)
+    if not ok:
+        return None
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("utf-8")
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray) -> dict | None:
+    """
+    単一リクエストで2領域をOCRし、JSONで返す:
+      {"top_clock_lines":[...], "center_lines":[...],
+       "structured":{"server":"s####","rows":[{"place":int,"status":"免戦中","duration":"HH:MM:SS"}]}}
+    - 非同期SDK/Responsesが無い場合は chat.completions に自動フォールバック
+    - RPM制御 / 429バックオフ / quotaサーキットブレーカ
+    """
+    if OA_ASYNC is None:
+        return None
+
+    now = _now_mono()
+    if now < _oa_circuit_until:
+        return None  # quota 休止中
+
+    img1 = _bgr_to_data_uri_np(top_bgr)
+    img2 = _bgr_to_data_uri_np(center_bgr)
+    if not img1 or not img2:
+        return None
+
+    # Responses 用コンテンツ
+    content_responses = [
+        {"type": "input_text", "text": (
+            "与えられた2枚の画像について、次のJSONで返して。説明不要・必ずJSONのみ：\n"
+            '{"top_clock_lines":[<上部(時計)の行文字列>],'
+            '"center_lines":[<中央リストの行文字列>],'
+            '"structured":{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}}\n'
+            "中央の構造化は見えた範囲でOK。数値/コロンは正規化して。"
+        )},
+        {"type": "input_image", "image_url": img1},
+        {"type": "input_image", "image_url": img2},
+    ]
+    # Chat Completions 用コンテンツ
+    content_chat = [
+        {"type": "text", "text": (
+            "与えられた2枚の画像について、次のJSONで返して。説明不要・必ずJSONのみ：\n"
+            '{"top_clock_lines":[<上部(時計)の行文字列>],'
+            '"center_lines":[<中央リストの行文字列>],'
+            '"structured":{"server":"s####","rows":[{"place":<int>,"status":"免戦中","duration":"HH:MM:SS"}]}}\n'
+            "中央の構造化は見えた範囲でOK。数値/コロンは正規化して。"
+        )},
+        {"type": "image_url", "image_url": {"url": img1}},
+        {"type": "image_url", "image_url": {"url": img2}},
+    ]
+
+    backoff = 1.0
+    for _ in range(5):
+        try:
+            await _ensure_openai_slot()
+            if OA_SUPPORTS_RESPONSES:
+                res = await OA_ASYNC.responses.create(
+                    model=OPENAI_MODEL,
+                    input=[{"role": "user", "content": content_responses}],
+                    max_output_tokens=700,
+                )
+                txt = (res.output_text or "").strip()
+            else:
+                res = await OA_ASYNC.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": content_chat}],
+                    max_tokens=700,
+                )
+                txt = (res.choices[0].message.content or "").strip()
+
+            txt = _strip_code_fences(txt)
+            if not txt or not txt.startswith("{"):
+                return None
+            return json.loads(txt)
+
+        except Exception as e:
+            msg = str(e).lower()
+            if "insufficient_quota" in msg:
+                cooldown = int(os.getenv("OPENAI_CIRCUIT_COOLDOWN", "600"))
+                globals()["_oa_circuit_until"] = _now_mono() + cooldown
+                print(f"[OpenAI] quota exhausted → circuit open for {cooldown}s")
+                return None
+            if "rate_limit" in msg or "429" in msg:
+                await asyncio.sleep(backoff + random.random() * 0.3)
+                backoff = min(backoff * 2, 8.0)
+                continue
+            raise
+    return None
+
 def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
     """
     中央リストから『越域駐騎場<番号>』と『免戦中 HH:MM:SS』を JSON で抽出。
@@ -577,6 +708,8 @@ def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
     except Exception as e:
         print(f"[OpenAI OCR JSON] error: {e}")
         return None
+
+
 
 async def ping_google_vision() -> tuple[bool, str]:
     """
@@ -999,6 +1132,10 @@ def extract_text_from_image_google(np_bgr: np.ndarray) -> list[str]:
     except Exception as e:
         print(f"[GV-OCR] error: {e}")
         return []
+
+async def extract_text_from_image_google_async(np_bgr: np.ndarray) -> list[str]:
+    """GVの同期APIをスレッドに逃がしてイベントループを止めない"""
+    return await asyncio.to_thread(extract_text_from_image_google, np_bgr)
 
 # ---- 中央OCR強化ユーティリティ ----
 def preprocess_for_colon(img_bgr: np.ndarray) -> list[np.ndarray]:
@@ -2687,16 +2824,18 @@ async def on_message(message):
         img = Image.open(io.BytesIO(b)).convert("RGB")
         np_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        # 免戦中の帯を黒塗り（既存の処理と同じ前処理）
+        # 免戦中の帯を黒塗り（既存処理と同じ）
         np_img_masked, masked_cnt = auto_mask_ime(np_img)
 
-        # トリムして OpenAI のみで OCR
+        # トリム → 単一APIで top/center/structured を同時取得
         top = crop_top_right(np_img_masked)
         center = crop_center_area(np_img_masked)
-        top_txts    = oai_ocr_lines(top, purpose="clock")
-        center_txts = oai_ocr_lines(center, purpose="general")
+        j = await oai_ocr_all_in_one_async(top, center)
 
-        # 予定プレビュー（既存のパーサをOpenAI出力で再利用）
+        top_txts    = (j or {}).get("top_clock_lines", []) or []
+        center_txts = (j or {}).get("center_lines", []) or []
+
+        # 予定プレビュー（既存パーサ再利用）
         parsed_preview = parse_multiple_places(center_txts, top_txts)
         preview_lines = [f"・{txt}" for _, txt, _ in parsed_preview] if parsed_preview else ["(なし)"]
 
@@ -2704,12 +2843,45 @@ async def on_message(message):
         durations = extract_imsen_durations(center_txts)
         duration_text = "\n".join(durations) if durations else "(抽出なし)"
 
+        # サーバー番号（JSON優先→テキストフォールバック）
+        server_raw = (((j or {}).get("structured") or {}).get("server"))
+        if isinstance(server_raw, str) and server_raw.strip():
+            server_digits = re.sub(r"^[sS]", "", server_raw.strip())
+        else:
+            server_digits = extract_server_number(center_txts)
+
+        # 上部時計の基準時刻（先頭を補正して抽出）
+        base = None
+        if top_txts:
+            raw = normalize_time_separators(top_txts[0])
+            raw = force_hhmmss_if_six_digits(raw)
+            m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
+            if m:
+                h, mi, se = map(int, m.groups())
+                base = f"{h:02}:{mi:02}:{se:02}"
+
+        # JSONの structured → テキストプレビュー（補助）
+        rows = (((j or {}).get("structured") or {}).get("rows")) or []
+        if rows and base and server_digits:
+            mode = "警備" if server_digits == "1268" else "奪取"
+            preview_extra = []
+            for row in rows:
+                place = str(row.get("place"))
+                dur   = correct_imsen_text(str(row.get("duration", "")))
+                if not place or dur == "":
+                    continue
+                dt, unlock = add_time(base, dur)
+                if dt:
+                    preview_extra.append(f"{mode} {server_digits}-{place}-{unlock}")
+            if preview_extra:
+                preview_lines = [f"・{p}" for p in preview_extra]
+
         # 文字列整形
         top_txts_str    = "\n".join(top_txts) if top_txts else "(検出なし)"
         center_txts_str = "\n".join(center_txts) if center_txts else "(検出なし)"
         preview_text    = "\n".join(preview_lines)
 
-        # クロップ画像も添付（見比べやすい）
+        # クロップ画像も添付
         files = []
         def _attach(bgr_img, filename, quality=92):
             try:
@@ -2722,53 +2894,10 @@ async def on_message(message):
         _attach(np_img_masked, f"oai_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", 92)
         _attach(top,             f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",         92)
         _attach(center,          f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",      95)
-        # --- OpenAI構造化抽出(JSON) ---
-        j = oai_extract_parking_json(center)
-
-        # サーバー番号（JSON が 's1296' でもOKに）
-        server_raw = (j or {}).get("server")
-        if isinstance(server_raw, str) and server_raw.strip():
-            server_digits = re.sub(r"^[sS]", "", server_raw.strip())
-        else:
-            server_digits = extract_server_number(center_txts)  # ← フォールバックは OCR 行から
-        rows = (j or {}).get("rows") or []
-
-        # 上部時計（基準時刻）
-        base = None
-        if top_txts:
-            raw = normalize_time_separators(top_txts[0])
-            raw = force_hhmmss_if_six_digits(raw)
-            m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", raw)
-            if m:
-                h, mi, se = map(int, m.groups())
-                base = f"{h:02}:{mi:02}:{se:02}"
-
-        # プレビュー生成（JSON → テキスト）
-        preview = []
-        if rows and base and server_digits:
-            mode = "警備" if server_digits == "1268" else "奪取"
-            for row in rows:
-                place = str(row.get("place"))
-                dur   = correct_imsen_text(str(row.get("duration","")))
-                if not place or dur == "":
-                    continue
-                dt, unlock = add_time(base, dur)
-                if dt:
-                    preview.append(f"{mode} {server_digits}-{place}-{unlock}")
-
-        # 画面表示に追加
-        if preview:
-            preview_text = "\n".join(f"・{p}" for p in preview)
-        else:
-            preview_text = "(なし)"
-
-        # 既存の送信テキストに上書き/追記
-        # top_txts_str / center_txts_str はそのまま
-        # 下の送信部分の preview_text をこの preview_text で差し替える
 
         await message.channel.send(
             content=(
-                f"🤖 **OpenAI OCR（gpt-5-mini）の結果**\n"
+                f"🤖 **OpenAI OCR（{OPENAI_MODEL}）の結果**\n"
                 f"📸 上部（時計）:\n```\n{top_txts_str}\n```\n"
                 f"🧩 中央（本文）:\n```\n{center_txts_str}\n```\n"
                 f"📋 予定プレビュー:\n```\n{preview_text}\n```\n"
@@ -2802,7 +2931,7 @@ async def on_message(message):
         center = crop_center_area(np_img)
 
         # ★ GV のみでOCR
-        top_txts = extract_text_from_image_google(top)
+        top_txts = await extract_text_from_image_google_async(top)
         center_txts = ocr_center_google(center)  # ここもGV専用（Paddle不使用）
 
         # 予定抽出（既存のパーサをそのまま利用）
