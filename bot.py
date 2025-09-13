@@ -599,6 +599,7 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
         '"structured":{"server":"","rows":[{"place":0,"status":"免戦中","duration":"00:00:00"}]}}'
         ' 上のJSONだけ返す。'
         ' 右上はゲーム内時計、中央は一覧、最下部は「停戦終了 HH:MM:SS」。'
+        ' 配列要素は必ず文字列（str）にし、オブジェクトを入れないこと。'
         ' 数字/コロンは正規化して。'
     )
 
@@ -906,6 +907,7 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
         '"structured":{"server":"","rows":[{"place":0,"status":"免戦中","duration":"00:00:00"}]}}'
         ' 以上のJSONだけを返す。数値とコロンは正規化。'
         ' 帯から「停戦終了 HH:MM:SS」を読めたら ceasefire_end に入れる。'
+        ' 配列要素は必ず文字列（str）にし、オブジェクトを入れないこと。'
     )
 
     content_responses = [
