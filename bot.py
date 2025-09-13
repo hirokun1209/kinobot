@@ -26,6 +26,12 @@ import random
 # 共通の時刻パターン（HH:MM:SS / HH:MM）
 TIME_HHMMSS = re.compile(r"\b(\d{1,2})[:：](\d{2})[:：](\d{2})\b")
 TIME_HHMM   = re.compile(r"\b(\d{1,2})[:：](\d{2})\b")
+
+# ← ここから追加
+# [s1234] の有無・「越域」の有無・「駐騎/駐车/駐車」どれでも許容
+PLACE_RE = re.compile(
+    r"(?:\[\s*[sS]\d{3,4}\s*\])?\s*越域?\s*駐[騎骑车車]場\s*(\d+)"
+)
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
 
 def _get_exif_datetime_strings(img_bytes: bytes) -> dict:
@@ -1192,7 +1198,8 @@ def crop_top_right(img):
 
 def crop_center_area(img):
     h, w = img.shape[:2]
-    return img[int(h*0.35):int(h*0.65), :]
+    # 旧: return img[int(h*0.35):int(h*0.65), :]
+    return img[int(h*0.30):int(h*0.72), :]
 
 def extract_text_from_image(img):
     result = ocr.ocr(img, cls=True)
@@ -1437,13 +1444,14 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
     durations = []
     for text in texts:
         t = normalize_time_separators(text)
-        # ① 「免戦中 …」から優先して取る
+        # ① 「免戦中 …」を優先
         for m in re.findall(r"免戦中\s*([0-9:：]{4,10})", t):
             durations.append(correct_imsen_text(m))
         # ② ①で取れなかったら、裸の時間をフォールバックで拾う
         if not durations:
-            for m in TIME_RE.findall(t):
-                durations.append(correct_imsen_text(m))
+            # 旧: for m in TIME_RE.findall(t): durations.append(correct_imsen_text(m))
+            for m in TIME_RE.finditer(t):
+                durations.append(correct_imsen_text(m.group(0)))
     return durations
 
 def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|None = None):
@@ -1474,16 +1482,16 @@ def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|
     current_group = {"place": None, "lines": []}
 
     for line in center_texts:
-        match = re.search(r"越域駐騎場(\d+)", line)
-        if match:
+        m = PLACE_RE.search(line)
+        if m:
             if current_group["place"] and current_group["lines"]:
                 groups.append(current_group)
-            current_group = {"place": match.group(1), "lines": []}
+            current_group = {"place": m.group(1), "lines": []}
         else:
             current_group["lines"].append(line)
 
     if current_group["place"] and current_group["lines"]:
-        groups.append(current_group)
+        groups.append(current_group
 
     # ✅ 各グループの免戦時間抽出（免戦中の近傍±2行 & 上限時間でフィルタ）
     for g in groups:
