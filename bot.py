@@ -500,7 +500,7 @@ def crop_cease_banner(bgr: np.ndarray) -> np.ndarray | None:
     端末差がある場合は比率を微調整してください。
     """
     h, w = bgr.shape[:2]
-    y1, y2 = int(h*0.17), int(h*0.25)
+    y1, y2 = int(h*0.25), int(h*0.30)
     x1, x2 = int(w*0.12), int(w*0.88)
     if y2 - y1 < 12 or x2 - x1 < 12:
         return None
