@@ -1750,39 +1750,53 @@ def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|
                 return f"{int(h):02}:{int(m):02}:{int(s):02}"
         return None
 
-    # ★ 追加: メタ優先の上書き
     top_time = base_time_override or extract_top_time(top_time_texts)
-
     server = extract_server_number(center_texts)
     if not top_time or not server:
         return []
 
     mode = "警備" if server == "1268" else "奪取"
 
-    # ✅ グループ構築
-    groups = []
-    current_group = {"place": None, "lines": []}
+    # --- ① 1行完結パターン（その行に「免戦中 HH:MM:SS」まで含まれる）を直取り ---
+    seen = set()  # (server, place) 重複防止
+    for line in center_texts:
+        m = PLACE_RE.search(line)
+        if not m:
+            continue
+        place = m.group(1)
+        d = pick_duration_from_group([line])  # 同じ行から時間を拾う
+        if d:
+            dt, unlock = add_time(top_time, d)
+            if dt and (server, place) not in seen:
+                res.append((dt, f"{mode} {server}-{place}-{unlock}", d))
+                seen.add((server, place))
 
+    # --- ② ヘッダ行と別行のパターン（グループ化）。ヘッダ行も lines に含めるのがポイント ---
+    groups = []
+    current = None
     for line in center_texts:
         m = PLACE_RE.search(line)
         if m:
-            if current_group["place"] and current_group["lines"]:
-                groups.append(current_group)
-            current_group = {"place": m.group(1), "lines": []}
+            if current and current["place"] and current["lines"]:
+                groups.append(current)
+            current = {"place": m.group(1), "lines": [line]}  # ← ヘッダ行も入れる！
         else:
-            current_group["lines"].append(line)
+            if current:
+                current["lines"].append(line)
+    if current and current["place"] and current["lines"]:
+        groups.append(current)
 
-    if current_group["place"] and current_group["lines"]:
-        groups.append(current_group)
-
-    # ✅ 各グループの免戦時間抽出（免戦中の近傍±2行 & 上限時間でフィルタ）
     for g in groups:
+        if (server, g["place"]) in seen:
+            continue
         d = pick_duration_from_group(g["lines"])
         if not d:
             continue
         dt, unlock = add_time(top_time, d)
         if dt:
             res.append((dt, f"{mode} {server}-{g['place']}-{unlock}", d))
+            seen.add((server, g["place"]))
+
     return res
 
 def correct_imsen_text(text: str) -> str:
