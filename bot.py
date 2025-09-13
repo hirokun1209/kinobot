@@ -684,6 +684,17 @@ def _bgr_to_data_uri_np(bgr: np.ndarray) -> str | None:
         return None
     return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("utf-8")
 
+def _bgr_to_png_bytes_and_data_uri(img_bgr: np.ndarray) -> tuple[bytes | None, str | None]:
+    """同じエンコード結果を OpenAI送信用(URI) と Discord添付用(bytes)の両方で返す"""
+    if img_bgr is None:
+        return None, None
+    ok, buf = cv2.imencode(".png", img_bgr)
+    if not ok:
+        return None, None
+    by = buf.tobytes()
+    uri = "data:image/png;base64," + base64.b64encode(by).decode("utf-8")
+    return by, uri
+
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     if s.startswith("```"):
@@ -708,11 +719,10 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
     if now < _oa_circuit_until:
         return None  # quota休止中
 
-    # ⬇ 送る前に縮小（画素数＝コスト）
+    # 送る前に縮小（画素数＝コスト）
     top_small    = shrink_long_side(top_bgr,    640)
     center_small = shrink_long_side(center_bgr, 768)
 
-    # ⬇ full の代わりに『停戦終了』帯だけ切り出して小さく
     cease_small = None
     if full_bgr is not None:
         try:
@@ -722,9 +732,13 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
         except Exception:
             cease_small = None
 
-    img1 = _bgr_to_data_uri_np(top_small)
-    img2 = _bgr_to_data_uri_np(center_small)
-    img3 = _bgr_to_data_uri_np(cease_small) if cease_small is not None else None
+    # ★ ここを置換：OpenAI用の data_uri と Discord用の png bytes を同時に作成
+    top_png,    img1 = _bgr_to_png_bytes_and_data_uri(top_small)
+    center_png, img2 = _bgr_to_png_bytes_and_data_uri(center_small)
+    cease_png,  img3 = (None, None)
+    if cease_small is not None:
+        cease_png, img3 = _bgr_to_png_bytes_and_data_uri(cease_small)
+
     if not img1 or not img2:
         return None
 
@@ -736,7 +750,6 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
         ' 帯から「停戦終了 HH:MM:SS」を読めたら ceasefire_end に入れる。'
     )
 
-    # ⬇ detail は "low"
     content_responses = [
         {"type": "input_text", "text": instruction},
         {"type": "input_image", "image_url": img1, "detail": "low"},
@@ -776,7 +789,17 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
             txt = _strip_code_fences(txt)
             if not txt or not txt.startswith("{"):
                 return None
-            return json.loads(txt)
+            out = json.loads(txt)
+
+            # ★ 追加：OpenAI に送った PNG bytes を同梱（ローカル利用用）
+            out["_echo"] = {
+                "top_png": top_png,
+                "center_png": center_png,
+            }
+            if cease_png:
+                out["_echo"]["cease_png"] = cease_png
+
+            return out
 
         except Exception as e:
             msg = str(e).lower()
@@ -3073,28 +3096,49 @@ async def on_message(message):
         cease_show = cease_str or (cease_dt.strftime("%H:%M:%S") if cease_dt else "(検出なし)")
         delta_show = f"{delta_sec:+d}秒" if delta_sec else "±0秒"
 
-        # デバッグ添付
+        # ーー デバッグ添付 ここから ーー
         files = []
-        def _attach(bgr_img, filename, quality=92):
+
+        def _attach_jpg(bgr_img, filename, quality=92):
             try:
                 ok, buf = cv2.imencode(".jpg", bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-                if ok: files.append(discord.File(io.BytesIO(buf.tobytes()), filename=filename))
-            except Exception: pass
+                if ok:
+                    files.append(discord.File(io.BytesIO(buf.tobytes()), filename=filename))
+            except Exception:
+                pass
 
-        _attach(np_img_masked, f"oai_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", 92)
-        _attach(top,          f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",           92)
-        _attach(center,       f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",        95)
+        # PNG bytes 直添付ヘルパー（★追加）
+        def _attach_png_bytes(png_bytes: bytes | None, filename: str):
+            try:
+                if png_bytes:
+                    files.append(discord.File(io.BytesIO(png_bytes), filename=filename))
+            except Exception:
+                pass
 
-        # 停戦終了の切り取り画像も添付（合計10枚まで）
+        # 全体（黒塗り済み）は JPG で1枚だけ残す
+        _attach_jpg(np_img_masked, f"oai_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", 92)
+
+        # ★ OpenAI に送ったのと同じ PNG をそのまま添付
+        echo = (j or {}).get("_echo", {})
+        base = a.filename.rsplit('.', 1)[0]
+        _attach_png_bytes(echo.get("top_png"),    f"oai_sent_top_{base}.png")
+        _attach_png_bytes(echo.get("center_png"), f"oai_sent_center_{base}.png")
+        _attach_png_bytes(echo.get("cease_png"),  f"oai_sent_cease_{base}.png")  # ← 停戦終了の帯（送っていれば必ず一致）
+
+        # （任意）Paddleベースの「停戦終了」切り抜きは、空き枠があるときだけ追加して比較用に
         try:
-            cease_rects = find_ceasefire_regions_full_img(np_img_masked)
-            # 既に full/top/center を入れているので、超えない範囲で追加
-            max_extra = max(0, 10 - len(files))
-            for i, (x1, y1, x2, y2) in enumerate(cease_rects[:max_extra], start=1):
-                crop = np_img_masked[y1:y2, x1:x2]
-                _attach(crop, f"oai_cease_{i}_{a.filename.rsplit('.',1)[0]}.jpg", quality=95)
+            remain = max(0, 10 - len(files))  # Discord 1メッセージ=最大10添付
+            if remain > 0:
+                cease_rects = find_ceasefire_regions_full_img(np_img_masked)
+                for i, (x1, y1, x2, y2) in enumerate(cease_rects[:remain], start=1):
+                    crop = np_img_masked[y1:y2, x1:x2]
+                    _attach_jpg(crop, f"oai_cease_paddle_{i}_{base}.jpg", quality=95)
         except Exception:
             pass
+
+        # 画像を先に送る（本文が長くても画像は確実に届く）
+        if files:
+            await message.channel.send(content=f"📎 デバッグ画像（{len(files)}件）", files=files)
 
         def _split_chunks(s: str, limit: int = 1900) -> list[str]:
             s = s or ""
