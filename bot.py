@@ -3085,33 +3085,41 @@ async def on_message(message):
         _attach(top,          f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",           92)
         _attach(center,       f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",        95)
 
-        # 停戦終了の切り取り画像も添付
+        # 停戦終了の切り取り画像も添付（合計10枚まで）
         try:
             cease_rects = find_ceasefire_regions_full_img(np_img_masked)
-            for i, (x1, y1, x2, y2) in enumerate(cease_rects, start=1):
+            # 既に full/top/center を入れているので、超えない範囲で追加
+            max_extra = max(0, 10 - len(files))
+            for i, (x1, y1, x2, y2) in enumerate(cease_rects[:max_extra], start=1):
                 crop = np_img_masked[y1:y2, x1:x2]
                 _attach(crop, f"oai_cease_{i}_{a.filename.rsplit('.',1)[0]}.jpg", quality=95)
         except Exception:
             pass
 
-        # 送信（補正前と最終出力を両方表示）
-        await message.channel.send(
-            content=(
-                f"🤖 **OpenAI OCR（{OPENAI_MODEL}）の結果**\n"
-                f"📸 上部（時計）:\n```\n{chr(10).join(top_txts) if top_txts else '(検出なし)'}\n```\n"
-                f"🧩 中央（本文）:\n```\n{chr(10).join(center_txts) if center_txts else '(検出なし)'}\n```\n"
-                f"🕒 基準(右上時計): `{base_show}`\n"
-                f"🛡 停戦終了: `{cease_show}` / 自動補正: {delta_show}（閾値±{CEASEFIX_MAX_SEC}s）\n"
-                f"📋 **補正前の予定プレビュー**:\n```\n{preview_text}\n```\n"
-                f"🧾 **最終出力（登録される行）**:\n```\n{final_text}\n```\n"
-                f"⏳ 免戦時間候補:\n```\n{duration_text}\n```\n"
-                f"🧽 maskime: {masked_cnt} 本"
-            ),
-            files=files if files else None
+        def _split_chunks(s: str, limit: int = 1900) -> list[str]:
+            s = s or ""
+            return [s[i:i+limit] for i in range(0, len(s), limit)]
+
+        report = (
+            f"🤖 **OpenAI OCR（{OPENAI_MODEL}）の結果**\n"
+            f"📸 上部（時計）:\n```\n{chr(10).join(top_txts) if top_txts else '(検出なし)'}\n```\n"
+            f"🧩 中央（本文）:\n```\n{chr(10).join(center_txts) if center_txts else '(検出なし)'}\n```\n"
+            f"🕒 基準(右上時計): `{base_show}`\n"
+            f"🛡 停戦終了: `{cease_show}` / 自動補正: {delta_show}（閾値±{CEASEFIX_MAX_SEC}s）\n"
+            f"📋 **補正前の予定プレビュー**:\n```\n{preview_text}\n```\n"
+            f"🧾 **最終出力（登録される行）**:\n```\n{final_text}\n```\n"
+            f"⏳ 免戦時間候補:\n```\n{duration_text}\n```\n"
+            f"🧽 maskime: {masked_cnt} 本"
         )
+
+        # ① まず画像だけを送る（本文が長すぎても画像は確実に届く）
+        if files:
+            await message.channel.send(content=f"📎 デバッグ画像（{len(files)}件）", files=files)
+        
+        # ② 本文は 2,000 文字制限に合わせて分割送信
+        for chunk in _split_chunks(report, 1900):
+            await message.channel.send(content=chunk)
         return
-
-
 
     # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
     if message.content.strip() == "!gvocr":
