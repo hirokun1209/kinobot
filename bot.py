@@ -3155,10 +3155,6 @@ async def on_message(message):
             f"⏳ 免戦時間候補:\n```\n{duration_text}\n```\n"
             f"🧽 maskime: {masked_cnt} 本"
         )
-
-        # ① まず画像だけを送る（本文が長すぎても画像は確実に届く）
-        if files:
-            await message.channel.send(content=f"📎 デバッグ画像（{len(files)}件）", files=files)
         
         # ② 本文は 2,000 文字制限に合わせて分割送信
         for chunk in _split_chunks(report, 1900):
