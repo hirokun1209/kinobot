@@ -992,6 +992,64 @@ def auto_mask_ime(bgr: np.ndarray) -> tuple[np.ndarray, int]:
         return bgr, 0
     return fill_rects_black(bgr, rects), len(rects)
 
+# ==== 停戦終了の検出＆切り取り（Y軸ちょい下寄せ） ====
+
+# 調整用パラメータ（必要に応じて環境変数で上書き）
+CEASE_PAD_X            = int(os.getenv("CEASE_PAD_X", "20"))      # 左右の余白(px)
+CEASE_PAD_TOP          = int(os.getenv("CEASE_PAD_TOP", "6"))     # 上側の余白(px)
+CEASE_PAD_BOTTOM       = int(os.getenv("CEASE_PAD_BOTTOM", "68")) # 下側の余白(px) ← 少し多め
+CEASE_Y_SHIFT_RATIO    = float(os.getenv("CEASE_Y_SHIFT_RATIO", "0.30"))  # テキスト高さに対する下方向オフセット比
+
+def find_ceasefire_regions_full_img(
+    bgr: np.ndarray,
+    y_shift_ratio: float | None = None,
+    pad_bottom: int | None = None,
+    pad_x: int | None = None,
+    pad_top: int | None = None,
+) -> list[tuple[int,int,int,int]]:
+    """
+    画像全体を PaddleOCR で走らせ、『停戦終了』を含むテキストボックスを見つけ、
+    その周辺を“少し下寄せ”で切り取り矩形 (x1,y1,x2,y2) のリストで返す。
+    """
+    y_shift_ratio = CEASE_Y_SHIFT_RATIO if y_shift_ratio is None else y_shift_ratio
+    pad_bottom    = CEASE_PAD_BOTTOM    if pad_bottom    is None else pad_bottom
+    pad_x         = CEASE_PAD_X         if pad_x         is None else pad_x
+    pad_top       = CEASE_PAD_TOP       if pad_top       is None else pad_top
+
+    rects: list[tuple[int,int,int,int]] = []
+    try:
+        result = ocr.ocr(bgr, cls=True)
+    except Exception:
+        result = None
+
+    if not result or not result[0]:
+        return rects
+
+    H, W = bgr.shape[:2]
+    for item in result[0]:
+        box, (text, conf) = item
+        if "停戦終了" not in str(text):
+            continue
+
+        xs = [int(p[0]) for p in box]
+        ys = [int(p[1]) for p in box]
+        x_min, x_max = max(0, min(xs)), min(W, max(xs))
+        y_min, y_max = max(0, min(ys)), min(H, max(ys))
+        h_txt = max(8, y_max - y_min)
+
+        # “Y軸をもう少し下へ”の肝：テキスト高さ割合で下方向にシフト
+        y_shift = int(h_txt * y_shift_ratio)
+
+        x1 = max(0, x_min - pad_x)
+        x2 = min(W, x_max + pad_x)
+        y1 = max(0, y_min - pad_top + y_shift)
+        y2 = min(H, y_max + pad_bottom + y_shift)
+
+        if (x2 - x1) >= 10 and (y2 - y1) >= 10:
+            rects.append((x1, y1, x2, y2))
+
+    return rects
+
 async def _notify_discord_upload_meta(filename: str, meta: dict, channel_id: int):
     await client.wait_until_ready()
     ch = client.get_channel(channel_id)   # ← 渡されたチャンネルへ
@@ -3026,6 +3084,15 @@ async def on_message(message):
         _attach(np_img_masked, f"oai_full_masked_{a.filename.rsplit('.',1)[0]}.jpg", 92)
         _attach(top,          f"oai_top_{a.filename.rsplit('.',1)[0]}.jpg",           92)
         _attach(center,       f"oai_center_{a.filename.rsplit('.',1)[0]}.jpg",        95)
+
+        # 停戦終了の切り取り画像も添付
+        try:
+            cease_rects = find_ceasefire_regions_full_img(np_img_masked)
+            for i, (x1, y1, x2, y2) in enumerate(cease_rects, start=1):
+                crop = np_img_masked[y1:y2, x1:x2]
+                _attach(crop, f"oai_cease_{i}_{a.filename.rsplit('.',1)[0]}.jpg", quality=95)
+        except Exception:
+            pass
 
         # 送信（補正前と最終出力を両方表示）
         await message.channel.send(
