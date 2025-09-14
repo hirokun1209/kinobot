@@ -525,34 +525,120 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     r = max_side / s
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
 
+def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
+    """左右上下を割合でトリミング"""
+    h, w = bgr.shape[:2]
+    x1 = int(w * l); y1 = int(h * t)
+    x2 = w - int(w * r); y2 = h - int(h * b)
+    x1 = max(0, min(x1, w-1)); y1 = max(0, min(y1, h-1))
+    x2 = max(x1+1, min(x2, w)); y2 = max(y1+1, min(y2, h))
+    return bgr[y1:y2, x1:x2]
+
+def find_black_bands_rows(bgr: np.ndarray,
+                          thr=BLACK_ROW_LUMA_THR,
+                          ratio=BLACK_ROW_RATIO,
+                          min_h=BLACK_MIN_H) -> list[tuple[int,int]]:
+    """横一帯の黒塗り（行）を検出して [(y1,y2), ...] を返す"""
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    h, w = g.shape
+    row_black = (g < thr).sum(axis=1) >= int(w * ratio)
+    bands = []
+    i = 0
+    while i < h:
+        if row_black[i]:
+            j = i
+            while j < h and row_black[j]:
+                j += 1
+            if (j - i) >= min_h:
+                bands.append((i, j))
+            i = j
+        else:
+            i += 1
+    return bands
+
+def compact_black_rows_and_cut_tail(bgr: np.ndarray) -> np.ndarray:
+    """
+    黒帯行は丸ごと削除して上に詰める。
+    さらに『最後の黒帯の終端』より下は全部削除。
+    """
+    bands = find_black_bands_rows(bgr)
+    if not bands:
+        return bgr
+    h = bgr.shape[0]
+    last_end = bands[-1][1]
+    keep = np.ones(h, dtype=bool)
+    for y1, y2 in bands:
+        keep[y1:y2] = False
+    if DELETE_BELOW_LAST:
+        keep[last_end:] = False
+    return bgr[keep, :, :]
+
 # ===== 1画像ルート：合成 → OpenAI OCR =====
 
 SINGLEIMG_MAX_SIDE = int(os.getenv("SINGLEIMG_MAX_SIDE", "1280"))  # 送信用に縮小してトークン節約
 CLOCK_SCALE_W      = float(os.getenv("CLOCK_SCALE_W", "0.32"))    # 右上時計の横幅(ベース比)
 MARGIN_PX          = int(os.getenv("COMPOSE_MARGIN_PX", "10"))    # 貼り付けマージンpx
+# ===== 合成オプション（前処理） =====
+ATTACH_CEASE        = os.getenv("ATTACH_CEASE", "1") == "1"    # 「停戦終了」を下に接続（被せない）
+COMPACT_BLACK       = os.getenv("COMPACT_BLACK", "1") == "1"   # 黒帯を詰める
+DELETE_BELOW_LAST   = os.getenv("DELETE_BELOW_LAST", "1") == "1"  # 最下黒帯より下を削除
+
+# 黒帯（横一帯）検出のしきい値
+BLACK_ROW_LUMA_THR  = int(os.getenv("BLACK_ROW_LUMA_THR",  "22"))   # 0–255 この明度以下を黒扱い
+BLACK_ROW_RATIO     = float(os.getenv("BLACK_ROW_RATIO",   "0.92"))  # 行内の黒ピクセル比がこれを超えたら黒行
+BLACK_MIN_H         = int(os.getenv("BLACK_MIN_H", "10"))            # 黒帯最小高さ(px)
+
+# 仕上げのパーセントトリミング（左20%・上15%）
+POST_CROP_LEFT      = float(os.getenv("POST_CROP_LEFT",  "0.20"))
+POST_CROP_TOP       = float(os.getenv("POST_CROP_TOP",   "0.15"))
+POST_CROP_RIGHT     = float(os.getenv("POST_CROP_RIGHT", "0.00"))
+POST_CROP_BOTTOM    = float(os.getenv("POST_CROP_BOTTOM","0.00"))
+
 
 def compose_center_with_clock_and_cease(bgr_full: np.ndarray) -> tuple[np.ndarray, dict]:
     """
-    1) 免戦中帯を黒塗り
+    1) 「免戦中」の直下を黒塗り（既存）
     2) 中央をベースに切り出し
-    3) 右上時計を右上に、停戦終了帯を一番下に重ねて 1 枚を返す
-    戻り値: (composite_bgr, debug dict)
+    3) 黒帯を詰めて最下黒帯より下を削除
+    4) 左20%・上15%をトリミング
+    5) 「停戦終了」を“下に接続”（被せない）
+    6) 右上の時計を右上へ貼り付け
     """
     # 免戦中の横帯は先に黒塗り（誤読抑止）
     bgr_masked, _ = auto_mask_ime(bgr_full)
 
-    base  = crop_center_area(bgr_masked).copy()
-    clock = crop_top_right(bgr_masked)
-    # 停戦終了は Paddle 検出→無ければ 25〜30% のフォールバック帯
+    # 各パーツを切り出し
+    center = crop_center_area(bgr_masked).copy()
+    clock  = crop_top_right(bgr_masked)
+
+    # 停戦終了帯（検出→無ければフォールバック）
     rects = find_ceasefire_regions_full_img(bgr_masked)
     if rects:
         x1,y1,x2,y2 = rects[0]
         cease = bgr_masked[y1:y2, x1:x2]
     else:
-        cease = crop_cease_banner(bgr_masked)  # ← 25%〜30%/左右12%に変更済みの関数を使う
+        cease = crop_cease_banner(bgr_masked)
 
+    # 黒帯を詰める＋最下黒帯より下を削除
+    if COMPACT_BLACK:
+        center = compact_black_rows_and_cut_tail(center)
+
+    # 左20%・上15%トリミング（値は環境変数で調整可）
+    if any([POST_CROP_LEFT, POST_CROP_TOP, POST_CROP_RIGHT, POST_CROP_BOTTOM]):
+        center = percent_crop(center, POST_CROP_LEFT, POST_CROP_TOP, POST_CROP_RIGHT, POST_CROP_BOTTOM)
+
+    base = center
+
+    # 「停戦終了」を“下に接続”（被せない）
+    if ATTACH_CEASE and cease is not None and cease.size:
+        target_w = base.shape[1]
+        ratio = target_w / max(1, cease.shape[1])
+        csz   = cv2.resize(cease, (target_w, max(12, int(cease.shape[0]*ratio))), interpolation=cv2.INTER_AREA)
+        spacer = np.zeros((6, target_w, 3), dtype=np.uint8)  # 少しだけ間隔
+        base   = np.vstack([base, spacer, csz])
+
+    # 右上の時計を貼り付け（従来通り）
     H, W = base.shape[:2]
-    # 右上時計をリサイズして貼り付け
     if clock is not None and clock.size:
         tw = min(int(W * CLOCK_SCALE_W), clock.shape[1])
         th = max(12, int(clock.shape[0] * (tw / clock.shape[1])))
@@ -560,17 +646,6 @@ def compose_center_with_clock_and_cease(bgr_full: np.ndarray) -> tuple[np.ndarra
         y = max(MARGIN_PX, 2)
         x = W - tw - MARGIN_PX
         base[y:y+th, x:x+tw] = clk
-
-    # 停戦終了帯を下辺にフィット
-    if cease is not None and cease.size:
-        target_w = W - MARGIN_PX*2
-        ratio = target_w / max(1, cease.shape[1])
-        sh = max(12, int(cease.shape[0]*ratio))
-        csz = cv2.resize(cease, (target_w, sh), interpolation=cv2.INTER_AREA)
-        y2 = H - sh - MARGIN_PX
-        # 背景を薄く暗くして見やすく（上書き前に黒長方形を敷く）
-        cv2.rectangle(base, (MARGIN_PX, y2), (MARGIN_PX+target_w, y2+sh), (0,0,0), -1)
-        base[y2:y2+sh, MARGIN_PX:MARGIN_PX+target_w] = csz
 
     return base, {"base_center": base, "clock": clock, "cease": cease}
 
