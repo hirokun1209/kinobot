@@ -32,6 +32,14 @@ TIME_HHMM   = re.compile(r"\b(\d{1,2})[:：](\d{2})\b")
 PLACE_RE = re.compile(
     r"(?:\[\s*[sS]\d{3,4}\s*\])?\s*越域?\s*駐[騎骑车車]場\s*(\d+)"
 )
+# [s1234] / s1234 / 1234 を全部「1234」に正規化
+SERVER_NUM_RE = re.compile(r"[sS]?\s*(\d{3,4})")
+
+def _normalize_server(x) -> str | None:
+    if x is None:
+        return None
+    m = SERVER_NUM_RE.search(str(x))
+    return m.group(1) if m else None
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
 
 # === JSONの曖昧な出力を吸収する正規化 ===
@@ -1816,7 +1824,9 @@ def extract_imsen_durations(texts: list[str]) -> list[str]:
                 durations.append(correct_imsen_text(m.group(0)))
     return durations
 
-def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|None = None):
+def parse_multiple_places(center_texts, top_time_texts,
+                          base_time_override: str | None = None,
+                          server_override: str | None = None):
     res = []
 
     def extract_top_time(txts):
@@ -1831,7 +1841,8 @@ def parse_multiple_places(center_texts, top_time_texts, base_time_override: str|
         return None
 
     top_time = base_time_override or extract_top_time(top_time_texts)
-    server = extract_server_number(center_texts)
+    server = server_override or extract_server_number(center_texts)
+    server = _normalize_server(server)
     if not top_time or not server:
         return []
 
@@ -3302,63 +3313,136 @@ async def on_message(message):
         top_txts    = _coerce_str_lines(j.get("top_clock_lines"))
         center_txts = _coerce_str_lines(j.get("center_lines"))
         cease_str   = _first_str(j.get("ceasefire_end"))
-        base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(raw)
-            
-        # 補正前のプレビュー
-        parsed_preview = parse_multiple_places(center_txts, top_txts, base_time_override=base_clock_str)
-        parsed = list(parsed_preview)
-    
-        # 停戦終了の±補正
-        cease_str = j.get("ceasefire_end")
-        cease_dt  = _parse_hhmmss_to_dt_jst(cease_str) if cease_str else None
-        delta_sec = 0
-        if cease_dt and parsed:
-            top_unlock_dt = parsed[0][0]
-            delta_sec = int((cease_dt - top_unlock_dt).total_seconds())
-            if abs(delta_sec) <= CEASEFIX_MAX_SEC:
-                adjusted = []
-                for dt, txt, raw_dur in parsed:
-                    m = parse_txt_fields(txt)
-                    if not m:
-                        adjusted.append((dt, txt, raw_dur)); continue
-                    mode, server, place, _ = m
-                    ndt = dt + timedelta(seconds=delta_sec)
-                    adjusted.append((ndt, f"{mode} {server}-{place}-{ndt.strftime('%H:%M:%S')}", raw_dur))
-                parsed = adjusted
-            else:
-                delta_sec = 0
-    
-        # 最終テキスト
-        preview_text = "\n".join([f"・{t}" for _, t, _ in parsed_preview]) if parsed_preview else "(なし)"
-        final_text   = "\n".join([f"・{t}" for _, t, _ in parsed]) if parsed else "(なし)"
-        durations    = extract_imsen_durations(center_txts)
-        duration_txt = "\n".join(durations) if durations else "(抽出なし)"
-        base_show    = base_clock_str or "??:??:??"
-        cease_show   = cease_str or "(検出なし)"
-        delta_show   = f"{delta_sec:+d}秒" if delta_sec else "±0秒"
-    
-        # 画像（合成PNG）を添付
-        files = []
-        try:
-            comp_png = (j.get("_echo") or {}).get("composite_png")
-            if comp_png:
-                files.append(discord.File(io.BytesIO(comp_png), filename=f"oai_single_{att.filename.rsplit('.',1)[0]}.png"))
-        except Exception:
-            pass
-    
-        report = (
-            f"🤖 **OpenAI OCR（1画像）**\n"
-            f"📸 上部（時計）:\n```\n{chr(10).join(top_txts) if top_txts else '(検出なし)'}\n```\n"
-            f"🧩 中央（本文）:\n```\n{chr(10).join(center_txts) if center_txts else '(検出なし)'}\n```\n"
-            f"🕒 基準(右上時計): `{base_show}`\n"
-            f"🛡 停戦終了: `{cease_show}` / 自動補正: {delta_show}（閾値±{CEASEFIX_MAX_SEC}s）\n"
-            f"📋 **補正前の予定プレビュー**:\n```\n{preview_text}\n```\n"
-            f"🧾 **最終出力（登録される行）**:\n```\n{final_text}\n```\n"
-            f"⏳ 免戦時間候補:\n```\n{duration_txt}\n```"
+
+        # 基準時計（OCR優先 → メタ）
+        base_clock_ocr  = _extract_clock_from_top_txts(top_txts)
+        base_clock_meta = base_time_from_metadata(raw)
+        base_clock_str  = base_clock_ocr or base_clock_meta
+        base_kind       = "ocr" if base_clock_ocr else ("meta" if base_clock_meta else "none")
+
+        # ③ OpenAI の structured.server を優先
+        server_oai = _normalize_server((j.get("structured") or {}).get("server"))
+
+        parsed_preview = parse_multiple_places(
+            center_txts, top_txts,
+            base_time_override=base_clock_str,
+            server_override=server_oai,   # ★ ここがポイント
         )
-        # Discord 2000 文字対策
-        for i in range(0, len(report), 1900):
-            await message.channel.send(content=report[i:i+1900], files=files if i==0 and files else None)
+        parsed = list(parsed_preview)
+
+        # ④ からっぽなら OpenAI の rows から復元
+        if not parsed:
+            rows = ((j.get("structured") or {}).get("rows") or [])
+            srv = server_oai
+            if srv and base_clock_str and rows:
+                mode = "警備" if srv == "1268" else "奪取"
+                for r in rows:
+                    place = _first_str(r.get("place"))
+                    dur   = correct_imsen_text(_first_str(r.get("duration") or ""))
+                    if not (place and dur):
+                        continue
+                    dt, unlock = add_time(base_clock_str, dur)
+                    if dt:
+                        parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
+
+        # ---- 登録処理 & !g 用グループ構築（フォームと同じ流儀）----
+        image_results = []
+        structured_entries_for_this_image = []
+
+        for dt, txt, raw_dur in parsed:
+            g = parse_txt_fields(txt)
+            if g:
+                _mode, _server, _place, _ = g
+                structured_entries_for_this_image.append({
+                    "mode": _mode, "server": _server, "place": _place,
+                    "dt": dt, "txt": txt,
+                    "main_msg_id": pending_places.get(txt, {}).get("main_msg_id"),
+                    "copy_msg_id": pending_places.get(txt, {}).get("copy_msg_id"),
+                })
+
+            if txt not in pending_places:
+                pending_places[txt] = {
+                    "dt": dt,
+                    "txt": txt,
+                    "server": "",
+                    "created_at": now_jst(),
+                    "main_msg_id": None,
+                    "copy_msg_id": None,
+                }
+                await auto_dedup()
+                pending_copy_queue.append((dt, txt))
+                image_results.append(f"{txt} ({raw_dur})")
+
+                # 通知まとめ・事前通知のスケジュール
+                task = asyncio.create_task(handle_new_event(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
+                active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
+                if txt.startswith("奪取"):
+                    t2 = asyncio.create_task(schedule_notification(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
+                    active_tasks.add(t2); t2.add_done_callback(lambda t: active_tasks.discard(t))
+
+        # !g グループ採番
+        gid = None
+        if structured_entries_for_this_image:
+            global last_groups_seq, last_groups
+            last_groups_seq += 1
+            gid = last_groups_seq
+            last_groups[gid] = structured_entries_for_this_image
+
+        # ---- レポート（フォームと同じ見た目）----
+        ch = message.channel  # 実行したチャンネルへ返す
+        color_ok   = 0x2ECC71
+        color_none = 0x95A5A6
+
+        kind_label = {"meta": "メタ", "ocr": "OCR", "none": "未取得"}[base_kind]
+        base_label = (base_clock_str or "??:??:??") + f"（{kind_label}）"
+
+        if image_results:
+            emb = discord.Embed(
+                title="✅ 解析完了（OpenAI / 1枚合成）",
+                description=f"`{att.filename}`",
+                color=color_ok
+            )
+            if gid is not None:
+                emb.add_field(name="グループ", value=f"G{gid}", inline=True)
+            emb.add_field(name="基準時間", value=base_label, inline=True)
+
+            joined = "\n".join(f"・{t}" for t in image_results)
+            if len(joined) > 1024:
+                chunk = []
+                cur = ""
+                for line in image_results:
+                    line = f"・{line}"
+                    if len(cur) + 1 + len(line) > 1000:
+                        chunk.append(cur)
+                        cur = line
+                    else:
+                        cur = (cur + "\n" + line) if cur else line
+                if cur:
+                    chunk.append(cur)
+                for i, c in enumerate(chunk):
+                    title = "登録された予定" if i == 0 else f"登録された予定（続き {i}）"
+                    emb.add_field(name=title, value=c, inline=False)
+            else:
+                emb.add_field(name="登録された予定", value=joined, inline=False)
+
+            emb.add_field(
+                name="ヒント",
+                value="`!g <grp>` で±秒の微調整 / `!a` で時刻を直接修正\n"
+                      "実際の時間と違う場合はスクショを撮り直して再送してね",
+                inline=False
+            )
+            emb.set_footer(text="OCR: OpenAI（server優先） + rowsフォールバック採用")
+
+            await ch.send(embed=emb)
+        else:
+            emb = discord.Embed(
+                title="⚠️ 解析は完了しましたが新規登録はありませんでした",
+                description=f"`{att.filename}`\n基準時間: {base_label}",
+                color=color_none
+            )
+            emb.set_footer(text="OCR: OpenAI（server優先） + rowsフォールバック採用")
+            await ch.send(embed=emb)
+
         return
 
     # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
