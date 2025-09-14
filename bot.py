@@ -2387,6 +2387,7 @@ async def process_copy_queue():
         await asyncio.sleep(2)   # ポーリング間隔を短く
 
 async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id: int):
+    global last_groups_seq, last_groups  # ← 先頭に移動
     await client.wait_until_ready()
     ch = client.get_channel(channel_id)
     if not ch:
@@ -2450,7 +2451,6 @@ async def _register_from_image_bytes(img_bytes: bytes, filename: str, channel_id
         # !g グループ採番
         gid = None
         if structured_entries_for_this_image:
-            global last_groups_seq, last_groups
             last_groups_seq += 1
             gid = last_groups_seq
             last_groups[gid] = structured_entries_for_this_image
@@ -2540,6 +2540,7 @@ def register_from_bytes_threadsafe(img_bytes: bytes, filename: str, channel_id: 
 # 自動リセット処理（毎日02:00）
 # =======================
 async def daily_reset_task():
+    global last_groups, last_groups_seq  # ← 先頭に移動
     await client.wait_until_ready()
     while not client.is_closed():
         now = now_jst()
@@ -2605,7 +2606,6 @@ async def daily_reset_task():
         for task in list(active_tasks):
             task.cancel()
         active_tasks.clear()
-        global last_groups, last_groups_seq
         last_groups.clear()
         last_groups_seq = 0
         # ✅ 通知は送らない（silent reset）
@@ -2640,6 +2640,8 @@ async def periodic_cleanup_task():
 # コマンドベースのリセット
 # =======================
 async def reset_all(message):
+    global last_groups, last_groups_seq  # ← 先頭に移動
+
     # 予定ごとの個別メッセージ削除（通知/コピー）
     for entry in list(pending_places.values()):
         if entry.get("main_msg_id"):
@@ -2705,7 +2707,6 @@ async def reset_all(message):
     for t in list(active_tasks):
         t.cancel()
     active_tasks.clear()
-    global last_groups, last_groups_seq
     last_groups.clear()
     last_groups_seq = 0
 
