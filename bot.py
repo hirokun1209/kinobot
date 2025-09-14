@@ -42,6 +42,8 @@ def _normalize_server(x) -> str | None:
     return m.group(1) if m else None
 EXIF_DT_KEYS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")  # 優先順
 
+POST_CROP_TOP=0.00
+
 # === JSONの曖昧な出力を吸収する正規化 ===
 def _coerce_str_lines(x) -> list[str]:
     """str / list[str] / list[dict{text|value|content|line}] / dict を全部 list[str] に揃える"""
@@ -603,7 +605,7 @@ BLACK_MIN_H         = int(os.getenv("BLACK_MIN_H", "10"))            # 黒帯最
 
 # 仕上げのパーセントトリミング（左20%・上15%）
 POST_CROP_LEFT      = float(os.getenv("POST_CROP_LEFT",  "0.20"))
-POST_CROP_TOP       = float(os.getenv("POST_CROP_TOP",   "0.15"))
+POST_CROP_TOP       = float(os.getenv("POST_CROP_TOP",   "0.00"))
 POST_CROP_RIGHT     = float(os.getenv("POST_CROP_RIGHT", "0.00"))
 POST_CROP_BOTTOM    = float(os.getenv("POST_CROP_BOTTOM","0.00"))
 
@@ -637,8 +639,9 @@ def compose_center_with_clock_and_cease(bgr_full: np.ndarray) -> tuple[np.ndarra
         center = compact_black_rows_and_cut_tail(center)
 
     # 左20%・上15%トリミング（値は環境変数で調整可）
-    if any([POST_CROP_LEFT, POST_CROP_TOP, POST_CROP_RIGHT, POST_CROP_BOTTOM]):
-        center = percent_crop(center, POST_CROP_LEFT, POST_CROP_TOP, POST_CROP_RIGHT, POST_CROP_BOTTOM)
+#    if any([POST_CROP_LEFT, POST_CROP_RIGHT, POST_CROP_BOTTOM]):
+        # 上(Top)は絶対に削らない
+#        center = percent_crop(center, POST_CROP_LEFT, 0.0, POST_CROP_RIGHT, POST_CROP_BOTTOM)
 
     base = center
 
@@ -1788,6 +1791,19 @@ def extract_server_number(center_texts):
         if m:
             return m.group(1)
     return None
+
+def _extract_server_from_header(full_bgr: np.ndarray) -> str | None:
+    """
+    画面上部のタイトル帯（[s1234] 越域…）からサーバー番号を読むフォールバック。
+    合成前の full_bgr を渡す。
+    """
+    H, W = full_bgr.shape[:2]
+    # タイトル帯が来る高さ帯（端末差を吸収しやすいよう少し広め）
+    head = full_bgr[int(H*0.18):int(H*0.36), :int(W*0.88)]
+    # Paddle優先 → 弱ければ既存のPaddle関数/Googleへ
+    lines = ocr_center_paddle(head) or extract_text_from_image(head)
+    s = extract_server_number(lines)
+    return _normalize_server(s)
 
 def add_time(base_time_str, duration_str):
     today = now_jst().date()
@@ -3305,7 +3321,12 @@ async def on_message(message):
             top_txts    = extract_text_from_image(crop_top_right(masked)) or []
             center_txts = ocr_center_with_fallback(crop_center_area(masked)) or []
             base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(raw)
-            parsed = parse_multiple_places(center_txts, top_txts, base_time_override=base_clock_str)
+            srv_fb = _extract_server_from_header(full_bgr)
+            parsed = parse_multiple_places(
+                center_txts, top_txts,
+                base_time_override=base_clock_str,
+                server_override=srv_fb
+            )
             # 以降のレポート生成は既存通り…
             # （省略：あなたの元の !oaiocr のレポート部分をそのまま使ってOK）
             return
@@ -3322,6 +3343,8 @@ async def on_message(message):
 
         # ③ OpenAI の structured.server を優先
         server_oai = _normalize_server((j.get("structured") or {}).get("server"))
+        if not server_oai:
+            server_oai = _extract_server_from_header(full_bgr)
 
         parsed_preview = parse_multiple_places(
             center_txts, top_txts,
