@@ -535,10 +535,15 @@ def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
     return bgr[y1:y2, x1:x2]
 
 def find_black_bands_rows(bgr: np.ndarray,
-                          thr=BLACK_ROW_LUMA_THR,
-                          ratio=BLACK_ROW_RATIO,
-                          min_h=BLACK_MIN_H) -> list[tuple[int,int]]:
+                          thr: int | None = None,
+                          ratio: float | None = None,
+                          min_h: int | None = None) -> list[tuple[int,int]]:
     """横一帯の黒塗り（行）を検出して [(y1,y2), ...] を返す"""
+    # ← デフォルトはここで評価（定数は後で定義されていてもOKになる）
+    if thr   is None:  thr   = BLACK_ROW_LUMA_THR
+    if ratio is None:  ratio = BLACK_ROW_RATIO
+    if min_h is None:  min_h = BLACK_MIN_H
+
     g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     h, w = g.shape
     row_black = (g < thr).sum(axis=1) >= int(w * ratio)
