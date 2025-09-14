@@ -1192,9 +1192,9 @@ def redact_right_of_boxes(bgr: np.ndarray, boxes: list[tuple[int,int,int,int]], 
 
 # ===== 「免戦中」の直下を右端まで黒塗りするヘルパー =====
 # チューニング用の係数（必要に応じて微調整）
-IME_ABOVE_RATIO = 0.05   # 文字ボックス下端から少し上に戻す割合
-IME_BELOW_RATIO = 1.40   # 文字高さの何倍までを帯に含めるか
-IME_LEFT_MARGIN = 8      # 帯の開始X（免戦中ボックス右端からのマージンpx）
+IME_ABOVE_RATIO = -0.10   # 上端を文字の下へ0.1文字ぶん下げる
+IME_BELOW_RATIO = 1.10    # 帯の厚みを控えめに
+IME_LEFT_MARGIN = 12      # ← 未定義なら追加（免戦中の右端からの余白px）
 
 def find_ime_sen_rows_full_img(bgr: np.ndarray) -> list[tuple[int,int,int,int]]:
     """
