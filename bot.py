@@ -1859,7 +1859,7 @@ def _extract_server_from_header(full_bgr: np.ndarray) -> str | None:
     """
     H, W = full_bgr.shape[:2]
     # タイトル帯が来る高さ帯（端末差を吸収しやすいよう少し広め）
-    head = full_bgr[int(H*0.18):int(H*0.36), :int(W*0.88)]
+    head = full_bgr[int(H*0.00):int(H*0.36), :int(W*0.88)]
     # Paddle優先 → 弱ければ既存のPaddle関数/Googleへ
     lines = ocr_center_paddle(head) or extract_text_from_image(head)
     s = extract_server_number(lines)
