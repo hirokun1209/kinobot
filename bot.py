@@ -3407,7 +3407,7 @@ async def on_message(message):
         # !g グループ採番
         gid = None
         if structured_entries_for_this_image:
-            global last_groups_seq, last_groups
+            global last_groups_seq
             last_groups_seq += 1
             gid = last_groups_seq
             last_groups[gid] = structured_entries_for_this_image
