@@ -515,6 +515,10 @@ async def remove_expired_entries():
 def now_jst():
     return datetime.now(JST)
 
+# 画像バイト列を Discord 添付にするだけの薄いヘルパー
+def _file_from_bytes(filename: str, byts: bytes):
+    return discord.File(io.BytesIO(byts), filename=filename)
+
 def cleanup_old_entries():
     now = now_jst()
     for k in list(pending_places):
@@ -961,6 +965,7 @@ async def _send_oaiocr_text_report(
     durations: list[str],
     cease_fix_applied_sec: int = 0,
     cease_fix_threshold_sec: int | None = None,
+    files: list[discord.File] | None = None,   # ← 追加
 ):
     thresh = cease_fix_threshold_sec if cease_fix_threshold_sec is not None else 0
 
@@ -993,7 +998,7 @@ async def _send_oaiocr_text_report(
     lines.append("⏳ 免戦時間候補:")
     lines.append(_fmt_block(durations))
 
-    await ch.send("\n".join(lines))
+    await ch.send("\n".join(lines), files=files if files else None)
 
 async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, full_bgr: np.ndarray | None = None) -> dict | None:
     """
@@ -3366,7 +3371,7 @@ async def on_message(message):
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         full_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        # —— 新ルート：OpenAI 1枚OCR
+        # —— 新ルート：OpenAI 1枚OCR（合成して1枚だけ送る）
         j = await oai_ocr_oneimg_async(full_bgr)
 
         # ======================
@@ -3391,7 +3396,17 @@ async def on_message(message):
             parsed_final = list(parsed_preview)
             durations = extract_imsen_durations(center_txts)
 
-            # 📤 レポート（テキスト固定）
+            # ← 追加：参考用の合成画像をローカル生成して添付
+            files = []
+            try:
+                comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
+                ok, buf = cv2.imencode(".png", comp_bgr)
+                if ok:
+                    files.append(discord.File(io.BytesIO(buf.tobytes()), filename="oaiocr_composite_fallback.png"))
+            except Exception:
+                pass
+
+            # 📤 テキストレポート + 画像添付
             await _send_oaiocr_text_report(
                 message.channel,
                 top_txts=top_txts,
@@ -3403,9 +3418,8 @@ async def on_message(message):
                 durations=durations,
                 cease_fix_applied_sec=0,
                 cease_fix_threshold_sec=CEASEFIX_MAX_SEC,
+                files=files,  # ← 追加
             )
-
-            # （必要ならここで登録処理を続けてもOK）
             return
 
         # ======================
@@ -3429,7 +3443,7 @@ async def on_message(message):
         )
         parsed = list(parsed_preview)
 
-        # rows フォールバック
+        # rows フォールバック（structured.rows からも復元）
         if not parsed:
             rows = ((j.get("structured") or {}).get("rows") or [])
             srv  = server_oai
@@ -3444,7 +3458,7 @@ async def on_message(message):
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
 
-        # ===== 登録処理（あなたの元コードのまま）=====
+        # ===== 登録処理（既存設計に合わせる）=====
         image_results = []
         structured_entries_for_this_image = []
         for dt, txt, raw_dur in parsed:
@@ -3479,13 +3493,27 @@ async def on_message(message):
 
         gid = None
         if structured_entries_for_this_image:
-            global last_groups_seq
+            global last_groups_seq, last_groups
             last_groups_seq += 1
             gid = last_groups_seq
             last_groups[gid] = structured_entries_for_this_image
 
-        # ===== ここから “テキストレポート” で返す（Embedは使わない）=====
         durations = extract_imsen_durations(center_txts)
+
+        # ← 追加：OpenAIが返した合成PNG（_echo）をそのまま添付、無ければローカル合成を添付
+        files = []
+        comp_png = ((j.get("_echo") or {}).get("composite_png") or None)
+        if comp_png:
+            files.append(_file_from_bytes("oaiocr_composite.png", comp_png))
+        else:
+            try:
+                comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
+                ok, buf = cv2.imencode(".png", comp_bgr)
+                if ok:
+                    files.append(discord.File(io.BytesIO(buf.tobytes()), filename="oaiocr_composite_fallback.png"))
+            except Exception:
+                pass
+
         await _send_oaiocr_text_report(
             message.channel,
             top_txts=top_txts,
@@ -3497,6 +3525,7 @@ async def on_message(message):
             durations=durations,
             cease_fix_applied_sec=0,
             cease_fix_threshold_sec=CEASEFIX_MAX_SEC,
+            files=files,  # ← 追加
         )
         return
 
