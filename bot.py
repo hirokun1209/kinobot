@@ -2832,7 +2832,7 @@ async def auto_dedup():
 
 @client.event
 async def on_message(message):
-    # global は不要（読み取りだけだから）
+    global last_groups, last_groups_seq   # ← これを最初に置く
     if message.author.bot or message.channel.id not in READABLE_CHANNEL_IDS:
         return
 
@@ -3493,7 +3493,6 @@ async def on_message(message):
 
         gid = None
         if structured_entries_for_this_image:
-            global last_groups_seq, last_groups
             last_groups_seq += 1
             gid = last_groups_seq
             last_groups[gid] = structured_entries_for_this_image
