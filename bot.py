@@ -9,6 +9,7 @@ import numpy as np
 from paddleocr import PaddleOCR
 from datetime import datetime, timedelta, timezone, time
 from PIL import Image
+from PIL import ImageOps  # ← 追加（EXIFの回転を正しく適用）
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse  # ← ここでまとめて import
 import uvicorn
@@ -22,6 +23,7 @@ import base64
 from openai import OpenAI  # ← 追加
 from collections import deque
 import random
+
 
 # 共通の時刻パターン（HH:MM:SS / HH:MM）
 TIME_HHMMSS = re.compile(r"\b(\d{1,2})[:：](\d{2})[:：](\d{2})\b")
@@ -539,6 +541,30 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     r = max_side / s
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
 
+# === SRVDEBUG: 可視化ユーティリティ ===
+def _draw_box(img_bgr, rect, color=(0,255,255), thick=2, label=None):
+    x1,y1,x2,y2 = rect
+    cv2.rectangle(img_bgr, (x1,y1), (x2,y2), color, thick)
+    if label:
+        cv2.putText(img_bgr, label, (x1+6, max(14,y1-6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+def _mark_regions_on_full(full_bgr):
+    H,W = full_bgr.shape[:2]
+    head  = (0, int(H*HEAD_TOP_RATIO), int(W*HEAD_RIGHT_RATIO), int(H*HEAD_BOTTOM_RATIO))
+    clock = (int(W*0.70), 0, W, int(H*0.20))
+    center= (0, int(H*0.30), W, int(H*0.72))
+    # 停戦帯はPaddle検出→無ければフォールバック
+    rects = find_ceasefire_regions_full_img(full_bgr) or [(int(W*0.12), int(H*0.25), int(W*0.88), int(H*0.30))]
+    cease = rects[0]
+
+    dbg = full_bgr.copy()
+    _draw_box(dbg, head,  (0,255,0),   2, "HEAD")
+    _draw_box(dbg, clock, (0,255,255), 2, "CLOCK")
+    _draw_box(dbg, center,(255,0,0),   2, "CENTER")
+    _draw_box(dbg, cease, (255,0,255), 2, "CEASE")
+    return dbg, head, clock, center, cease
+
 def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
     """左右上下を割合でトリミング"""
     h, w = bgr.shape[:2]
@@ -613,6 +639,13 @@ POST_CROP_TOP       = float(os.getenv("POST_CROP_TOP",   "0.00"))
 POST_CROP_RIGHT     = float(os.getenv("POST_CROP_RIGHT", "0.00"))
 POST_CROP_BOTTOM    = float(os.getenv("POST_CROP_BOTTOM","0.00"))
 
+# ---- SRVDEBUG用：ヘッダ帯の想定範囲（端末により微調整）----
+HEAD_TOP_RATIO    = float(os.getenv("HEAD_TOP_RATIO", "0.00"))  # 画面高さの上から何割〜
+HEAD_BOTTOM_RATIO = float(os.getenv("HEAD_BOTTOM_RATIO", "0.18"))  # 〜下まで何割（初期: 上18%）
+HEAD_RIGHT_RATIO  = float(os.getenv("HEAD_RIGHT_RATIO", "0.88"))  # 右端は少し余らせる
+
+# ヘッダ単体もOpenAIに投げて比較するか（True推奨）
+DEBUG_ATTACH_TO_OPENAI = os.getenv("SRVDEBUG_ATTACH_OAI", "1") == "1"
 
 def compose_center_with_clock_and_cease(bgr_full: np.ndarray) -> tuple[np.ndarray, dict]:
     """
@@ -1126,6 +1159,107 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
                 continue
             raise
     return None
+
+# === SRVDEBUG: 鯖番号読取デバッグ ===
+async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int):
+    await client.wait_until_ready()
+    ch = client.get_channel(channel_id)
+    if not ch:
+        return
+
+    # 1) 入力画像のEXIF回転を正しく適用（重要）
+    pil = Image.open(io.BytesIO(img_bytes))
+    pil = ImageOps.exif_transpose(pil).convert("RGB")
+    full_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+    # 2) 領域の可視化（HEAD/CLOCK/CENTER/CEASE）
+    marked, head_rect, clock_rect, center_rect, cease_rect = _mark_regions_on_full(full_bgr)
+
+    # 3) 各クロップ（ヘッダは“黒塗り前の原画像”から取る）
+    x1,y1,x2,y2 = head_rect;  head_bgr  = full_bgr[y1:y2, x1:x2]
+    x1,y1,x2,y2 = clock_rect; top_bgr   = full_bgr[y1:y2, x1:x2]
+
+    # CENTER/CEASE はいつもの前処理（免戦直下黒塗りなど）を通す
+    masked_bgr, _ = auto_mask_ime(full_bgr)
+    x1,y1,x2,y2 = center_rect; center_bgr = masked_bgr[y1:y2, x1:x2]
+    rects = find_ceasefire_regions_full_img(masked_bgr)
+    cease_bgr = (masked_bgr[rects[0][1]:rects[0][3], rects[0][0]:rects[0][2]] 
+                 if rects else crop_cease_banner(masked_bgr))
+
+    # 4) 実際にOpenAIへ送っている「合成PNG」を作る
+    comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
+    comp_small   = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
+
+    # 5) 3エンジン比較（ヘッダ帯のみで確認）
+    paddle_lines = ocr_center_paddle(head_bgr)
+    gv_lines     = extract_text_from_image_google(head_bgr) if GV_CLIENT else []
+    oa_head = []
+    if OA_CLIENT and DEBUG_ATTACH_TO_OPENAI:
+        uri = _bgr_to_data_uri_np(shrink_long_side(head_bgr, 768))
+        try:
+            res = OA_CLIENT.responses.create(
+                model=os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini"),
+                input=[{"role":"user","content":[
+                    {"type":"input_text","text":"タイトル帯からサーバ番号 [s####] / s#### / #### を1行で返して。説明は不要。"},
+                    {"type":"input_image","image_url":uri,"detail":"high"},
+                ]}],
+                max_output_tokens=32,
+                temperature=0
+            )
+            txt = (res.output_text or "").strip()
+            oa_head = [t.strip() for t in txt.splitlines() if t.strip()]
+        except Exception as e:
+            oa_head = [f"(OpenAI error: {e})"]
+
+    # 6) 正規化（[s1234] / s1234 / 1234 → "1234"）
+    def _pick_num(lines):
+        for t in lines:
+            m = re.search(r"\[?\s*[sS]?(\d{3,4})\s*\]?", t)
+            if m: return m.group(1)
+        return None
+    raw_paddle = _pick_num(paddle_lines)
+    raw_gv     = _pick_num(gv_lines)
+    raw_oa     = _pick_num(oa_head)
+    norm_paddle = _normalize_server(raw_paddle)
+    norm_gv     = _normalize_server(raw_gv)
+    norm_oa     = _normalize_server(raw_oa)
+
+    # 7) Discordへ添付（実物を見ながら調整できる）
+    files = []
+    def _add(name, bgr, q=95):
+        if bgr is None or not getattr(bgr, "size", 0):
+            return
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+        if ok:
+            files.append(discord.File(io.BytesIO(buf.tobytes()), filename=name))
+
+    _add("srvdebug_marked.jpg",          shrink_long_side(marked, 1280))
+    _add("srvdebug_head.jpg",            shrink_long_side(head_bgr, 820))
+    _add("srvdebug_clock.jpg",           shrink_long_side(top_bgr,  820))
+    _add("srvdebug_center.jpg",          shrink_long_side(center_bgr, 1000))
+    _add("srvdebug_cease.jpg",           shrink_long_side(cease_bgr, 820))
+    _add("srvdebug_composite_sent.jpg",  comp_small)
+
+    hH, hW = head_bgr.shape[:2]
+    lines = [
+        f"🔎 **サーバ番号読取デバッグ** `{filename}`",
+        "",
+        f"🖼 合成送付サイズ: {comp_small.shape[1]}x{comp_small.shape[0]}  (SINGLEIMG_MAX_SIDE={SINGLEIMG_MAX_SIDE})",
+        f"🎛 ヘッダ帯サイズ: {hW}x{hH}  HEAD_TOP={HEAD_TOP_RATIO} / BOTTOM={HEAD_BOTTOM_RATIO} / RIGHT={HEAD_RIGHT_RATIO}",
+        "",
+        "📚 **ヘッダ帯 OCR 結果**",
+        f"・Paddle:  {paddle_lines[:4] or '(なし)'}  → raw=%r / norm=%r" % (raw_paddle, norm_paddle),
+        f"・Google:  {gv_lines[:4]     or '(なし)'}  → raw=%r / norm=%r" % (raw_gv, norm_gv),
+        f"・OpenAI:  {oa_head[:2]      or '(未送信)'} → raw=%r / norm=%r" % (raw_oa, norm_oa),
+        "",
+        "✅ 期待: いずれかで norm が4桁になっていること。",
+        "❗ ダメなときの典型:",
+        "  - 合成にヘッダが写っていない / 文字が小さすぎる（数字高さ<16px）",
+        "  - EXIF回転未適用でクロップが外れている",
+        "  - マスク/トリムでヘッダが欠けている",
+        "  - プロンプトで『数字4桁だけ返す』が弱い",
+    ]
+    await ch.send("\n".join(lines), files=files)
 
 def oai_extract_parking_json(center_bgr: np.ndarray) -> dict | None:
     """
@@ -3355,6 +3489,16 @@ async def on_message(message):
             ),
             files=files if files else None
         )
+        return
+        
+    # ==== !srvdebug ====
+    if message.content.strip() == "!srvdebug":
+        if not message.attachments:
+            await message.channel.send("🖼 画像を添付して `!srvdebug` を実行してね")
+            return
+        for att in message.attachments:
+            data = await att.read()
+            await _srvdebug_from_bytes(data, att.filename, message.channel.id)
         return
 
     # ==== !oaiocr（OpenAI：合成1枚ルート） ====
