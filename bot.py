@@ -3360,59 +3360,79 @@ async def on_message(message):
         if not message.attachments:
             await message.channel.send("🖼 画像を添付して `!oaiocr` を実行してね")
             return
-    
+
         att = message.attachments[0]
         raw = await att.read()
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         full_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    
-        # —— ここが新ルート：1枚だけ送る ——
+
+        # —— 新ルート：OpenAI 1枚OCR
         j = await oai_ocr_oneimg_async(full_bgr)
-    
-        # 失敗時は既存の Paddle/GV フォールバックで最低限動かす
+
+        # ======================
+        # 失敗時（Paddle/GVにフォールバック）
+        # ======================
         if not j:
-            await message.channel.send("⚠️ OpenAI OCR に失敗。フォールバックで解析します。")
-            # 旧手順：中央/上部から自前OCR
             masked, _ = auto_mask_ime(full_bgr)
-            top_txts    = extract_text_from_image(crop_top_right(masked)) or []
-            center_txts = ocr_center_with_fallback(crop_center_area(masked)) or []
+            top_bgr    = crop_top_right(masked)
+            center_bgr = crop_center_area(masked)
+
+            top_txts    = extract_text_from_image(top_bgr) or []
+            center_txts = ocr_center_with_fallback(center_bgr) or []
+
             base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(raw)
             srv_fb = _extract_server_from_header(full_bgr)
-            parsed = parse_multiple_places(
+
+            parsed_preview = parse_multiple_places(
                 center_txts, top_txts,
                 base_time_override=base_clock_str,
                 server_override=srv_fb
             )
-            # 以降のレポート生成は既存通り…
-            # （省略：あなたの元の !oaiocr のレポート部分をそのまま使ってOK）
+            parsed_final = list(parsed_preview)
+            durations = extract_imsen_durations(center_txts)
+
+            # 📤 レポート（テキスト固定）
+            await _send_oaiocr_text_report(
+                message.channel,
+                top_txts=top_txts,
+                center_txts=center_txts,
+                base_clock_str=base_clock_str,
+                cease_hhmmss=None,
+                parsed_preview=parsed_preview,
+                parsed_final=parsed_final,
+                durations=durations,
+                cease_fix_applied_sec=0,
+                cease_fix_threshold_sec=CEASEFIX_MAX_SEC,
+            )
+
+            # （必要ならここで登録処理を続けてもOK）
             return
-    
+
+        # ======================
+        # 成功時（OpenAI結果を整形）
+        # ======================
         top_txts    = _coerce_str_lines(j.get("top_clock_lines"))
         center_txts = _coerce_str_lines(j.get("center_lines"))
         cease_str   = _first_str(j.get("ceasefire_end"))
 
-        # 基準時計（OCR優先 → メタ）
         base_clock_ocr  = _extract_clock_from_top_txts(top_txts)
         base_clock_meta = base_time_from_metadata(raw)
         base_clock_str  = base_clock_ocr or base_clock_meta
-        base_kind       = "ocr" if base_clock_ocr else ("meta" if base_clock_meta else "none")
 
-        # ③ OpenAI の structured.server を優先
-        server_oai = _normalize_server((j.get("structured") or {}).get("server"))
-        if not server_oai:
-            server_oai = _extract_server_from_header(full_bgr)
+        # server は OpenAI優先 → ヘッダから補完
+        server_oai = _normalize_server((j.get("structured") or {}).get("server")) or _extract_server_from_header(full_bgr)
 
         parsed_preview = parse_multiple_places(
             center_txts, top_txts,
             base_time_override=base_clock_str,
-            server_override=server_oai,   # ★ ここがポイント
+            server_override=server_oai,
         )
         parsed = list(parsed_preview)
 
-        # ④ からっぽなら OpenAI の rows から復元
+        # rows フォールバック
         if not parsed:
             rows = ((j.get("structured") or {}).get("rows") or [])
-            srv = server_oai
+            srv  = server_oai
             if srv and base_clock_str and rows:
                 mode = "警備" if srv == "1268" else "奪取"
                 for r in rows:
@@ -3424,10 +3444,9 @@ async def on_message(message):
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
 
-        # ---- 登録処理 & !g 用グループ構築（フォームと同じ流儀）----
+        # ===== 登録処理（あなたの元コードのまま）=====
         image_results = []
         structured_entries_for_this_image = []
-
         for dt, txt, raw_dur in parsed:
             g = parse_txt_fields(txt)
             if g:
@@ -3452,14 +3471,12 @@ async def on_message(message):
                 pending_copy_queue.append((dt, txt))
                 image_results.append(f"{txt} ({raw_dur})")
 
-                # 通知まとめ・事前通知のスケジュール
                 task = asyncio.create_task(handle_new_event(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
                 active_tasks.add(task); task.add_done_callback(lambda t: active_tasks.discard(t))
                 if txt.startswith("奪取"):
                     t2 = asyncio.create_task(schedule_notification(dt, txt, client.get_channel(NOTIFY_CHANNEL_ID)))
                     active_tasks.add(t2); t2.add_done_callback(lambda t: active_tasks.discard(t))
 
-        # !g グループ採番
         gid = None
         if structured_entries_for_this_image:
             global last_groups_seq
@@ -3467,61 +3484,20 @@ async def on_message(message):
             gid = last_groups_seq
             last_groups[gid] = structured_entries_for_this_image
 
-        # ---- レポート（フォームと同じ見た目）----
-        ch = message.channel  # 実行したチャンネルへ返す
-        color_ok   = 0x2ECC71
-        color_none = 0x95A5A6
-
-        kind_label = {"meta": "メタ", "ocr": "OCR", "none": "未取得"}[base_kind]
-        base_label = (base_clock_str or "??:??:??") + f"（{kind_label}）"
-
-        if image_results:
-            emb = discord.Embed(
-                title="✅ 解析完了（OpenAI / 1枚合成）",
-                description=f"`{att.filename}`",
-                color=color_ok
-            )
-            if gid is not None:
-                emb.add_field(name="グループ", value=f"G{gid}", inline=True)
-            emb.add_field(name="基準時間", value=base_label, inline=True)
-
-            joined = "\n".join(f"・{t}" for t in image_results)
-            if len(joined) > 1024:
-                chunk = []
-                cur = ""
-                for line in image_results:
-                    line = f"・{line}"
-                    if len(cur) + 1 + len(line) > 1000:
-                        chunk.append(cur)
-                        cur = line
-                    else:
-                        cur = (cur + "\n" + line) if cur else line
-                if cur:
-                    chunk.append(cur)
-                for i, c in enumerate(chunk):
-                    title = "登録された予定" if i == 0 else f"登録された予定（続き {i}）"
-                    emb.add_field(name=title, value=c, inline=False)
-            else:
-                emb.add_field(name="登録された予定", value=joined, inline=False)
-
-            emb.add_field(
-                name="ヒント",
-                value="`!g <grp>` で±秒の微調整 / `!a` で時刻を直接修正\n"
-                      "実際の時間と違う場合はスクショを撮り直して再送してね",
-                inline=False
-            )
-            emb.set_footer(text="OCR: OpenAI（server優先） + rowsフォールバック採用")
-
-            await ch.send(embed=emb)
-        else:
-            emb = discord.Embed(
-                title="⚠️ 解析は完了しましたが新規登録はありませんでした",
-                description=f"`{att.filename}`\n基準時間: {base_label}",
-                color=color_none
-            )
-            emb.set_footer(text="OCR: OpenAI（server優先） + rowsフォールバック採用")
-            await ch.send(embed=emb)
-
+        # ===== ここから “テキストレポート” で返す（Embedは使わない）=====
+        durations = extract_imsen_durations(center_txts)
+        await _send_oaiocr_text_report(
+            message.channel,
+            top_txts=top_txts,
+            center_txts=center_txts,
+            base_clock_str=base_clock_str,
+            cease_hhmmss=cease_str,
+            parsed_preview=parsed_preview,
+            parsed_final=parsed,
+            durations=durations,
+            cease_fix_applied_sec=0,
+            cease_fix_threshold_sec=CEASEFIX_MAX_SEC,
+        )
         return
 
     # ==== !gvocr（Google VisionのみでOCRデバッグ表示） ====
