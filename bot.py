@@ -940,6 +940,61 @@ def _strip_code_fences(s: str) -> str:
         s = re.sub(r"\s*```$", "", s)
     return s.strip()
 
+# === oaiocr テキストレポート ===
+def _fmt_block(lines: list[str] | None, empty="(なし)", max_lines=50) -> str:
+    ls = (lines or [])[:max_lines]
+    body = "\n".join(ls) if ls else empty
+    return f"```\n{body}\n```"
+
+def _only_txt_from_parsed(parsed: list[tuple]) -> list[str]:
+    # parsed は [(dt, txt, raw_dur), ...]
+    return [t for _, t, _ in parsed] if parsed else []
+
+async def _send_oaiocr_text_report(
+    ch,
+    top_txts: list[str],
+    center_txts: list[str],
+    base_clock_str: str | None,
+    cease_hhmmss: str | None,
+    parsed_preview: list[tuple],
+    parsed_final: list[tuple],
+    durations: list[str],
+    cease_fix_applied_sec: int = 0,
+    cease_fix_threshold_sec: int | None = None,
+):
+    thresh = cease_fix_threshold_sec if cease_fix_threshold_sec is not None else 0
+
+    # 停戦終了の表示（例のフォーマット：YYYY:MM:DD HH:MM:SS）
+    if cease_hhmmss:
+        today = now_jst().strftime("%Y:%m:%d")
+        cease_label = f"{today} {cease_hhmmss}"
+    else:
+        cease_label = "-"
+
+    lines = []
+    lines.append("🤖 **OpenAI OCR（1画像）**")
+
+    lines.append("📸 上部（時計）:")
+    lines.append(_fmt_block(top_txts or ["(検出なし)"]))
+
+    lines.append("🧩 中央（本文）:")
+    lines.append(_fmt_block(center_txts or ["(検出なし)"]))
+
+    lines.append(f"🕒 基準(右上時計): `{base_clock_str or '---'}`")
+
+    lines.append(f"🛡 停戦終了: `{cease_label}` / 自動補正: ±{abs(cease_fix_applied_sec)}秒（閾値±{thresh}s）")
+
+    lines.append("📋 **補正前の予定プレビュー**:")
+    lines.append(_fmt_block(_only_txt_from_parsed(parsed_preview)))
+
+    lines.append("🧾 **最終出力（登録される行）**:")
+    lines.append(_fmt_block(_only_txt_from_parsed(parsed_final)))
+
+    lines.append("⏳ 免戦時間候補:")
+    lines.append(_fmt_block(durations))
+
+    await ch.send("\n".join(lines))
+
 async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, full_bgr: np.ndarray | None = None) -> dict | None:
     """
     単一リクエストで 2〜3領域をOCRし、JSONで返す:
