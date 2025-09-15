@@ -2772,7 +2772,7 @@ async def auto_dedup():
 
 @client.event
 async def on_message(message):
-    global last_groups_seq, last_groups
+    # global は不要（読み取りだけだから）
     if message.author.bot or message.channel.id not in READABLE_CHANNEL_IDS:
         return
 
