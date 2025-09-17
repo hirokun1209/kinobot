@@ -688,15 +688,19 @@ def _draw_box(img_bgr, rect, color=(0,255,255), thick=2, label=None):
 CLOCK_TOP_RATIO    = float(os.getenv("CLOCK_TOP_RATIO", "0.20"))  # １ブロック下げ版
 CLOCK_BOTTOM_RATIO = float(os.getenv("CLOCK_BOTTOM_RATIO", "0.38"))
 CEASE_FALLBACK_TOP = float(os.getenv("CEASE_FALLBACK_TOP", "0.85"))
+# CLOCK の左右を環境変数で調整可能に
+CLOCK_LEFT_RATIO  = float(os.getenv("CLOCK_LEFT_RATIO",  "0.72"))
+CLOCK_RIGHT_RATIO = float(os.getenv("CLOCK_RIGHT_RATIO", "0.98"))
 
-def _mark_regions_on_full(full_bgr: np.ndarray):
-    H, W = full_bgr.shape[:2]
+def _mark_regions_on_full(full_bgr):
+    H,W = full_bgr.shape[:2]
 
     # HEAD：環境比率
     head  = (0, int(H*HEAD_TOP_RATIO), int(W*HEAD_RIGHT_RATIO), int(H*HEAD_BOTTOM_RATIO))
 
-    # CLOCK：環境比率（黄色を一段下げ）
-    clock = (int(W*0.72), int(H*CLOCK_TOP_RATIO), int(W*0.98), int(H*CLOCK_BOTTOM_RATIO))
+    # CLOCK：比率（← 0.72/0.98 のハードコーディングを撤廃）
+    clock = (int(W*CLOCK_LEFT_RATIO), int(H*CLOCK_TOP_RATIO),
+             int(W*CLOCK_RIGHT_RATIO), int(H*CLOCK_BOTTOM_RATIO))
 
     # CEASE：検出 → 無ければフォールバック（下側帯）
     rects = find_ceasefire_regions_full_img(full_bgr)
@@ -705,18 +709,17 @@ def _mark_regions_on_full(full_bgr: np.ndarray):
     else:
         cease = (0, int(H*CEASE_FALLBACK_TOP), W, H)
 
-    # CENTER：HEADの下端〜CEASEの上端（“間”を全部）
-    center = (0, head[3], W, cease[1])
+    # CENTER：HEADの下端〜CEASEの上端、右端は“時計の左端”に揃える
+    center = (0, head[3], clock[0], cease[1])
 
-    # 可視化描画
+    # 可視化
     dbg = full_bgr.copy()
     _draw_box(dbg, head,   (0,255,0),   2, "HEAD")
-    _draw_box(dbg, clock,  (255,255,0), 2, "CLOCK")   # ← カンマあり
+    _draw_box(dbg, clock,  (255,255,0), 2, "CLOCK")   # ← カンマ抜けバグ修正
     _draw_box(dbg, center, (0,128,255), 2, "CENTER")
     _draw_box(dbg, cease,  (255,0,255), 2, "CEASE")
-
     return dbg, head, clock, center, cease
-
+    
 def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
     """左右上下を割合でトリミング"""
     h, w = bgr.shape[:2]
@@ -1915,12 +1918,35 @@ async def apply_adjust_for_server_place(server: str, place: str, sec_adj: int):
 
 def crop_top_right(img):
     h, w = img.shape[:2]
-    return img[0:int(h*0.2), int(w*0.7):]
+    x1 = int(w * CLOCK_LEFT_RATIO)
+    x2 = int(w * CLOCK_RIGHT_RATIO)
+    y1 = int(h * CLOCK_TOP_RATIO)
+    y2 = int(h * CLOCK_BOTTOM_RATIO)
+    return img[y1:y2, x1:x2]
 
 def crop_center_area(img):
     h, w = img.shape[:2]
-    # 旧: return img[int(h*0.35):int(h*0.65), :]
-    return img[int(h*0.30):int(h*0.72), :]
+
+    # 上端＝HEADの下端
+    y1 = int(h * HEAD_BOTTOM_RATIO)
+
+    # 下端＝CEASEの上端（検出→なければフォールバック）
+    rects = find_ceasefire_regions_full_img(img)
+    if rects:
+        cease_top = rects[0][1]  # (x1,y1,x2,y2)
+    else:
+        cease_top = int(h * CEASE_FALLBACK_TOP)
+    y2 = cease_top
+
+    # 左右：右端は時計の左端にロック
+    x1 = 0
+    x2 = int(w * CLOCK_LEFT_RATIO)
+
+    # はみ出し防止
+    x2 = max(x1+1, min(x2, w))
+    y2 = max(y1+1, min(y2, h))
+
+    return img[y1:y2, x1:x2]
 
 def extract_text_from_image(img):
     result = ocr.ocr(img, cls=True)
@@ -2181,6 +2207,60 @@ def add_time(base_time_str, duration_str):
     return dt, dt.strftime("%H:%M:%S")
 
 TIME_RE = TIME_HHMMSS   # 後方互換のため
+
+def _extract_clock_from_center_lines(lines):
+    """
+    center_lines に混ざった HH:MM:SS の '時刻' を拾う。
+    ・免戦時間(通常 00:MM:SS, 01-05:MM:SS)は劣後、6時間以上を優先
+    ・複数あれば一番大きい（見た目右上の時計に近い）を採用
+    """
+    if not lines:
+        return None
+    txt = "\n".join(str(s) for s in lines if s)
+    import re
+    cand = re.findall(r'\b([0-2]\d):([0-5]\d):([0-5]\d)\b', txt)
+    if not cand:
+        return None
+    def to_sec(h,m,s): return int(h)*3600 + int(m)*60 + int(s)
+    hi, lo = [], []
+    for h,m,s in cand:
+        (hi if int(h) >= 6 else lo).append((to_sec(h,m,s), f"{h}:{m}:{s}"))
+    if hi:
+        hi.sort(reverse=True)
+        return hi[0][1]
+    lo.sort(reverse=True)
+    return lo[0][1] if lo else None
+
+
+def _ocr_clock_from_roi(full_bgr):
+    """
+    右上の時計ROIをローカルOCR(Paddle/Google)で読む最終手段。
+    """
+    H, W = full_bgr.shape[:2]
+    x1 = int(W * CLOCK_LEFT_RATIO)
+    x2 = int(W * CLOCK_RIGHT_RATIO)
+    y1 = int(H * CLOCK_TOP_RATIO)
+    y2 = int(H * CLOCK_BOTTOM_RATIO)
+    roi = full_bgr[y1:y2, x1:x2]
+
+    pp = ocr_center_paddle(roi) or []
+    gv = google_ocr_from_np(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)) or []
+
+    # まとめてユニーク
+    lines = []
+    for arr in (pp if isinstance(pp, list) else [pp],
+                gv if isinstance(gv, list) else [gv]):
+        for s in arr:
+            s = str(s).strip()
+            if s and s not in lines:
+                lines.append(s)
+
+    import re
+    for s in lines:
+        m = re.search(r'\b([0-2]\d:[0-5]\d:[0-5]\d)\b', s)
+        if m:
+            return m.group(1)
+    return None
 
 def extract_imsen_durations(texts: list[str]) -> list[str]:
     durations = []
@@ -3775,6 +3855,25 @@ async def on_message(message):
         base_clock_ocr  = _extract_clock_from_top_txts(top_txts)
         base_clock_meta = base_time_from_metadata(raw)
         base_clock_str  = base_clock_ocr or base_clock_meta
+        # --- 時計の多段フォールバック（center→ROI） ---
+        if not base_clock_str:
+            # 1) center_lines に出てしまった HH:MM:SS を拾う（免戦的な 00:MM:SS などは劣後）
+            clock_from_center = _extract_clock_from_center_lines(center_txts)
+            if clock_from_center:
+                base_clock_str = clock_from_center
+                # 誤結合防止のため、見つけた時刻は center_lines から除去（任意）
+                cleaned = []
+                for ln in center_txts:
+                    s = str(ln)
+                    if clock_from_center in s:
+                        s = s.replace(clock_from_center, "").strip()
+                    if s:
+                        cleaned.append(s)
+                center_txts = cleaned
+        
+        if not base_clock_str:
+            # 2) 右上ROIをローカルOCRで読む（Paddle/Google）
+            base_clock_str = _ocr_clock_from_roi(full_bgr)
         # === 合成からヘッダ帯を読む（USE_COMPOSITE_FOR_HEADER=1 のとき優先） ===
         head_src_bgr = full_bgr  # 既定は原寸
         if USE_COMPOSITE_FOR_HEADER:
