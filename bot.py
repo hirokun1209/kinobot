@@ -1053,7 +1053,14 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
         return None
 
     comp_bgr, dbg = compose_center_with_clock_and_cease(full_bgr)
-
+    # ← 合成PNGを作った直後に、指定％だけ四辺トリミング（上端を削る等）
+    comp_bgr = percent_crop(
+        comp_bgr,
+        left=COMP_TRIM_LEFT_RATIO,
+        top=COMP_TRIM_TOP_RATIO,
+        right=COMP_TRIM_RIGHT_RATIO,
+        bottom=COMP_TRIM_BOTTOM_RATIO
+    )
     # 送信用に縮小
     comp_small = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
 
@@ -1543,6 +1550,13 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
 
     # 4) 実際にOpenAIへ送っている「合成PNG」を作る（必ず full_bgr から）
     comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
+        comp_bgr = percent_crop(
+        comp_bgr,
+        left=COMP_TRIM_LEFT_RATIO,
+        top=COMP_TRIM_TOP_RATIO,
+        right=COMP_TRIM_RIGHT_RATIO,
+        bottom=COMP_TRIM_BOTTOM_RATIO
+    )
     comp_small = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
 
     # 5) 3エンジン比較（ヘッダ帯のみで確認）
