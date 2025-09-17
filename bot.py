@@ -566,6 +566,25 @@ def parse_txt_fields(txt: str):
     m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
     return m.groups() if m else None
 
+def _ocr_lines_pp_gv(bgr: np.ndarray):
+    """Paddle + Google で本文行を拾って統合（重複除去）"""
+    pp = ocr_center_paddle(bgr) or []
+    if isinstance(pp, str): pp = [pp]
+    gv = extract_text_from_image(bgr) or []
+    if isinstance(gv, str): gv = [gv]
+    merged = []
+    for arr in (pp, gv):
+        for s in arr:
+            if s and s not in merged:
+                merged.append(s)
+    return merged
+
+def extract_places_from_center(center_txts):
+    """中央本文から『越域 駐騎/駐車場 N』の N を列挙して返す（駐騎/駐車 両対応）"""
+    text = "\n".join(center_txts or [])
+    nums = re.findall(r'越域\s*駐[騎骑車车]場\s*([0-9]{1,2})', text)
+    return [int(n) for n in nums]
+
 # === 低コスト化ヘルパー（追加） ===
 def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     """長辺を max_side に縮小（総ピクセル数を減らす）"""
@@ -2133,12 +2152,6 @@ def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
     return sid
 
     # 2) 外側（既存のヘッダ帯）
-    return sid
-
-    # 2) 外側
-    y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
-    head_outer = full_bgr[y1:y2, x1:x2]
-    sid, _ = _triage_read_server_from_head(head_outer)
     return sid
 
 def add_time(base_time_str, duration_str):
@@ -3787,6 +3800,49 @@ async def on_message(message):
             server_struct = _normalize_server((j.get("structured") or {}).get("server"))
         
         server_final = server_from_head or server_struct
+        if os.getenv("OAI_HEADER_DEBUG") == "1":
+        dbg_lines = [
+            "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
+            f"・Paddle: {repr(dbg.get('raw',{}).get('pp'))} → norm={dbg.get('norm',{}).get('pp')!r}",
+            f"・Google: {repr(dbg.get('raw',{}).get('gv'))} → norm={dbg.get('norm',{}).get('gv')!r}",
+            f"・OpenAI: {repr(dbg.get('raw',{}).get('oai'))} → norm={dbg.get('norm',{}).get('oai')!r}",
+            f"➡️ 採用(server_final): {server_final!r}",
+        ]
+        await message.channel.send("\n".join(dbg_lines))
+        # ----- Center 追OCR補完：OpenAI が場所を落としたときだけ実行 -----
+        places0 = extract_places_from_center(center_txts)
+        if not places0:
+            aux_lines = []
+            # OpenAIの合成PNGが返ってきていれば、それを優先してOCR
+            comp_bgr = None
+            try:
+                comp_png = ((j.get("_echo") or {}).get("composite_png") or None)
+                if comp_png:
+                    arr = np.frombuffer(comp_png, np.uint8)
+                    comp_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            except Exception:
+                comp_bgr = None
+        
+            if comp_bgr is not None:
+                aux_lines = _ocr_lines_pp_gv(comp_bgr)
+            else:
+                # 無ければ原寸のセンター帯で追OCR
+                try:
+                    center_bgr = crop_center_area(full_bgr)
+                except Exception:
+                    center_bgr = None
+                if center_bgr is not None:
+                    aux_lines = _ocr_lines_pp_gv(center_bgr)
+        
+            if aux_lines:
+                # 追OCRの行を統合（重複除去）
+                center_txts = list(dict.fromkeys(list(center_txts) + list(aux_lines)))
+        
+                if os.getenv("OAI_HEADER_DEBUG") == "1":
+                    preview = "\n".join(aux_lines[:15])
+                    await message.channel.send(
+                        "🔁 追加OCR(center Paddle+Google)\n```\n" + preview + "\n```"
+                    )
         
         if os.getenv("OAI_HEADER_DEBUG") == "1":
             lines = [
@@ -3834,9 +3890,8 @@ async def on_message(message):
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
         # 3) それでも parsed が空なら、何も登録しない（ダミー禁止）
-
         # --- 最終ガード：server一致 & place>0 以外は捨てる（フォールバック後に適用） ---
-        if server_final:
+        if server_final and parsed:
             filtered = []
             for dt, txt, raw_dur in parsed:
                 m = re.search(r'^\S+\s+(\d{3,5})-([0-9]+)-', txt)
