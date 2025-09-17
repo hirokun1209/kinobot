@@ -1992,9 +1992,15 @@ def _extract_server_from_header(full_bgr: np.ndarray) -> str | None:
     合成前の full_bgr を渡す。
     """
     H, W = full_bgr.shape[:2]
-    # タイトル帯が来る高さ帯（端末差を吸収しやすいよう少し広め）
-    head = full_bgr[int(H*0.00):int(H*0.36), :int(W*0.88)]
-    # Paddle優先 → 弱ければ既存のPaddle関数/Googleへ
+    # !srvdebug と同じ矩形：HEAD_TOP_RATIO / HEAD_BOTTOM_RATIO / HEAD_RIGHT_RATIO
+    # （定義場所：BLACK_* 定数の少し下）
+    x1 = 0
+    y1 = int(H * HEAD_TOP_RATIO)
+    x2 = int(W * HEAD_RIGHT_RATIO)
+    y2 = int(H * HEAD_BOTTOM_RATIO)
+    head = full_bgr[y1:y2, x1:x2]
+    
+    # Paddle優先 → 弱ければGoogle Visionにフォールバック（!srvdebug と同じ流儀）
     lines = ocr_center_paddle(head) or extract_text_from_image(head)
     s = extract_server_number(lines)
     return _normalize_server(s)
