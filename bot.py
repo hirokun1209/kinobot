@@ -693,31 +693,40 @@ CLOCK_LEFT_RATIO  = float(os.getenv("CLOCK_LEFT_RATIO",  "0.72"))
 CLOCK_RIGHT_RATIO = float(os.getenv("CLOCK_RIGHT_RATIO", "0.98"))
 
 def _mark_regions_on_full(full_bgr):
-    H,W = full_bgr.shape[:2]
+    H, W = full_bgr.shape[:2]
 
     # HEAD：環境比率
-    head  = (0, int(H*HEAD_TOP_RATIO), int(W*HEAD_RIGHT_RATIO), int(H*HEAD_BOTTOM_RATIO))
+    head = (
+        0,
+        int(H * HEAD_TOP_RATIO),
+        int(W * HEAD_RIGHT_RATIO),
+        int(H * HEAD_BOTTOM_RATIO),
+    )
 
-    # CLOCK：比率（← 0.72/0.98 のハードコーディングを撤廃）
-    clock = (int(W*CLOCK_LEFT_RATIO), int(H*CLOCK_TOP_RATIO),
-             int(W*CLOCK_RIGHT_RATIO), int(H*CLOCK_BOTTOM_RATIO))
+    # CLOCK：環境比率（黄色）
+    clock = (
+        int(W * CLOCK_LEFT_RATIO),
+        int(H * CLOCK_TOP_RATIO),
+        int(W * CLOCK_RIGHT_RATIO),
+        int(H * CLOCK_BOTTOM_RATIO),
+    )
 
     # CEASE：検出 → 無ければフォールバック（下側帯）
     rects = find_ceasefire_regions_full_img(full_bgr)
     if rects:
-        cease = rects[0]
+        cease = rects[0]  # (x1,y1,x2,y2)
     else:
-        cease = (0, int(H*CEASE_FALLBACK_TOP), W, H)
+        cease = (0, int(H * CEASE_FALLBACK_TOP), W, H)
 
-    # CENTER：HEADの下端〜CEASEの上端、右端は“時計の左端”に揃える
+    # CENTER：HEADの下端〜CEASEの上端、右端は“時計の左端”にロック
     center = (0, head[3], clock[0], cease[1])
 
     # 可視化
     dbg = full_bgr.copy()
-    _draw_box(dbg, head,   (0,255,0),   2, "HEAD")
-    _draw_box(dbg, clock,  (255,255,0), 2, "CLOCK")   # ← カンマ抜けバグ修正
-    _draw_box(dbg, center, (0,128,255), 2, "CENTER")
-    _draw_box(dbg, cease,  (255,0,255), 2, "CEASE")
+    _draw_box(dbg, head,   (0, 255,   0), 2, "HEAD")
+    _draw_box(dbg, clock,  (255, 255, 0), 2, "CLOCK")  # ← カンマ抜けを修正
+    _draw_box(dbg, center, (0, 128, 255), 2, "CENTER")
+    _draw_box(dbg, cease,  (255, 0, 255), 2, "CEASE")
     return dbg, head, clock, center, cease
     
 def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
@@ -1922,6 +1931,9 @@ def crop_top_right(img):
     x2 = int(w * CLOCK_RIGHT_RATIO)
     y1 = int(h * CLOCK_TOP_RATIO)
     y2 = int(h * CLOCK_BOTTOM_RATIO)
+    # はみ出し防止
+    x1 = max(0, min(x1, w-1)); x2 = max(x1+1, min(x2, w))
+    y1 = max(0, min(y1, h-1)); y2 = max(y1+1, min(y2, h))
     return img[y1:y2, x1:x2]
 
 def crop_center_area(img):
@@ -1933,21 +1945,21 @@ def crop_center_area(img):
     # 下端＝CEASEの上端（検出→なければフォールバック）
     rects = find_ceasefire_regions_full_img(img)
     if rects:
-        cease_top = rects[0][1]  # (x1,y1,x2,y2)
+        cease_top = rects[0][1]  # (x1,y1,x2,y2) の y1
     else:
         cease_top = int(h * CEASE_FALLBACK_TOP)
     y2 = cease_top
 
-    # 左右：右端は時計の左端にロック
+    # 右端は“時計の左端”にロック
     x1 = 0
     x2 = int(w * CLOCK_LEFT_RATIO)
 
     # はみ出し防止
-    x2 = max(x1+1, min(x2, w))
-    y2 = max(y1+1, min(y2, h))
+    x2 = max(x1 + 1, min(x2, w))
+    y2 = max(y1 + 1, min(y2, h))
 
     return img[y1:y2, x1:x2]
-
+    
 def extract_text_from_image(img):
     result = ocr.ocr(img, cls=True)
     return [line[1][0] for line in result[0]] if result and result[0] else []
