@@ -569,77 +569,106 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     r = max_side / s
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
 
-def _pick_last_server_from_lines(lines) -> str | None:
+def extract_places_from_center(center_txts):
+    text = "\n".join(center_txts or [])
+    nums = re.findall(r'越域駐騎場\s*([0-9]{1,2})', text)
+    return [int(n) for n in nums]
+
+def _pick_last_server_from_lines(lines) -> Optional[str]:
     """
-    OCRの行リストから [s1234] / s1234 / 1234 / s268 などを全て拾い、
-    『一番後ろ』に出現したサーバ番号を返す。
-    4桁を最優先、無ければ最後の3〜5桁。
+    OCRの行から [s1234] / s1234 / 1234 / s268 などを全て拾い、
+    『一番後ろ』の番号を返す。4桁があれば4桁を優先。
     """
     if not lines:
         return None
     if isinstance(lines, str):
         lines = [lines]
-
     found: list[str] = []
     for t in lines:
         s = unicodedata.normalize("NFKC", str(t))
-        # 行内に複数ある場合も順番通り全部拾う
         for m in re.finditer(r"\[?\s*[sS]?\s*(\d{3,5})\s*\]?", s):
             found.append(m.group(1))
-
     if not found:
         return None
-    # 4桁を優先して“最後”から探す
     for d in reversed(found):
         if len(d) == 4:
             return d
-    # 4桁が無ければ最後のもの
     return found[-1]
+
+# “英字っぽい紛れ”を数字へ寄せて4桁へ収束させる軽い正規化（必要箇所で使用）
+_CHAR2DIGIT = str.maketrans({'O':'0','o':'0','I':'1','l':'1','S':'5','s':'5','Z':'2','z':'2','B':'8'})
+def _normalize_server4(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    t = unicodedata.normalize("NFKC", str(text)).translate(_CHAR2DIGIT).lower()
+    t = re.sub(r'[^0-9\[\]s-越域駐騎場]+', '', t)
+    for pat in (r'\[s\s*(\d{4,5})\]', r's\D*(\d{4,5})', r'(\d{4,5})'):
+        m = re.search(pat, t)
+        if m:
+            d = re.sub(r'\D', '', m.group(1))
+            if len(d) >= 4:
+                return d[:4]
+    return None
 
 def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], Dict]:
     """
-    ヘッダ帯画像からサーバIDを Paddle / Google / OpenAI の3系で読み、
-    正規化（4桁）→ 優先度/多数決で確定する。
-    return: (server4 or None, debug_info dict)
+    ヘッダ帯画像から Paddle / Google / OpenAI を実行し、
+    ・'越域/駐騎場' を含む行を優先
+    ・同一行中/複数行中に複数の [s****] があれば『一番後ろ』を採用
+    ・OpenAIが4桁なら最優先 → それ以外は多数決
     """
-    # ===== 1) エンジン実行 =====
-    # Paddle（あなたの既存関数に合わせてください）
-    pp_lines = ocr_center_paddle(head_bgr)
-    pp_text  = "\n".join(pp_lines) if isinstance(pp_lines, list) else (pp_lines or "")
-
-    # Google Vision（あなたの既存関数）
-    gv_lines = extract_text_from_image(head_bgr)
-    gv_text  = "\n".join(gv_lines) if isinstance(gv_lines, list) else (gv_lines or "")
-
-    # OpenAI（“4桁だけ返せ”強プロンプト）
-    oai_prompt = (
-        "You are reading a server id like [s1234] near the top header. "
-        "Return ONLY the four digits (0-9). If uncertain, return NONE."
-    )
+    # Paddle
+    pp_lines = ocr_center_paddle(head_bgr) or []
+    if isinstance(pp_lines, str): pp_lines = [pp_lines]
+    # Google
+    gv_lines = extract_text_from_image(head_bgr) or []
+    if isinstance(gv_lines, str): gv_lines = [gv_lines]
+    # OpenAI（短プロンプト）
+    oai_prompt = ("Read server id like [s1234] in header. "
+                  "Return ONLY the four digits; if unsure, return NONE.")
     try:
-        oai_text = call_openai_vision(head_bgr, prompt=oai_prompt)
+        oai_text = call_openai_vision(head_bgr, prompt=oai_prompt) or ""
     except Exception:
         oai_text = ""
 
-    # ===== 2) 正規化 =====
-    cand_raw = {"pp": pp_text, "gv": gv_text, "oai": oai_text}
-    cand_norm = {k: _normalize_server4(v) for k, v in cand_raw.items()}
+    cand_raw = {
+        "pp": "\n".join(pp_lines),
+        "gv": "\n".join(gv_lines),
+        "oai": oai_text,
+    }
 
-    # ===== 3) 決定ロジック =====
-    # 3-1) OpenAI が4桁を出していれば最優先で採用
+    # “越域/駐騎場”含む行を最優先にしつつ、最後の番号を採る
+    def _prefer_last(lines):
+        lines = list(lines or [])
+        # 1) キーワード行を先に検索
+        for ln in lines:
+            ln2 = unicodedata.normalize("NFKC", str(ln))
+            if ("越域" in ln2) or ("駐騎場" in ln2):
+                n = _pick_last_server_from_lines([ln2])
+                if n: return n
+        # 2) [s が入る行
+        for ln in lines:
+            if "[s" in str(ln):
+                n = _pick_last_server_from_lines([ln])
+                if n: return n
+        # 3) 全行で最後
+        return _pick_last_server_from_lines(lines)
+
+    pick_pp  = _prefer_last(pp_lines)
+    pick_gv  = _prefer_last(gv_lines)
+    pick_oai = _normalize_server4(oai_text)  # OpenAIは1文想定
+
+    cand_norm = {"pp": pick_pp, "gv": pick_gv, "oai": pick_oai}
+
+    # 決定：OpenAI→多数決
     if cand_norm.get("oai"):
         return cand_norm["oai"], {"raw": cand_raw, "norm": cand_norm, "winner": "oai"}
-
-    # 3-2) 多数決（最頻値）
     votes: Dict[str, int] = {}
-    for n in cand_norm.values():
-        if n:
-            votes[n] = votes.get(n, 0) + 1
+    for n in (pick_pp, pick_gv, pick_oai):
+        if n: votes[n] = votes.get(n, 0) + 1
     if votes:
         winner_val = max(votes.items(), key=lambda kv: kv[1])[0]
         return winner_val, {"raw": cand_raw, "norm": cand_norm, "winner": "vote"}
-
-    # 3-3) どれも取れないときは None
     return None, {"raw": cand_raw, "norm": cand_norm, "winner": None}
 
 # === SRVDEBUG: 可視化ユーティリティ ===
@@ -1314,6 +1343,7 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
 
     # 6) 正規化（[s1234] / s1234 / 1234 → "1234"）
     def _pick_num(lines):
+        return _pick_last_server_from_lines(lines)
         # ここを “最後の番号” を返すロジックに変更
         return _pick_last_server_from_lines(lines)
     raw_paddle = _pick_num(paddle_lines)
@@ -2085,27 +2115,26 @@ def extract_server_number(center_texts):
             return m.group(1)
     return None
 
-def _extract_server_from_header(full_bgr: np.ndarray) -> str | None:
+def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
     """
-    画面上部のタイトル帯（[s1234] 越域…）からサーバ番号を読む。
-    ヘッダ帯に複数番号が出たら『一番後ろ』を採用。
+    まず“内側クロップ（ニュース帯を避ける）”で抽出し、失敗なら従来の外側で再試行。
+    ヘッダ帯に複数番号があれば『一番後ろ』を採用（_triage_* 内で実施）。
     """
     H, W = full_bgr.shape[:2]
-    x1 = 0
-    y1 = int(H * HEAD_TOP_RATIO)
-    x2 = int(W * HEAD_RIGHT_RATIO)
-    y2 = int(H * HEAD_BOTTOM_RATIO)
-    head = full_bgr[y1:y2, x1:x2]
+    x1, x2 = 0, int(W * HEAD_RIGHT_RATIO)
 
-    # 両エンジンの出力行を結合して“最後”を採用
-    pp_lines = ocr_center_paddle(head) or []
-    gv_lines = extract_text_from_image(head) or []
-    raw = _pick_last_server_from_lines((pp_lines or [])) or _pick_last_server_from_lines((gv_lines or []))
-    # 両方に候補がある場合は、行を結合して「全体で最後」をもう一度採用
-    if pp_lines and gv_lines:
-        raw = _pick_last_server_from_lines((pp_lines or []) + (gv_lines or [])) or raw
+    # 1) 内側
+    y1 = int(H * HEAD_INNER_TOP);  y2 = int(H * HEAD_INNER_BOTTOM)
+    head_inner = full_bgr[y1:y2, x1:x2]
+    sid, _ = _triage_read_server_from_head(head_inner)
+    if sid:
+        return sid
 
-    return _normalize_server(raw)
+    # 2) 外側
+    y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
+    head_outer = full_bgr[y1:y2, x1:x2]
+    sid, _ = _triage_read_server_from_head(head_outer)
+    return sid
 
 def add_time(base_time_str, duration_str):
     today = now_jst().date()
@@ -3729,10 +3758,11 @@ async def on_message(message):
         )
         parsed = list(parsed_preview)
 
-        # rows フォールバック（structured.rows からも復元）
+        # rows / centerテキストからのフォールバック復元
         if not parsed:
+            srv = server_final
+            # 1) structured.rows があれば使用
             rows = ((j.get("structured") or {}).get("rows") or [])
-            srv  = server_oai
             if srv and base_clock_str and rows:
                 mode = "警備" if srv == "1268" else "奪取"
                 for r in rows:
@@ -3743,6 +3773,21 @@ async def on_message(message):
                     dt, unlock = add_time(base_clock_str, dur)
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
+        
+            # 2) rows が空/不足なら中央本文から復元（上から順に place×duration をペアリング）
+            if not parsed and srv and base_clock_str:
+                mode = "警備" if srv == "1268" else "奪取"
+                places = extract_places_from_center(center_txts)
+                durs   = extract_imsen_durations(center_txts) or []
+                n = min(len(places), len(durs))
+                for i in range(n):
+                    place = str(places[i])
+                    dur   = correct_imsen_text(durs[i])
+                    dt, unlock = add_time(base_clock_str, dur)
+                    if dt:
+                        parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
+        
+        # 3) それでも parsed が空なら、ダミーの -0- 行は作らず終了
 
         # ===== 登録処理（既存設計に合わせる）=====
         image_results = []
