@@ -550,7 +550,7 @@ def _bgr_from_png_bytes(png_bytes: bytes) -> np.ndarray:
 
 # --- 合成画像内のヘッダ帯の割合（必要なら環境変数で微調整） ---
 COMP_HEAD_TOP    = float(os.getenv("COMP_HEAD_TOP", "0.00"))
-COMP_HEAD_BOTTOM = float(os.getenv("COMP_HEAD_BOTTOM", "0.25"))
+COMP_HEAD_BOTTOM = float(os.getenv("COMP_HEAD_BOTTOM", "0.30"))
 COMP_HEAD_RIGHT  = float(os.getenv("COMP_HEAD_RIGHT", "1.00"))
 
 # --- スイッチ：合成後からヘッダを読む（1でON） ---
@@ -577,7 +577,6 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
 
 def extract_places_from_center(center_txts):
-    """中央本文から『越域駐騎場 N / 越域駐車場 N』の N を抽出"""
     text = "\n".join(center_txts or [])
     nums = re.findall(r'越域駐[騎車]場\s*([0-9]{1,2})', text)
     if not nums:
@@ -3831,6 +3830,20 @@ async def on_message(message):
             server_override=server_final
         )
         parsed = list(parsed_preview)
+        # --- 不正行のガード：server一致 & place>0 以外は捨てる ---
+        if 'server_final' in locals() and server_final:
+            filtered = []
+            for dt, txt, raw_dur in parsed:
+                m = re.search(r'^\S+\s+(\d{3,5})-([0-9]+)-', txt)
+                if not m:
+                    continue
+                srv_txt, place_txt = m.group(1), m.group(2)
+                if srv_txt != server_final:
+                    continue
+                if place_txt in ("0", ""):
+                    continue
+                filtered.append((dt, txt, raw_dur))
+            parsed = filtered
         # --- 追加ガード：server/場所の妥当性チェック ---
         if server_final:
             good = []
@@ -3845,13 +3858,13 @@ async def on_message(message):
                     continue
                 good.append((dt, txt, raw_dur))
             parsed = good
-        # rows / centerテキストからのフォールバック復元
-        # rows / centerテキストからのフォールバック復元
+            
+        # rows / center からのフォールバック復元（ダミー生成なし）
         if not parsed:
-            srv = server_final
+            srv = server_final  # ヘッダ確定サーバ（なければ何もしない）
             rows = ((j.get("structured") or {}).get("rows") or [])
         
-            # 1) structured.rows があれば優先
+            # 1) structured.rows があれば使う
             if srv and base_clock_str and rows:
                 mode = "警備" if srv == "1268" else "奪取"
                 for r in rows:
@@ -3863,10 +3876,10 @@ async def on_message(message):
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
         
-            # 2) rows が空/不足 → 中央本文から復元（上から順にペアリング）
+            # 2) rows が無い/不足 → 中央本文から復元（場所×免戦を上から順にペアリング）
             if not parsed and srv and base_clock_str:
                 mode = "警備" if srv == "1268" else "奪取"
-                places = extract_places_from_center(center_txts)
+                places = extract_places_from_center(center_txts)       # ← 駐騎/駐車 両対応にしておく
                 durs   = extract_imsen_durations(center_txts) or []
                 n = min(len(places), len(durs))
                 for i in range(n):
@@ -3875,7 +3888,8 @@ async def on_message(message):
                     dt, unlock = add_time(base_clock_str, dur)
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
-        # 3) それでも parsed が空ならダミー行は作らない
+        
+        # 3) それでも parsed が空なら、何も登録しない（ダミー禁止）
         # ===== 登録処理（既存設計に合わせる）=====
         image_results = []
         structured_entries_for_this_image = []
