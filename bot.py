@@ -906,7 +906,7 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
                 messages=[{"role":"user","content":[
                     {"type":"text","text":instruction},
                     {"type":"image_url","image_url":{"url":data_uri,"detail":"high"}},  # ← low→high
-                ]}]],
+                ]}],
                 max_tokens=200,
                 temperature=0
             )
@@ -1079,7 +1079,7 @@ def oai_ocr_lines(np_bgr: np.ndarray, purpose: str = "general") -> list[str]:
 
         content = [
             {"type": "input_text", "text": f"[目的:{purpose}] {user_text}"},
-            {"type": "input_image", "image_url": data_uri, "detail": "low"},
+            {"type": "input_image", "image_url": data_uri, "detail": "high"},
         ]
 
         for model_name in model_chain:
@@ -1250,11 +1250,11 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
 
     content_responses = [
         {"type": "input_text", "text": instruction},
-        {"type": "input_image", "image_url": img1, "detail": "low"},
-        {"type": "input_image", "image_url": img2, "detail": "low"},
+        {"type": "input_image", "image_url": img1, "detail": "high"},
+        {"type": "input_image", "image_url": img2, "detail": "high"},
     ]
     if img3:
-        content_responses.append({"type": "input_image", "image_url": img3, "detail": "low"})
+        content_responses.append({"type": "input_image", "image_url": img3, "detail": "high"})
 
     content_chat = [
         {"type": "text", "text": instruction},
@@ -3712,7 +3712,6 @@ async def on_message(message):
                     srv_fb = _extract_server_from_header(full_bgr)
             else:
                 srv_fb = _extract_server_from_header(full_bgr)
-            srv_fb = _extract_server_from_header(full_bgr)
             # --- 3エンジン比較デバッグ（失敗フォールバック時） ---
             # ヘッダ帯のBGR画像を用意
             H, W = full_bgr.shape[:2]
