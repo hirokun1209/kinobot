@@ -562,6 +562,28 @@ def cleanup_old_entries():
         if (now - pending_places[k]["created_at"]) > timedelta(hours=6):
             del pending_places[k]
 
+HHMMSS_RE   = r'(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)'
+DATE_LIKE_RE= r'\d{4}[-/年]\d{1,2}[-/月]\d{1,2}'
+
+def _read_clock_from_roi_strict(full_bgr, clock_rect=None):
+    """右上時計のROIだけから HH:MM:SS を抽出。日付や『停戦』混じりは排除。"""
+    roi = _crop_rect(full_bgr, clock_rect) if clock_rect else full_bgr
+    pp = ocr_center_paddle(roi) or []
+    gv = extract_text_from_image(roi) or []
+    texts = []
+    for s in (pp if isinstance(pp, list) else [pp]) + (gv if isinstance(gv, list) else [gv]):
+        if not s: 
+            continue
+        t = str(s)
+        if "停戦" in t or re.search(DATE_LIKE_RE, t):
+            continue
+        texts.append(t)
+    for t in texts:
+        m = re.search(HHMMSS_RE, t)
+        if m:
+            return m.group(0)
+    return None
+
 def parse_txt_fields(txt: str):
     m = re.fullmatch(r"(奪取|警備)\s+(\d{4})-(\d+)-(\d{2}:\d{2}:\d{2})", txt)
     return m.groups() if m else None
@@ -3864,9 +3886,22 @@ async def on_message(message):
         center_txts = _coerce_str_lines(j.get("center_lines"))
         cease_str   = _first_str(j.get("ceasefire_end"))
 
+        # まず全ROIをフル画像から一発計算（ネスト禁止）
+        rects = _calc_regions(full_bgr)
+        
+        # 時計は必ず「フル画像の clock_rect」から読む
+        base_clock_roi  = _read_clock_from_roi_strict(full_bgr, rects["clock"])
+        
+        # OpenAIの上部行（停戦/日付混じりは除外）
         base_clock_ocr  = _extract_clock_from_top_txts(top_txts)
+        
+        # 本文からの拾い上げ（あれば）
+        base_clock_cent = _extract_clock_from_center_lines(center_txts) if ' _extract_clock_from_center_lines' in globals() else None
+        
+        # 最後はメタデータ
         base_clock_meta = base_time_from_metadata(raw)
-        base_clock_str  = base_clock_ocr or base_clock_meta
+        
+        base_clock_str = base_clock_roi or base_clock_ocr or base_clock_cent or base_clock_meta
         # --- 時計の多段フォールバック（center→ROI） ---
         if not base_clock_str:
             # 1) center_lines に出てしまった HH:MM:SS を拾う（免戦的な 00:MM:SS などは劣後）
