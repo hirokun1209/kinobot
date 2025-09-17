@@ -2133,9 +2133,6 @@ def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
     return sid
 
     # 2) 外側（既存のヘッダ帯）
-    y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
-    head_outer = full_bgr[y1:y2, x1:x2]
-    sid, _ = _triage_read_server_from_head(head_outer)
     return sid
 
     # 2) 外側
@@ -3806,20 +3803,6 @@ async def on_message(message):
         H, W = full_bgr.shape[:2]
         y1 = int(H * HEAD_TOP_RATIO); y2 = int(H * HEAD_BOTTOM_RATIO)
         x1 = 0; x2 = int(W * HEAD_RIGHT_RATIO)
-        head_img_bgr = full_bgr[y1:y2, x1:x2]
-        
-        try:
-            server_from_head, dbg = _triage_read_server_from_head(head_img_bgr)
-        except NameError:
-            # もし _triage_* をまだ入れてない場合は、旧フォールバックに倒す
-            server_from_head = _extract_server_from_header(full_bgr)
-            dbg = {"raw": {}, "norm": {}, "winner": "fallback(_extract_server_from_header)"}
-        
-        # OpenAI構造化にも一応フォールバック
-        try:
-            server_struct = _normalize_server4((j.get("structured") or {}).get("server"))
-        except NameError:
-            server_struct = _normalize_server((j.get("structured") or {}).get("server"))
         
         # 最終採用：ヘッダ帯 ＞ 構造化
         server_final = server_from_head or server_struct
@@ -3872,20 +3855,6 @@ async def on_message(message):
                     continue
                 filtered.append((dt, txt, raw_dur))
             parsed = filtered
-        # --- 追加ガード：server/場所の妥当性チェック ---
-        if server_final:
-            good = []
-            for dt, txt, raw_dur in parsed:
-                m = re.search(r'^\S+\s+(\d{3,5})-([0-9]+)-', txt)
-                if not m:
-                    continue
-                srv_txt, place_txt = m.group(1), m.group(2)
-                if srv_txt != server_final:
-                    continue
-                if place_txt in ("0", ""):
-                    continue
-                good.append((dt, txt, raw_dur))
-            parsed = good
             
         # rows / center からのフォールバック復元（ダミー生成なし）
         if not parsed:
