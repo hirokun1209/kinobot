@@ -37,6 +37,34 @@ PLACE_RE = re.compile(
 # [s1234] / s1234 / 1234 を全部「1234」に正規化
 SERVER_NUM_RE = re.compile(r"[sS]?\s*(\d{3,4})")
 
+# --- (!oaiocr ヘッダ帯の3エンジン比較用 追加) ---
+import unicodedata
+from typing import Optional, Tuple, Dict
+
+# 英字の紛れを数字へ寄せる（O→0, l/I→1, S→5 など）
+CHAR2DIGIT = str.maketrans({
+    'O':'0','o':'0','〇':'0','零':'0',
+    'I':'1','l':'1','｜':'1','一':'1',
+    'S':'5','s':'5','$':'5',
+    'Z':'2','z':'2',
+    'B':'8',
+})
+
+def _normalize_server4(text: Optional[str]) -> Optional[str]:
+    """任意のOCR文字列から『サーバ番号4桁』だけを安全に取り出す。失敗時は None。"""
+    if not text:
+        return None
+    t = unicodedata.normalize("NFKC", str(text)).strip()
+    t = t.translate(CHAR2DIGIT)
+    t = re.sub(r'[^0-9\[\]s-]+', '', t.lower())
+    for pat in (r's\D*(\d{4,5})', r'\[(?:s)?\D*(\d{4,5})\]', r'(\d{4,5})'):
+        m = re.search(pat, t)
+        if m:
+            d = re.sub(r'\D', '', m.group(1))
+            if len(d) >= 4:
+                return d[:4]  # 常に4桁へ収束
+    return None
+
 def _normalize_server(x) -> str | None:
     if x is None:
         return None
@@ -540,6 +568,52 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
         return bgr
     r = max_side / s
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
+
+def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], Dict]:
+    """
+    ヘッダ帯画像からサーバIDを Paddle / Google / OpenAI の3系で読み、
+    正規化（4桁）→ 優先度/多数決で確定する。
+    return: (server4 or None, debug_info dict)
+    """
+    # ===== 1) エンジン実行 =====
+    # Paddle（あなたの既存関数に合わせてください）
+    pp_lines = ocr_center_paddle(head_bgr)
+    pp_text  = "\n".join(pp_lines) if isinstance(pp_lines, list) else (pp_lines or "")
+
+    # Google Vision（あなたの既存関数）
+    gv_lines = extract_text_from_image(head_bgr)
+    gv_text  = "\n".join(gv_lines) if isinstance(gv_lines, list) else (gv_lines or "")
+
+    # OpenAI（“4桁だけ返せ”強プロンプト）
+    oai_prompt = (
+        "You are reading a server id like [s1234] near the top header. "
+        "Return ONLY the four digits (0-9). If uncertain, return NONE."
+    )
+    try:
+        oai_text = call_openai_vision(head_bgr, prompt=oai_prompt)
+    except Exception:
+        oai_text = ""
+
+    # ===== 2) 正規化 =====
+    cand_raw = {"pp": pp_text, "gv": gv_text, "oai": oai_text}
+    cand_norm = {k: _normalize_server4(v) for k, v in cand_raw.items()}
+
+    # ===== 3) 決定ロジック =====
+    # 3-1) OpenAI が4桁を出していれば最優先で採用
+    if cand_norm.get("oai"):
+        return cand_norm["oai"], {"raw": cand_raw, "norm": cand_norm, "winner": "oai"}
+
+    # 3-2) 多数決（最頻値）
+    votes: Dict[str, int] = {}
+    for n in cand_norm.values():
+        if n:
+            votes[n] = votes.get(n, 0) + 1
+    if votes:
+        winner_val = max(votes.items(), key=lambda kv: kv[1])[0]
+        return winner_val, {"raw": cand_raw, "norm": cand_norm, "winner": "vote"}
+
+    # 3-3) どれも取れないときは None
+    return None, {"raw": cand_raw, "norm": cand_norm, "winner": None}
 
 # === SRVDEBUG: 可視化ユーティリティ ===
 def _draw_box(img_bgr, rect, color=(0,255,255), thick=2, label=None):
@@ -1986,24 +2060,20 @@ def extract_server_number(center_texts):
             return m.group(1)
     return None
 
-def _extract_server_from_header(full_bgr: np.ndarray) -> str | None:
+def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
     """
-    画面上部のタイトル帯（[s1234] 越域…）からサーバー番号を読むフォールバック。
-    合成前の full_bgr を渡す。
+    画面上部のタイトル帯（[s1234] 越域…）からサーバ番号を読む。
+    合成前の full_bgr（BGR）を渡す。
     """
     H, W = full_bgr.shape[:2]
-    # !srvdebug と同じ矩形：HEAD_TOP_RATIO / HEAD_BOTTOM_RATIO / HEAD_RIGHT_RATIO
-    # （定義場所：BLACK_* 定数の少し下）
-    x1 = 0
     y1 = int(H * HEAD_TOP_RATIO)
-    x2 = int(W * HEAD_RIGHT_RATIO)
     y2 = int(H * HEAD_BOTTOM_RATIO)
+    x1 = 0
+    x2 = int(W * HEAD_RIGHT_RATIO)
     head = full_bgr[y1:y2, x1:x2]
-    
-    # Paddle優先 → 弱ければGoogle Visionにフォールバック（!srvdebug と同じ流儀）
-    lines = ocr_center_paddle(head) or extract_text_from_image(head)
-    s = extract_server_number(lines)
-    return _normalize_server(s)
+
+    server4, _dbg = _triage_read_server_from_head(head)
+    return server4
 
 def add_time(base_time_str, duration_str):
     today = now_jst().date()
@@ -3537,7 +3607,23 @@ async def on_message(message):
 
             base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(raw)
             srv_fb = _extract_server_from_header(full_bgr)
-
+            # --- 3エンジン比較デバッグ（失敗フォールバック時） ---
+            # ヘッダ帯のBGR画像を用意
+            H, W = full_bgr.shape[:2]
+            y1 = int(H * HEAD_TOP_RATIO); y2 = int(H * HEAD_BOTTOM_RATIO)
+            x1 = 0; x2 = int(W * HEAD_RIGHT_RATIO)
+            head_img_bgr = full_bgr[y1:y2, x1:x2]
+            
+            if os.getenv("OAI_HEADER_DEBUG") == "1":
+                srv_dbg, dbg = _triage_read_server_from_head(head_img_bgr)
+                lines = [
+                    "📚 **ヘッダ帯 3エンジン比較（!oaiocr fallback）**",
+                    f"・Paddle: {repr(dbg['raw'].get('pp'))} → norm={dbg['norm'].get('pp')!r}",
+                    f"・Google: {repr(dbg['raw'].get('gv'))} → norm={dbg['norm'].get('gv')!r}",
+                    f"・OpenAI: {repr(dbg['raw'].get('oai'))} → norm={dbg['norm'].get('oai')!r}",
+                    f"➡️ 採用: {srv_dbg!r}",
+                ]
+                await message.channel.send("\n".join(lines))
             parsed_preview = parse_multiple_places(
                 center_txts, top_txts,
                 base_time_override=base_clock_str,
@@ -3585,7 +3671,24 @@ async def on_message(message):
 
         # server は OpenAI優先 → ヘッダから補完
         server_oai = _normalize_server((j.get("structured") or {}).get("server")) or _extract_server_from_header(full_bgr)
-
+        # --- 3エンジン比較デバッグ（成功時：OpenAI結果あり） ---
+        # ヘッダ帯のBGR画像を用意
+        H, W = full_bgr.shape[:2]
+        y1 = int(H * HEAD_TOP_RATIO); y2 = int(H * HEAD_BOTTOM_RATIO)
+        x1 = 0; x2 = int(W * HEAD_RIGHT_RATIO)
+        head_img_bgr = full_bgr[y1:y2, x1:x2]
+        
+        if os.getenv("OAI_HEADER_DEBUG") == "1":
+            srv_dbg, dbg = _triage_read_server_from_head(head_img_bgr)
+            lines = [
+                "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
+                f"・Paddle: {repr(dbg['raw'].get('pp'))} → norm={dbg['norm'].get('pp')!r}",
+                f"・Google: {repr(dbg['raw'].get('gv'))} → norm={dbg['norm'].get('gv')!r}",
+                f"・OpenAI: {repr(dbg['raw'].get('oai'))} → norm={dbg['norm'].get('oai')!r}",
+                f"➡️ 採用: {srv_dbg!r}",
+                f"（OpenAI構造化のserver={server_oai!r}）",
+            ]
+            await message.channel.send("\n".join(lines))
         parsed_preview = parse_multiple_places(
             center_txts, top_txts,
             base_time_override=base_clock_str,
