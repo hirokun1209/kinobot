@@ -542,6 +542,77 @@ def now_jst():
 def _file_from_bytes(filename: str, byts: bytes):
     return discord.File(io.BytesIO(byts), filename=filename)
 
+def _rect_from_ratio(H, W, L, T, R, B):
+    x1 = max(0, min(int(W*L), W-1))
+    y1 = max(0, min(int(H*T), H-1))
+    x2 = max(x1+1, min(int(W*R), W))
+    y2 = max(y1+1, min(int(H*B), H))
+    return (x1, y1, x2, y2)
+
+def _crop_rect(img, rect):
+    x1, y1, x2, y2 = rect
+    return img[y1:y2, x1:x2]
+
+def _pick_last_4digit(texts):
+    """配列/文字列から 4桁連続数字の『最後の出現』を返す"""
+    if not texts: return ""
+    if isinstance(texts, str): texts = [texts]
+    import re
+    last = ""
+    for t in texts:
+        for m in re.finditer(r"(?<!\d)(\d{4})(?!\d)", t):
+            last = m.group(1)
+    return last
+
+def _ocr_lines_pp_gv(img_bgr):
+    """ヘッダ帯を Paddle / Google で読む（行配列を返す）"""
+    lines_pp = ocr_center_paddle(img_bgr) or []
+    lines_gv = extract_text_from_image_google(img_bgr) if GV_CLIENT else []
+    return lines_pp, lines_gv
+
+def _triage_read_server_from_head(head_img_bgr):
+    """3エンジン（Paddle/Google/OpenAI）比較し、最後の4桁を採用"""
+    pp, gv = _ocr_lines_pp_gv(head_img_bgr)
+    # OpenAI 単発問い合わせ（debug用・短文プロンプト）
+    oai_lines = []
+    try:
+        if OA_CLIENT:
+            uri = _bgr_to_data_uri_np(shrink_long_side(head_img_bgr, 768))
+            res = OA_CLIENT.responses.create(
+                model=os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini"),
+                input=[{"role":"user","content":[
+                    {"type":"input_text","text":"ヘッダ帯から s#### / [s####] / #### のサーバ番号候補を列挙。1行に1つ。説明不要。"},
+                    {"type":"input_image","image_url":uri,"detail":"high"},
+                ]}],
+                max_output_tokens=48, temperature=0
+            )
+            txt = (res.output_text or "").strip()
+            oai_lines = [t.strip() for t in txt.splitlines() if t.strip()]
+    except Exception as e:
+        oai_lines = [f"(OpenAI error: {e})"]
+
+    # 正規化（sや[]を落として4桁取り）
+    cand_pp  = _pick_last_4digit(pp)
+    cand_gv  = _pick_last_4digit(gv)
+    cand_oai = _pick_last_4digit(oai_lines)
+
+    # 優先度：OpenAI → Google → Paddle
+    final = cand_oai or cand_gv or cand_pp
+
+    dbg = {"raw":{"pp":pp,"gv":gv,"oai":oai_lines},
+           "norm":{"pp":cand_pp,"gv":cand_gv,"oai":cand_oai},
+           "winner":final}
+    return final, dbg
+
+def _calc_regions(full_bgr):
+    """フル画像基準で head / clock / center / cease を一括決定"""
+    H, W = full_bgr.shape[:2]
+    head   = _rect_from_ratio(H, W, 0.0, HEAD_TOP_RATIO,   HEAD_RIGHT_RATIO,   HEAD_BOTTOM_RATIO)
+    clock  = _rect_from_ratio(H, W, CLOCK_LEFT_RATIO,      CLOCK_TOP_RATIO,    CLOCK_RIGHT_RATIO, CLOCK_BOTTOM_RATIO)
+    center = _rect_from_ratio(H, W, 0.0, CENTER_TOP_RATIO, CLOCK_LEFT_RATIO,   CENTER_BOTTOM_RATIO)  # 右端＝時計左端
+    cease  = _rect_from_ratio(H, W, 0.0, CEASE_TOP_RATIO,  1.0,                CEASE_BOTTOM_RATIO)
+    return {"head": head, "clock": clock, "center": center, "cease": cease}
+
 # --- 合成PNG(bytes) → BGR(ndarray) ---
 def _bgr_from_png_bytes(png_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(png_bytes, np.uint8)
@@ -714,42 +785,55 @@ CEASE_FALLBACK_TOP = float(os.getenv("CEASE_FALLBACK_TOP", "0.85"))
 CLOCK_LEFT_RATIO  = float(os.getenv("CLOCK_LEFT_RATIO",  "0.72"))
 CLOCK_RIGHT_RATIO = float(os.getenv("CLOCK_RIGHT_RATIO", "0.98"))
 
+# ==== ROI 比率（フル画像に対する相対座標） ====
+# ヘッダ帯（緑）：上のバナー〜タイトル帯全体
+HEAD_TOP_RATIO    = 0.00
+HEAD_BOTTOM_RATIO = 0.22
+HEAD_RIGHT_RATIO  = 1.00
+
+# 右上の時計（黄）：ひと区画分「下へ」ずらす
+#   もともと TOP=0.03〜0.12 だった想定 → 1段分の高さを足す
+_CLOCK_BASE_TOP    = 0.03
+_CLOCK_BASE_BOTTOM = 0.12
+_CLOCK_H           = _CLOCK_BASE_BOTTOM - _CLOCK_BASE_TOP
+CLOCK_TOP_RATIO    = _CLOCK_BASE_TOP + _CLOCK_H        # 下へ1段
+CLOCK_BOTTOM_RATIO = _CLOCK_BASE_BOTTOM + _CLOCK_H
+CLOCK_LEFT_RATIO   = 0.72
+CLOCK_RIGHT_RATIO  = 0.98
+
+# 停戦帯（紫）：少し上に
+CEASE_TOP_RATIO    = 0.83
+CEASE_BOTTOM_RATIO = 0.98
+
+# 中央（青）：上＝緑の下端、下＝紫の上端、右端＝時計の左端
+CENTER_TOP_RATIO    = HEAD_BOTTOM_RATIO
+CENTER_BOTTOM_RATIO = CEASE_TOP_RATIO
+
+# 合成画像に対する「ヘッダ帯」の比率（srvdebug と同じ）
+COMP_HEAD_TOP    = 0.00
+COMP_HEAD_BOTTOM = 0.25
+COMP_HEAD_RIGHT  = 1.00
+
+# 合成画像からヘッダを読むか（デフォルト=ON）
+USE_COMPOSITE_FOR_HEADER = (os.getenv("USE_COMPOSITE_FOR_HEADER", "1") == "1")
+
 def _mark_regions_on_full(full_bgr):
-    H, W = full_bgr.shape[:2]
-
-    # HEAD：環境比率
-    head = (
-        0,
-        int(H * HEAD_TOP_RATIO),
-        int(W * HEAD_RIGHT_RATIO),
-        int(H * HEAD_BOTTOM_RATIO),
-    )
-
-    # CLOCK：環境比率（黄色）
-    clock = (
-        int(W * CLOCK_LEFT_RATIO),
-        int(H * CLOCK_TOP_RATIO),
-        int(W * CLOCK_RIGHT_RATIO),
-        int(H * CLOCK_BOTTOM_RATIO),
-    )
-
-    # CEASE：検出 → 無ければフォールバック（下側帯）
-    rects = find_ceasefire_regions_full_img(full_bgr)
-    if rects:
-        cease = rects[0]  # (x1,y1,x2,y2)
-    else:
-        cease = (0, int(H * CEASE_FALLBACK_TOP), W, H)
-
-    # CENTER：HEADの下端〜CEASEの上端、右端は“時計の左端”にロック
-    center = (0, head[3], clock[0], cease[1])
-
-    # 可視化
+    """ヘルパ：緑(HEAD)・黄(CLOCK)・青(CENTER)・紫(CEASE)を描いて返す"""
+    rects = _calc_regions(full_bgr)
     dbg = full_bgr.copy()
-    _draw_box(dbg, head,   (0, 255,   0), 2, "HEAD")
-    _draw_box(dbg, clock,  (255, 255, 0), 2, "CLOCK")  # ← カンマ抜けを修正
-    _draw_box(dbg, center, (0, 128, 255), 2, "CENTER")
-    _draw_box(dbg, cease,  (255, 0, 255), 2, "CEASE")
-    return dbg, head, clock, center, cease
+
+    def _draw_box(img, rect, color, thickness, label):
+        x1, y1, x2, y2 = rect
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        if label:
+            cv2.putText(img, label, (x1+4, y1+18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+    _draw_box(dbg, rects["head"],   (0,255,0),   2, "HEAD")
+    _draw_box(dbg, rects["center"], (255,0,0),   2, "CENTER")
+    _draw_box(dbg, rects["clock"],  (255,255,0), 2, "CLOCK")
+    _draw_box(dbg, rects["cease"],  (255,0,255), 2, "CEASE")
+
+    return dbg, rects["head"], rects["clock"], rects["center"], rects["cease"]
     
 def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
     """左右上下を割合でトリミング"""
@@ -1361,36 +1445,50 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
     pil = ImageOps.exif_transpose(pil).convert("RGB")
     full_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
-    # 2) 領域の可視化（HEAD/CLOCK/CENTER/CEASE）
+    # 2) 領域の可視化（HEAD/CLOCK/CENTER/CEASE）: フル画像基準で一括ROI
     marked, head_rect, clock_rect, center_rect, cease_rect = _mark_regions_on_full(full_bgr)
 
-    # 3) 各クロップ（ヘッダは“黒塗り前の原画像”から取る）
-    x1,y1,x2,y2 = head_rect;  head_bgr  = full_bgr[y1:y2, x1:x2]
-    x1,y1,x2,y2 = clock_rect; top_bgr   = full_bgr[y1:y2, x1:x2]
+    # 3) 各クロップ
+    #    ヘッダ・時計は“黒塗り前の原画像”から取る
+    x1, y1, x2, y2 = head_rect
+    head_bgr = full_bgr[y1:y2, x1:x2]
 
-    # CENTER/CEASE はいつもの前処理（免戦直下黒塗りなど）を通す
+    x1, y1, x2, y2 = clock_rect
+    top_bgr = full_bgr[y1:y2, x1:x2]  # = CLOCK ROI（ファイル名に合わせて top_bgr のまま）
+
+    #    CENTER/CEASE は前処理（免戦直下黒塗りなど）後の画像から
     masked_bgr, _ = auto_mask_ime(full_bgr)
-    x1,y1,x2,y2 = center_rect; center_bgr = masked_bgr[y1:y2, x1:x2]
-    rects = find_ceasefire_regions_full_img(masked_bgr)
-    cease_bgr = (masked_bgr[rects[0][1]:rects[0][3], rects[0][0]:rects[0][2]] 
-                 if rects else crop_cease_banner(masked_bgr))
 
-    # 4) 実際にOpenAIへ送っている「合成PNG」を作る
+    # center は「上=HEAD下端、下=CEASE上端、右=時計左端」で再構築（ズレ防止）
+    cx1 = 0
+    cy1 = head_rect[3]
+    cx2 = clock_rect[0]
+    cy2 = cease_rect[1]
+    center_bgr = masked_bgr[cy1:cy2, cx1:cx2]
+
+    # 停戦帯は動的検出があれば上書き（変数名は衝突させない）
+    cease_bgr = masked_bgr[cease_rect[1]:cease_rect[3], cease_rect[0]:cease_rect[2]]
+    cease_cands = find_ceasefire_regions_full_img(masked_bgr)
+    if cease_cands:
+        x1, y1, x2, y2 = cease_cands[0]
+        cease_bgr = masked_bgr[y1:y2, x1:x2]
+
+    # 4) 実際にOpenAIへ送っている「合成PNG」を作る（必ず full_bgr から）
     comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
-    comp_small   = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
+    comp_small = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
 
     # 5) 3エンジン比較（ヘッダ帯のみで確認）
     paddle_lines = ocr_center_paddle(head_bgr)
-    gv_lines     = extract_text_from_image_google(head_bgr) if GV_CLIENT else []
+    gv_lines = extract_text_from_image_google(head_bgr) if GV_CLIENT else []
     oa_head = []
     if OA_CLIENT and DEBUG_ATTACH_TO_OPENAI:
         uri = _bgr_to_data_uri_np(shrink_long_side(head_bgr, 768))
         try:
             res = OA_CLIENT.responses.create(
                 model=os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini"),
-                input=[{"role":"user","content":[
-                    {"type":"input_text","text":"タイトル帯からサーバ番号 [s####] / s#### / #### を1行で返して。説明は不要。"},
-                    {"type":"input_image","image_url":uri,"detail":"high"},
+                input=[{"role": "user", "content": [
+                    {"type": "input_text", "text": "タイトル帯からサーバ番号 [s####] / s#### / #### を1行で返して。説明は不要。"},
+                    {"type": "input_image", "image_url": uri, "detail": "high"},
                 ]}],
                 max_output_tokens=32,
                 temperature=0
@@ -1400,20 +1498,21 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
         except Exception as e:
             oa_head = [f"(OpenAI error: {e})"]
 
-    # 6) 正規化（[s1234] / s1234 / 1234 → "1234"）
+    # 6) 正規化（[s1234] / s1234 / 1234 → "1234"）※“最後の番号”ルール
     def _pick_num(lines):
         return _pick_last_server_from_lines(lines)
-        # ここを “最後の番号” を返すロジックに変更
-        return _pick_last_server_from_lines(lines)
+
     raw_paddle = _pick_num(paddle_lines)
-    raw_gv     = _pick_num(gv_lines)
-    raw_oa     = _pick_num(oa_head)
+    raw_gv = _pick_num(gv_lines)
+    raw_oa = _pick_num(oa_head)
+
     norm_paddle = _normalize_server(raw_paddle)
-    norm_gv     = _normalize_server(raw_gv)
-    norm_oa     = _normalize_server(raw_oa)
+    norm_gv = _normalize_server(raw_gv)
+    norm_oa = _normalize_server(raw_oa)
 
     # 7) Discordへ添付（実物を見ながら調整できる）
     files = []
+
     def _add(name, bgr, q=95):
         if bgr is None or not getattr(bgr, "size", 0):
             return
@@ -1421,12 +1520,12 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
         if ok:
             files.append(discord.File(io.BytesIO(buf.tobytes()), filename=name))
 
-    _add("srvdebug_marked.jpg",          shrink_long_side(marked, 1280))
-    _add("srvdebug_head.jpg",            shrink_long_side(head_bgr, 820))
-    _add("srvdebug_clock.jpg",           shrink_long_side(top_bgr,  820))
-    _add("srvdebug_center.jpg",          shrink_long_side(center_bgr, 1000))
-    _add("srvdebug_cease.jpg",           shrink_long_side(cease_bgr, 820))
-    _add("srvdebug_composite_sent.jpg",  comp_small)
+    _add("srvdebug_marked.jpg",         shrink_long_side(marked, 1280))
+    _add("srvdebug_head.jpg",           shrink_long_side(head_bgr, 820))
+    _add("srvdebug_clock.jpg",          shrink_long_side(top_bgr, 820))
+    _add("srvdebug_center.jpg",         shrink_long_side(center_bgr, 1000))
+    _add("srvdebug_cease.jpg",          shrink_long_side(cease_bgr, 820))
+    _add("srvdebug_composite_sent.jpg", comp_small)
 
     hH, hW = head_bgr.shape[:2]
     lines = [
@@ -1436,9 +1535,9 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
         f"🎛 ヘッダ帯サイズ: {hW}x{hH}  HEAD_TOP={HEAD_TOP_RATIO} / BOTTOM={HEAD_BOTTOM_RATIO} / RIGHT={HEAD_RIGHT_RATIO}",
         "",
         "📚 **ヘッダ帯 OCR 結果**",
-        f"・Paddle:  {paddle_lines[:4] or '(なし)'}  → raw=%r / norm=%r" % (raw_paddle, norm_paddle),
-        f"・Google:  {gv_lines[:4]     or '(なし)'}  → raw=%r / norm=%r" % (raw_gv, norm_gv),
-        f"・OpenAI:  {oa_head[:2]      or '(未送信)'} → raw=%r / norm=%r" % (raw_oa, norm_oa),
+        f"・Paddle:  {paddle_lines[:4] or '(なし)'}  → raw={raw_paddle!r} / norm={norm_paddle!r}",
+        f"・Google:  {gv_lines[:4]     or '(なし)'}  → raw={raw_gv!r} / norm={norm_gv!r}",
+        f"・OpenAI:  {oa_head[:2]      or '(未送信)'} → raw={raw_oa!r} / norm={norm_oa!r}",
         "",
         "✅ 期待: いずれかで norm が4桁になっていること。",
         "❗ ダメなときの典型:",
@@ -3885,7 +3984,29 @@ async def on_message(message):
         top_txts    = _coerce_str_lines(j.get("top_clock_lines"))
         center_txts = _coerce_str_lines(j.get("center_lines"))
         cease_str   = _first_str(j.get("ceasefire_end"))
-
+        # === 合成からヘッダ帯を読む（USE_COMPOSITE_FOR_HEADER=1 のとき優先） ===
+        head_src_bgr = full_bgr  # 既定は原寸
+        if USE_COMPOSITE_FOR_HEADER:
+            comp_png = ((j.get("_echo") or {}).get("composite_png") or None)
+            if comp_png:
+                comp_bgr = _bgr_from_png_bytes(comp_png)
+            else:
+                comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
+            if comp_bgr is not None:
+                Hc, Wc = comp_bgr.shape[:2]
+                y1c = int(Hc * COMP_HEAD_TOP);    y2c = int(Hc * COMP_HEAD_BOTTOM)
+                x1c = 0;                           x2c = int(Wc * COMP_HEAD_RIGHT)
+                head_src_bgr = comp_bgr[y1c:y2c, x1c:x2c]
+        
+        # —— 3エンジン比較＋「一番後ろの番号」ルールで確定
+        server_from_head, dbg = _triage_read_server_from_head(head_src_bgr)
+        
+        # OpenAI の structured.server でも補完して最終採用
+        try:
+            server_struct = _normalize_server4((j.get("structured") or {}).get("server"))
+        except NameError:
+            server_struct = _normalize_server((j.get("structured") or {}).get("server"))
+        server_final = server_from_head or server_struct
         # まず全ROIをフル画像から一発計算（ネスト禁止）
         rects = _calc_regions(full_bgr)
         
