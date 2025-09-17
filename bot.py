@@ -611,19 +611,16 @@ def _normalize_server4(text: Optional[str]) -> Optional[str]:
     return None
 
 def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], Dict]:
+    """ヘッダ帯から Paddle / Google / OpenAI を実行し、
+       ・『越域/駐騎場』を含む行を優先
+       ・行内/複数行に複数の [s****] があれば『一番後ろ』を採用
+       ・OpenAIが4桁なら最優先 → それ以外は多数決
     """
-    ヘッダ帯画像から Paddle / Google / OpenAI を実行し、
-    ・'越域/駐騎場' を含む行を優先
-    ・同一行中/複数行中に複数の [s****] があれば『一番後ろ』を採用
-    ・OpenAIが4桁なら最優先 → それ以外は多数決
-    """
-    # Paddle
     pp_lines = ocr_center_paddle(head_bgr) or []
     if isinstance(pp_lines, str): pp_lines = [pp_lines]
-    # Google
     gv_lines = extract_text_from_image(head_bgr) or []
     if isinstance(gv_lines, str): gv_lines = [gv_lines]
-    # OpenAI（短プロンプト）
+
     oai_prompt = ("Read server id like [s1234] in header. "
                   "Return ONLY the four digits; if unsure, return NONE.")
     try:
@@ -631,44 +628,37 @@ def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], 
     except Exception:
         oai_text = ""
 
-    cand_raw = {
-        "pp": "\n".join(pp_lines),
-        "gv": "\n".join(gv_lines),
-        "oai": oai_text,
-    }
+    cand_raw = {"pp": "\n".join(pp_lines), "gv": "\n".join(gv_lines), "oai": oai_text}
 
-    # “越域/駐騎場”含む行を最優先にしつつ、最後の番号を採る
     def _prefer_last(lines):
         lines = list(lines or [])
-        # 1) キーワード行を先に検索
         for ln in lines:
             ln2 = unicodedata.normalize("NFKC", str(ln))
             if ("越域" in ln2) or ("駐騎場" in ln2):
                 n = _pick_last_server_from_lines([ln2])
                 if n: return n
-        # 2) [s が入る行
         for ln in lines:
             if "[s" in str(ln):
                 n = _pick_last_server_from_lines([ln])
                 if n: return n
-        # 3) 全行で最後
         return _pick_last_server_from_lines(lines)
 
     pick_pp  = _prefer_last(pp_lines)
     pick_gv  = _prefer_last(gv_lines)
-    pick_oai = _normalize_server4(oai_text)  # OpenAIは1文想定
+    pick_oai = _normalize_server4(oai_text)
 
     cand_norm = {"pp": pick_pp, "gv": pick_gv, "oai": pick_oai}
 
-    # 決定：OpenAI→多数決
     if cand_norm.get("oai"):
         return cand_norm["oai"], {"raw": cand_raw, "norm": cand_norm, "winner": "oai"}
+
     votes: Dict[str, int] = {}
     for n in (pick_pp, pick_gv, pick_oai):
         if n: votes[n] = votes.get(n, 0) + 1
     if votes:
         winner_val = max(votes.items(), key=lambda kv: kv[1])[0]
         return winner_val, {"raw": cand_raw, "norm": cand_norm, "winner": "vote"}
+
     return None, {"raw": cand_raw, "norm": cand_norm, "winner": None}
 
 # === SRVDEBUG: 可視化ユーティリティ ===
@@ -2116,19 +2106,23 @@ def extract_server_number(center_texts):
     return None
 
 def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
-    """
-    まず“内側クロップ（ニュース帯を避ける）”で抽出し、失敗なら従来の外側で再試行。
-    ヘッダ帯に複数番号があれば『一番後ろ』を採用（_triage_* 内で実施）。
-    """
+    """まず“内側クロップ”で抽出し、失敗なら従来の外側で再試行。
+       複数番号があれば“最後”を採用（_triage_* 内で実施）。"""
     H, W = full_bgr.shape[:2]
     x1, x2 = 0, int(W * HEAD_RIGHT_RATIO)
 
-    # 1) 内側
+    # 1) 内側（ニュース帯を避けてタイトル行だけ狙う）
     y1 = int(H * HEAD_INNER_TOP);  y2 = int(H * HEAD_INNER_BOTTOM)
     head_inner = full_bgr[y1:y2, x1:x2]
     sid, _ = _triage_read_server_from_head(head_inner)
     if sid:
         return sid
+
+    # 2) 外側（既存のヘッダ帯）
+    y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
+    head_outer = full_bgr[y1:y2, x1:x2]
+    sid, _ = _triage_read_server_from_head(head_outer)
+    return sid
 
     # 2) 外側
     y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
@@ -3732,7 +3726,38 @@ async def on_message(message):
 
         # server は OpenAI優先 → ヘッダから補完
         server_from_head = _extract_server_from_header(full_bgr)
-        server_oai = server_from_head or _normalize_server((j.get("structured") or {}).get("server"))
+        # --- ヘッダ帯から server を最優先で決定（3エンジン＋最後の番号ルールで確定） ---
+        H, W = full_bgr.shape[:2]
+        y1 = int(H * HEAD_TOP_RATIO); y2 = int(H * HEAD_BOTTOM_RATIO)
+        x1 = 0; x2 = int(W * HEAD_RIGHT_RATIO)
+        head_img_bgr = full_bgr[y1:y2, x1:x2]
+        
+        try:
+            server_from_head, dbg = _triage_read_server_from_head(head_img_bgr)
+        except NameError:
+            # もし _triage_* をまだ入れてない場合は、旧フォールバックに倒す
+            server_from_head = _extract_server_from_header(full_bgr)
+            dbg = {"raw": {}, "norm": {}, "winner": "fallback(_extract_server_from_header)"}
+        
+        # OpenAI構造化にも一応フォールバック
+        try:
+            server_struct = _normalize_server4((j.get("structured") or {}).get("server"))
+        except NameError:
+            server_struct = _normalize_server((j.get("structured") or {}).get("server"))
+        
+        # 最終採用：ヘッダ帯 ＞ 構造化
+        server_final = server_from_head or server_struct
+        
+        # （任意デバッグ）OAI_HEADER_DEBUG=1 で送信
+        if os.getenv("OAI_HEADER_DEBUG") == "1":
+            lines = [
+                "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
+                f"・Paddle: {repr(dbg.get('raw',{}).get('pp'))} → norm={dbg.get('norm',{}).get('pp')!r}",
+                f"・Google: {repr(dbg.get('raw',{}).get('gv'))} → norm={dbg.get('norm',{}).get('gv')!r}",
+                f"・OpenAI: {repr(dbg.get('raw',{}).get('oai'))} → norm={dbg.get('norm',{}).get('oai')!r}",
+                f"➡️ 採用(server_final): {server_final!r}",
+            ]
+            await message.channel.send("\n".join(lines))
         # --- 3エンジン比較デバッグ（成功時：OpenAI結果あり） ---
         # ヘッダ帯のBGR画像を用意
         H, W = full_bgr.shape[:2]
@@ -3754,15 +3779,16 @@ async def on_message(message):
         parsed_preview = parse_multiple_places(
             center_txts, top_txts,
             base_time_override=base_clock_str,
-            server_override=server_oai,
+            server_override=server_final
         )
         parsed = list(parsed_preview)
 
         # rows / centerテキストからのフォールバック復元
         if not parsed:
             srv = server_final
-            # 1) structured.rows があれば使用
             rows = ((j.get("structured") or {}).get("rows") or [])
+        
+            # 1) structured.rows があればまず使う
             if srv and base_clock_str and rows:
                 mode = "警備" if srv == "1268" else "奪取"
                 for r in rows:
@@ -3787,8 +3813,7 @@ async def on_message(message):
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
         
-        # 3) それでも parsed が空なら、ダミーの -0- 行は作らず終了
-
+        # 3) それでも parsed が空なら、ダミー行は作らない（静かに終了）
         # ===== 登録処理（既存設計に合わせる）=====
         image_results = []
         structured_entries_for_this_image = []
