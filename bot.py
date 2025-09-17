@@ -786,7 +786,7 @@ CLOCK_LEFT_RATIO  = float(os.getenv("CLOCK_LEFT_RATIO",  "0.72"))
 CLOCK_RIGHT_RATIO = float(os.getenv("CLOCK_RIGHT_RATIO", "0.98"))
 
 # === Region ratios (0.0 - 1.0) ===
-HEAD_TOP_RATIO    = 0.05
+HEAD_TOP_RATIO    = 0.00
 HEAD_BOTTOM_RATIO = 0.25
 HEAD_RIGHT_RATIO  = 1.00
 
@@ -937,7 +937,7 @@ POST_CROP_RIGHT     = float(os.getenv("POST_CROP_RIGHT", "0.00"))
 POST_CROP_BOTTOM    = float(os.getenv("POST_CROP_BOTTOM","0.00"))
 
 # ---- SRVDEBUG用：ヘッダ帯の想定範囲（端末により微調整）----
-HEAD_TOP_RATIO    = float(os.getenv("HEAD_TOP_RATIO", "0.05"))  # 画面高さの上から何割〜
+HEAD_TOP_RATIO    = float(os.getenv("HEAD_TOP_RATIO", "0.00"))  # 画面高さの上から何割〜
 HEAD_BOTTOM_RATIO = float(os.getenv("HEAD_BOTTOM_RATIO", "0.25"))  # 〜下まで何割（初期: 上18%）
 HEAD_RIGHT_RATIO  = float(os.getenv("HEAD_RIGHT_RATIO", "1.00"))  # 右端は少し余らせる
 # ニュース帯を避ける“内側”クロップ（!srvdebug / !oaiocr 共通）
