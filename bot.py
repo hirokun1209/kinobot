@@ -793,7 +793,7 @@ HEAD_RIGHT_RATIO  = 1.00
 # ⬇ 右上時計のトリミング領域（上に持ち上げ）
 # 以前より TOP を小さく、BOTTOM も同じぶん上げて高さはほぼ同じ
 CLOCK_TOP_RATIO    = 0.02   # ← 上に上げる
-CLOCK_BOTTOM_RATIO = 0.12   # ← 旧値が 0.16 前後なら 0.12 に（高さ ~0.10 を維持）
+CLOCK_BOTTOM_RATIO = 0.11   # ← 旧値が 0.16 前後なら 0.12 に（高さ ~0.10 を維持）
 CLOCK_LEFT_RATIO   = 0.74
 CLOCK_RIGHT_RATIO  = 0.98
 
