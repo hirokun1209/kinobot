@@ -42,27 +42,20 @@ import unicodedata
 from typing import Optional, Tuple, Dict
 
 # 英字の紛れを数字へ寄せる（O→0, l/I→1, S→5 など）
-CHAR2DIGIT = str.maketrans({
-    'O':'0','o':'0','〇':'0','零':'0',
-    'I':'1','l':'1','｜':'1','一':'1',
-    'S':'5','s':'5','$':'5',
-    'Z':'2','z':'2',
-    'B':'8',
-})
+# O→0 / lI→1 / S→5 などを数字に寄せる
+_CHAR2DIGIT = str.maketrans({'O':'0','o':'0','I':'1','l':'1','S':'5','s':'5','Z':'2','z':'2','B':'8'})
 
 def _normalize_server4(text: Optional[str]) -> Optional[str]:
-    """任意のOCR文字列から『サーバ番号4桁』だけを安全に取り出す。失敗時は None。"""
     if not text:
         return None
-    t = unicodedata.normalize("NFKC", str(text)).strip()
-    t = t.translate(CHAR2DIGIT)
-    t = re.sub(r'[^0-9\[\]s-]+', '', t.lower())
-    for pat in (r's\D*(\d{4,5})', r'\[(?:s)?\D*(\d{4,5})\]', r'(\d{4,5})'):
+    t = unicodedata.normalize("NFKC", str(text)).translate(_CHAR2DIGIT).lower()
+    t = re.sub(r'[^0-9\[\]s-越域駐騎場]+', '', t)
+    for pat in (r'\[s\s*(\d{4,5})\]', r's\D*(\d{4,5})', r'(\d{4,5})'):
         m = re.search(pat, t)
         if m:
             d = re.sub(r'\D', '', m.group(1))
             if len(d) >= 4:
-                return d[:4]  # 常に4桁へ収束
+                return d[:4]
     return None
 
 def _normalize_server(x) -> str | None:
@@ -570,14 +563,17 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
 
 def extract_places_from_center(center_txts):
+    """中央本文から『越域駐騎場 N / 越域駐車場 N』の N を抽出"""
     text = "\n".join(center_txts or [])
-    nums = re.findall(r'越域駐騎場\s*([0-9]{1,2})', text)
+    nums = re.findall(r'越域駐[騎車]場\s*([0-9]{1,2})', text)
+    if not nums:
+        nums = re.findall(r'越域\s*駐[騎車]場\s*([0-9]{1,2})', text)
     return [int(n) for n in nums]
 
 def _pick_last_server_from_lines(lines) -> Optional[str]:
     """
-    OCRの行から [s1234] / s1234 / 1234 / s268 などを全て拾い、
-    『一番後ろ』の番号を返す。4桁があれば4桁を優先。
+    OCR行から [s1234]/s1234/1234/s268 などを全部拾い、
+    『一番後ろ』を返す。4桁があれば4桁を優先。
     """
     if not lines:
         return None
@@ -611,16 +607,17 @@ def _normalize_server4(text: Optional[str]) -> Optional[str]:
     return None
 
 def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], Dict]:
-    """ヘッダ帯から Paddle / Google / OpenAI を実行し、
-       ・『越域/駐騎場』を含む行を優先
-       ・行内/複数行に複数の [s****] があれば『一番後ろ』を採用
-       ・OpenAIが4桁なら最優先 → それ以外は多数決
     """
+    ヘッダ帯から Paddle / Google / OpenAI を実行し、
+    ・『越域/駐騎(車)場』を含む行を優先
+    ・複数 [s****] があれば『一番後ろ』を採用
+    ・OpenAIが4桁なら最優先 → それ以外は多数決
+    """
+    # 1) 各エンジン
     pp_lines = ocr_center_paddle(head_bgr) or []
     if isinstance(pp_lines, str): pp_lines = [pp_lines]
     gv_lines = extract_text_from_image(head_bgr) or []
     if isinstance(gv_lines, str): gv_lines = [gv_lines]
-
     oai_prompt = ("Read server id like [s1234] in header. "
                   "Return ONLY the four digits; if unsure, return NONE.")
     try:
@@ -630,11 +627,12 @@ def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], 
 
     cand_raw = {"pp": "\n".join(pp_lines), "gv": "\n".join(gv_lines), "oai": oai_text}
 
+    # 2) エンジンごとに“最後の番号”を選ぶ（キーワード行を優先）
     def _prefer_last(lines):
         lines = list(lines or [])
         for ln in lines:
             ln2 = unicodedata.normalize("NFKC", str(ln))
-            if ("越域" in ln2) or ("駐騎場" in ln2):
+            if ("越域" in ln2) or ("駐騎" in ln2) or ("駐車" in ln2):
                 n = _pick_last_server_from_lines([ln2])
                 if n: return n
         for ln in lines:
@@ -649,16 +647,15 @@ def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], 
 
     cand_norm = {"pp": pick_pp, "gv": pick_gv, "oai": pick_oai}
 
+    # 3) 決定
     if cand_norm.get("oai"):
         return cand_norm["oai"], {"raw": cand_raw, "norm": cand_norm, "winner": "oai"}
-
-    votes: Dict[str, int] = {}
+    votes: Dict[str,int] = {}
     for n in (pick_pp, pick_gv, pick_oai):
         if n: votes[n] = votes.get(n, 0) + 1
     if votes:
         winner_val = max(votes.items(), key=lambda kv: kv[1])[0]
         return winner_val, {"raw": cand_raw, "norm": cand_norm, "winner": "vote"}
-
     return None, {"raw": cand_raw, "norm": cand_norm, "winner": None}
 
 # === SRVDEBUG: 可視化ユーティリティ ===
@@ -2109,17 +2106,25 @@ def extract_server_number(center_texts):
     return None
 
 def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
-    """まず“内側クロップ”で抽出し、失敗なら従来の外側で再試行。
-       複数番号があれば“最後”を採用（_triage_* 内で実施）。"""
+    """まず内側クロップで抽出→失敗なら外側。複数なら『最後』を採用。"""
     H, W = full_bgr.shape[:2]
     x1, x2 = 0, int(W * HEAD_RIGHT_RATIO)
 
-    # 1) 内側（ニュース帯を避けてタイトル行だけ狙う）
-    y1 = int(H * HEAD_INNER_TOP);  y2 = int(H * HEAD_INNER_BOTTOM)
+    inner_top    = float(globals().get("HEAD_INNER_TOP", 0.12))
+    inner_bottom = float(globals().get("HEAD_INNER_BOTTOM", 0.28))
+
+    # 1) 内側（ニュース帯を避ける＝タイトル行狙い）
+    y1 = int(H * inner_top);  y2 = int(H * inner_bottom)
     head_inner = full_bgr[y1:y2, x1:x2]
     sid, _ = _triage_read_server_from_head(head_inner)
     if sid:
         return sid
+
+    # 2) 外側（広め）
+    y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
+    head_outer = full_bgr[y1:y2, x1:x2]
+    sid, _ = _triage_read_server_from_head(head_outer)
+    return sid
 
     # 2) 外側（既存のヘッダ帯）
     y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
@@ -3785,13 +3790,27 @@ async def on_message(message):
             server_override=server_final
         )
         parsed = list(parsed_preview)
-
+        # --- 追加ガード：server/場所の妥当性チェック ---
+        if server_final:
+            good = []
+            for dt, txt, raw_dur in parsed:
+                m = re.search(r'^\S+\s+(\d{3,5})-([0-9]+)-', txt)
+                if not m:
+                    continue
+                srv_txt, place_txt = m.group(1), m.group(2)
+                if srv_txt != server_final:
+                    continue
+                if place_txt in ("0", ""):
+                    continue
+                good.append((dt, txt, raw_dur))
+            parsed = good
+        # rows / centerテキストからのフォールバック復元
         # rows / centerテキストからのフォールバック復元
         if not parsed:
             srv = server_final
             rows = ((j.get("structured") or {}).get("rows") or [])
         
-            # 1) structured.rows があればまず使う
+            # 1) structured.rows があれば優先
             if srv and base_clock_str and rows:
                 mode = "警備" if srv == "1268" else "奪取"
                 for r in rows:
@@ -3803,7 +3822,7 @@ async def on_message(message):
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
         
-            # 2) rows が空/不足なら中央本文から復元（上から順に place×duration をペアリング）
+            # 2) rows が空/不足 → 中央本文から復元（上から順にペアリング）
             if not parsed and srv and base_clock_str:
                 mode = "警備" if srv == "1268" else "奪取"
                 places = extract_places_from_center(center_txts)
@@ -3815,8 +3834,7 @@ async def on_message(message):
                     dt, unlock = add_time(base_clock_str, dur)
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
-        
-        # 3) それでも parsed が空なら、ダミー行は作らない（静かに終了）
+        # 3) それでも parsed が空ならダミー行は作らない
         # ===== 登録処理（既存設計に合わせる）=====
         image_results = []
         structured_entries_for_this_image = []
