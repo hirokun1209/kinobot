@@ -569,6 +569,33 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     r = max_side / s
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
 
+def _pick_last_server_from_lines(lines) -> str | None:
+    """
+    OCRの行リストから [s1234] / s1234 / 1234 / s268 などを全て拾い、
+    『一番後ろ』に出現したサーバ番号を返す。
+    4桁を最優先、無ければ最後の3〜5桁。
+    """
+    if not lines:
+        return None
+    if isinstance(lines, str):
+        lines = [lines]
+
+    found: list[str] = []
+    for t in lines:
+        s = unicodedata.normalize("NFKC", str(t))
+        # 行内に複数ある場合も順番通り全部拾う
+        for m in re.finditer(r"\[?\s*[sS]?\s*(\d{3,5})\s*\]?", s):
+            found.append(m.group(1))
+
+    if not found:
+        return None
+    # 4桁を優先して“最後”から探す
+    for d in reversed(found):
+        if len(d) == 4:
+            return d
+    # 4桁が無ければ最後のもの
+    return found[-1]
+
 def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], Dict]:
     """
     ヘッダ帯画像からサーバIDを Paddle / Google / OpenAI の3系で読み、
@@ -1287,10 +1314,8 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
 
     # 6) 正規化（[s1234] / s1234 / 1234 → "1234"）
     def _pick_num(lines):
-        for t in lines:
-            m = re.search(r"\[?\s*[sS]?(\d{3,4})\s*\]?", t)
-            if m: return m.group(1)
-        return None
+        # ここを “最後の番号” を返すロジックに変更
+        return _pick_last_server_from_lines(lines)
     raw_paddle = _pick_num(paddle_lines)
     raw_gv     = _pick_num(gv_lines)
     raw_oa     = _pick_num(oa_head)
@@ -2060,20 +2085,27 @@ def extract_server_number(center_texts):
             return m.group(1)
     return None
 
-def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
+def _extract_server_from_header(full_bgr: np.ndarray) -> str | None:
     """
     画面上部のタイトル帯（[s1234] 越域…）からサーバ番号を読む。
-    合成前の full_bgr（BGR）を渡す。
+    ヘッダ帯に複数番号が出たら『一番後ろ』を採用。
     """
     H, W = full_bgr.shape[:2]
-    y1 = int(H * HEAD_TOP_RATIO)
-    y2 = int(H * HEAD_BOTTOM_RATIO)
     x1 = 0
+    y1 = int(H * HEAD_TOP_RATIO)
     x2 = int(W * HEAD_RIGHT_RATIO)
+    y2 = int(H * HEAD_BOTTOM_RATIO)
     head = full_bgr[y1:y2, x1:x2]
 
-    server4, _dbg = _triage_read_server_from_head(head)
-    return server4
+    # 両エンジンの出力行を結合して“最後”を採用
+    pp_lines = ocr_center_paddle(head) or []
+    gv_lines = extract_text_from_image(head) or []
+    raw = _pick_last_server_from_lines((pp_lines or [])) or _pick_last_server_from_lines((gv_lines or []))
+    # 両方に候補がある場合は、行を結合して「全体で最後」をもう一度採用
+    if pp_lines and gv_lines:
+        raw = _pick_last_server_from_lines((pp_lines or []) + (gv_lines or [])) or raw
+
+    return _normalize_server(raw)
 
 def add_time(base_time_str, duration_str):
     today = now_jst().date()
@@ -3670,7 +3702,8 @@ async def on_message(message):
         base_clock_str  = base_clock_ocr or base_clock_meta
 
         # server は OpenAI優先 → ヘッダから補完
-        server_oai = _normalize_server((j.get("structured") or {}).get("server")) or _extract_server_from_header(full_bgr)
+        server_from_head = _extract_server_from_header(full_bgr)
+        server_oai = server_from_head or _normalize_server((j.get("structured") or {}).get("server"))
         # --- 3エンジン比較デバッグ（成功時：OpenAI結果あり） ---
         # ヘッダ帯のBGR画像を用意
         H, W = full_bgr.shape[:2]
