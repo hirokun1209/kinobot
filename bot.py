@@ -785,25 +785,28 @@ CEASE_FALLBACK_TOP = float(os.getenv("CEASE_FALLBACK_TOP", "0.85"))
 CLOCK_LEFT_RATIO  = float(os.getenv("CLOCK_LEFT_RATIO",  "0.72"))
 CLOCK_RIGHT_RATIO = float(os.getenv("CLOCK_RIGHT_RATIO", "0.98"))
 
-# ==== ROI 比率（フル画像に対する相対座標） ====
-# ヘッダ帯（緑）：上のバナー〜タイトル帯全体
+# === Region ratios (0.0 - 1.0) ===
 HEAD_TOP_RATIO    = 0.00
-HEAD_BOTTOM_RATIO = 0.22
+HEAD_BOTTOM_RATIO = 0.25
 HEAD_RIGHT_RATIO  = 1.00
 
-# 右上の時計（黄）：ひと区画分「下へ」ずらす
-#   もともと TOP=0.03〜0.12 だった想定 → 1段分の高さを足す
-_CLOCK_BASE_TOP    = 0.03
-_CLOCK_BASE_BOTTOM = 0.12
-_CLOCK_H           = _CLOCK_BASE_BOTTOM - _CLOCK_BASE_TOP
-CLOCK_TOP_RATIO    = _CLOCK_BASE_TOP + _CLOCK_H        # 下へ1段
-CLOCK_BOTTOM_RATIO = _CLOCK_BASE_BOTTOM + _CLOCK_H
-CLOCK_LEFT_RATIO   = 0.72
+# ⬇ 右上時計のトリミング領域（上に持ち上げ）
+# 以前より TOP を小さく、BOTTOM も同じぶん上げて高さはほぼ同じ
+CLOCK_TOP_RATIO    = 0.02   # ← 上に上げる
+CLOCK_BOTTOM_RATIO = 0.12   # ← 旧値が 0.16 前後なら 0.12 に（高さ ~0.10 を維持）
+CLOCK_LEFT_RATIO   = 0.74
 CLOCK_RIGHT_RATIO  = 0.98
 
-# 停戦帯（紫）：少し上に
-CEASE_TOP_RATIO    = 0.83
+# 中央リスト（必要なら既存値のままでOK）
+CENTER_TOP_RATIO    = 0.25
+CENTER_BOTTOM_RATIO = 0.78
+CENTER_LEFT_RATIO   = 0.05
+CENTER_RIGHT_RATIO  = 0.90  # ※下の関数で時計の左端までクランプします
+
+# 停戦バナー
+CEASE_TOP_RATIO    = 0.86
 CEASE_BOTTOM_RATIO = 0.98
+
 
 # 中央（青）：上＝緑の下端、下＝紫の上端、右端＝時計の左端
 CENTER_TOP_RATIO    = HEAD_BOTTOM_RATIO
@@ -817,23 +820,47 @@ COMP_HEAD_RIGHT  = 1.00
 # 合成画像からヘッダを読むか（デフォルト=ON）
 USE_COMPOSITE_FOR_HEADER = (os.getenv("USE_COMPOSITE_FOR_HEADER", "1") == "1")
 
-def _mark_regions_on_full(full_bgr):
-    """ヘルパ：緑(HEAD)・黄(CLOCK)・青(CENTER)・紫(CEASE)を描いて返す"""
-    rects = _calc_regions(full_bgr)
+def _mark_regions_on_full(full_bgr: np.ndarray):
+    """フル画像座標系で領域を決めて可視化用画像と各矩形を返す"""
+    H, W = full_bgr.shape[:2]
+
+    # 各矩形（x1, y1, x2, y2）
+    head_rect = (
+        0,
+        int(H * HEAD_TOP_RATIO),
+        int(W * HEAD_RIGHT_RATIO),
+        int(H * HEAD_BOTTOM_RATIO),
+    )
+    clock_rect = (
+        int(W * CLOCK_LEFT_RATIO),
+        int(H * CLOCK_TOP_RATIO),
+        int(W * CLOCK_RIGHT_RATIO),
+        int(H * CLOCK_BOTTOM_RATIO),
+    )
+    center_rect = (
+        int(W * CENTER_LEFT_RATIO),
+        int(H * CENTER_TOP_RATIO),
+        int(W * CENTER_RIGHT_RATIO),
+        int(H * CENTER_BOTTOM_RATIO),
+    )
+    # 中央の右端は時計の左端を超えないようにクランプ（右側の余計なパネルを避ける）
+    center_rect = (center_rect[0], center_rect[1], min(center_rect[2], clock_rect[0]), center_rect[3])
+
+    cease_rect = (
+        0,
+        int(H * CEASE_TOP_RATIO),
+        W,
+        int(H * CEASE_BOTTOM_RATIO),
+    )
+
+    # デバッグ描画
     dbg = full_bgr.copy()
+    _draw_box(dbg, head_rect,  (0, 255,   0), 2, "HEAD")
+    _draw_box(dbg, clock_rect, (0, 255, 255), 2, "CLOCK")   # 黄色
+    _draw_box(dbg, center_rect,(255,  0,   0), 2, "CENTER")
+    _draw_box(dbg, cease_rect, (255,  0, 255), 2, "CEASE")
 
-    def _draw_box(img, rect, color, thickness, label):
-        x1, y1, x2, y2 = rect
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-        if label:
-            cv2.putText(img, label, (x1+4, y1+18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-
-    _draw_box(dbg, rects["head"],   (0,255,0),   2, "HEAD")
-    _draw_box(dbg, rects["center"], (255,0,0),   2, "CENTER")
-    _draw_box(dbg, rects["clock"],  (255,255,0), 2, "CLOCK")
-    _draw_box(dbg, rects["cease"],  (255,0,255), 2, "CEASE")
-
-    return dbg, rects["head"], rects["clock"], rects["center"], rects["cease"]
+    return dbg, head_rect, clock_rect, center_rect, cease_rect
     
 def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
     """左右上下を割合でトリミング"""
