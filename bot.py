@@ -850,7 +850,7 @@ def _mark_regions_on_full(full_bgr: np.ndarray):
     # ---- 中央の“微調整”オフセット（未定義なら環境変数 or 0.00）----
     import os
     pad_t_ratio = globals().get("CENTER_TOP_PAD_RATIO",
-                        float(os.getenv("CENTER_TOP_PAD_RATIO", "0.00")))
+                        float(os.getenv("CENTER_TOP_PAD_RATIO", "0.05")))
     pad_b_ratio = globals().get("CENTER_BOTTOM_PAD_RATIO",
                         float(os.getenv("CENTER_BOTTOM_PAD_RATIO", "0.00")))
     pad_l_ratio = globals().get("CENTER_LEFT_PAD_RATIO",
@@ -980,7 +980,7 @@ HEAD_INNER_BOTTOM = float(os.getenv("HEAD_INNER_BOTTOM", "0.28"))
 
 # ===== Center の微調整（比率でオフセット）=====
 # 画像全体の高さに対する割合ぶん、CENTERの各辺を内側に寄せる
-CENTER_TOP_PAD_RATIO    = float(os.getenv("CENTER_TOP_PAD_RATIO", "0.02"))  # ← 上端を下へ 2%
+CENTER_TOP_PAD_RATIO    = float(os.getenv("CENTER_TOP_PAD_RATIO", "0.05"))  # ← 上端を下へ 2%
 CENTER_BOTTOM_PAD_RATIO = float(os.getenv("CENTER_BOTTOM_PAD_RATIO", "0.00"))
 CENTER_LEFT_PAD_RATIO   = float(os.getenv("CENTER_LEFT_PAD_RATIO", "0.00"))
 CENTER_RIGHT_PAD_RATIO  = float(os.getenv("CENTER_RIGHT_PAD_RATIO", "0.00"))
