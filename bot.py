@@ -550,7 +550,7 @@ def _bgr_from_png_bytes(png_bytes: bytes) -> np.ndarray:
 
 # --- 合成画像内のヘッダ帯の割合（必要なら環境変数で微調整） ---
 COMP_HEAD_TOP    = float(os.getenv("COMP_HEAD_TOP", "0.00"))
-COMP_HEAD_BOTTOM = float(os.getenv("COMP_HEAD_BOTTOM", "0.30"))
+COMP_HEAD_BOTTOM = float(os.getenv("COMP_HEAD_BOTTOM", "0.25"))
 COMP_HEAD_RIGHT  = float(os.getenv("COMP_HEAD_RIGHT", "1.00"))
 
 # --- スイッチ：合成後からヘッダを読む（1でON） ---
