@@ -684,13 +684,13 @@ def _draw_box(img_bgr, rect, color=(0,255,255), thick=2, label=None):
         cv2.putText(img_bgr, label, (x1+6, max(14,y1-6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-# 任意で環境調整できる比率
+# 任意で環境調整できる比率（なければ既定値）
 CLOCK_TOP_RATIO    = float(os.getenv("CLOCK_TOP_RATIO", "0.20"))  # １ブロック下げ版
 CLOCK_BOTTOM_RATIO = float(os.getenv("CLOCK_BOTTOM_RATIO", "0.38"))
 CEASE_FALLBACK_TOP = float(os.getenv("CEASE_FALLBACK_TOP", "0.85"))
 
-def _mark_regions_on_full(full_bgr):
-    H,W = full_bgr.shape[:2]
+def _mark_regions_on_full(full_bgr: np.ndarray):
+    H, W = full_bgr.shape[:2]
 
     # HEAD：環境比率
     head  = (0, int(H*HEAD_TOP_RATIO), int(W*HEAD_RIGHT_RATIO), int(H*HEAD_BOTTOM_RATIO))
@@ -708,11 +708,13 @@ def _mark_regions_on_full(full_bgr):
     # CENTER：HEADの下端〜CEASEの上端（“間”を全部）
     center = (0, head[3], W, cease[1])
 
+    # 可視化描画
     dbg = full_bgr.copy()
-    _draw_box(dbg, head,  (0,255,0),   2, "HEAD")
-    _draw_box(dbg, clock (255,255,0),  2, "CLOCK")
-    _draw_box(dbg, center,(0,128,255), 2, "CENTER")
-    _draw_box(dbg, cease, (255,0,255), 2, "CEASE")
+    _draw_box(dbg, head,   (0,255,0),   2, "HEAD")
+    _draw_box(dbg, clock,  (255,255,0), 2, "CLOCK")   # ← カンマあり
+    _draw_box(dbg, center, (0,128,255), 2, "CENTER")
+    _draw_box(dbg, cease,  (255,0,255), 2, "CEASE")
+
     return dbg, head, clock, center, cease
 
 def percent_crop(bgr: np.ndarray, l=0.0, t=0.0, r=0.0, b=0.0) -> np.ndarray:
