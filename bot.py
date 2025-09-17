@@ -3796,44 +3796,6 @@ async def on_message(message):
                 f"・OpenAI: {repr(dbg.get('raw',{}).get('oai'))} → norm={dbg.get('norm',{}).get('oai')!r}",
                 f"➡️ 採用(server_final): {server_final!r}",
             ]
-            await message.channel.send("\n".join(
-        # server は OpenAI優先 → ヘッダから補完
-        server_from_head = _extract_server_from_header(full_bgr)
-        # --- ヘッダ帯から server を最優先で決定（3エンジン＋最後の番号ルールで確定） ---
-        H, W = full_bgr.shape[:2]
-        y1 = int(H * HEAD_TOP_RATIO); y2 = int(H * HEAD_BOTTOM_RATIO)
-        x1 = 0; x2 = int(W * HEAD_RIGHT_RATIO)
-        
-        # 最終採用：ヘッダ帯 ＞ 構造化
-        server_final = server_from_head or server_struct
-        
-        # （任意デバッグ）OAI_HEADER_DEBUG=1 で送信
-        if os.getenv("OAI_HEADER_DEBUG") == "1":
-            lines = [
-                "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
-                f"・Paddle: {repr(dbg.get('raw',{}).get('pp'))} → norm={dbg.get('norm',{}).get('pp')!r}",
-                f"・Google: {repr(dbg.get('raw',{}).get('gv'))} → norm={dbg.get('norm',{}).get('gv')!r}",
-                f"・OpenAI: {repr(dbg.get('raw',{}).get('oai'))} → norm={dbg.get('norm',{}).get('oai')!r}",
-                f"➡️ 採用(server_final): {server_final!r}",
-            ]
-            await message.channel.send("\n".join(lines))
-        # --- 3エンジン比較デバッグ（成功時：OpenAI結果あり） ---
-        # ヘッダ帯のBGR画像を用意
-        H, W = full_bgr.shape[:2]
-        y1 = int(H * HEAD_TOP_RATIO); y2 = int(H * HEAD_BOTTOM_RATIO)
-        x1 = 0; x2 = int(W * HEAD_RIGHT_RATIO)
-        head_img_bgr = full_bgr[y1:y2, x1:x2]
-        
-        if os.getenv("OAI_HEADER_DEBUG") == "1":
-            srv_dbg, dbg = _triage_read_server_from_head(head_img_bgr)
-            lines = [
-                "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
-                f"・Paddle: {repr(dbg['raw'].get('pp'))} → norm={dbg['norm'].get('pp')!r}",
-                f"・Google: {repr(dbg['raw'].get('gv'))} → norm={dbg['norm'].get('gv')!r}",
-                f"・OpenAI: {repr(dbg['raw'].get('oai'))} → norm={dbg['norm'].get('oai')!r}",
-                f"➡️ 採用: {srv_dbg!r}",
-                f"（OpenAI構造化のserver={server_oai!r}）",
-            ]
             await message.channel.send("\n".join(lines))
         parsed_preview = parse_multiple_places(
             center_txts, top_txts,
