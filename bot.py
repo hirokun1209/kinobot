@@ -817,6 +817,8 @@ COMP_HEAD_TOP    = 0.00
 COMP_HEAD_BOTTOM = 0.25
 COMP_HEAD_RIGHT  = 1.00
 
+
+
 # 合成画像からヘッダを読むか（デフォルト=ON）
 USE_COMPOSITE_FOR_HEADER = (os.getenv("USE_COMPOSITE_FOR_HEADER", "1") == "1")
 
@@ -824,27 +826,59 @@ def _mark_regions_on_full(full_bgr: np.ndarray):
     """フル画像座標系で領域を決めて可視化用画像と各矩形を返す"""
     H, W = full_bgr.shape[:2]
 
-    # 各矩形（x1, y1, x2, y2）
+    # ---- 既存の各帯（比率ベース）----
     head_rect = (
         0,
         int(H * HEAD_TOP_RATIO),
         int(W * HEAD_RIGHT_RATIO),
         int(H * HEAD_BOTTOM_RATIO),
     )
+
     clock_rect = (
         int(W * CLOCK_LEFT_RATIO),
         int(H * CLOCK_TOP_RATIO),
         int(W * CLOCK_RIGHT_RATIO),
         int(H * CLOCK_BOTTOM_RATIO),
     )
-    center_rect = (
-        int(W * CENTER_LEFT_RATIO),
-        int(H * CENTER_TOP_RATIO),
-        int(W * CENTER_RIGHT_RATIO),
-        int(H * CENTER_BOTTOM_RATIO),
-    )
-    # 中央の右端は時計の左端を超えないようにクランプ（右側の余計なパネルを避ける）
-    center_rect = (center_rect[0], center_rect[1], min(center_rect[2], clock_rect[0]), center_rect[3])
+
+    # 中央のベース（従来の比率）
+    bx1 = int(W * CENTER_LEFT_RATIO)
+    by1 = int(H * CENTER_TOP_RATIO)
+    bx2 = int(W * CENTER_RIGHT_RATIO)
+    by2 = int(H * CENTER_BOTTOM_RATIO)
+
+    # ---- 中央の“微調整”オフセット（未定義なら環境変数 or 0.00）----
+    import os
+    pad_t_ratio = globals().get("CENTER_TOP_PAD_RATIO",
+                        float(os.getenv("CENTER_TOP_PAD_RATIO", "0.00")))
+    pad_b_ratio = globals().get("CENTER_BOTTOM_PAD_RATIO",
+                        float(os.getenv("CENTER_BOTTOM_PAD_RATIO", "0.00")))
+    pad_l_ratio = globals().get("CENTER_LEFT_PAD_RATIO",
+                        float(os.getenv("CENTER_LEFT_PAD_RATIO", "0.00")))
+    pad_r_ratio = globals().get("CENTER_RIGHT_PAD_RATIO",
+                        float(os.getenv("CENTER_RIGHT_PAD_RATIO", "0.00")))
+
+    # 比率 → ピクセル
+    bx1 += int(W * pad_l_ratio)   # 左を内側へ
+    bx2 -= int(W * pad_r_ratio)   # 右を内側へ
+    by1 += int(H * pad_t_ratio)   # 上を下へ（＝上側を狭める）
+    by2 -= int(H * pad_b_ratio)   # 下を上へ
+
+    # 右端は時計の左端を超えないようにクランプ（右側の余計なパネルを避ける）
+    bx2 = min(bx2, clock_rect[0])
+
+    # 画像境界のガード
+    bx1 = max(0, min(bx1, W)); bx2 = max(0, min(bx2, W))
+    by1 = max(0, min(by1, H)); by2 = max(0, min(by2, H))
+
+    # もし極端に狭くなったらフォールバック（最低サイズ8px）
+    if bx2 - bx1 < 8 or by2 - by1 < 8:
+        bx1 = 0
+        by1 = int(H * HEAD_BOTTOM_RATIO)
+        bx2 = clock_rect[0]
+        by2 = int(H * CEASE_TOP_RATIO)
+
+    center_rect = (bx1, by1, bx2, by2)
 
     cease_rect = (
         0,
@@ -855,10 +889,10 @@ def _mark_regions_on_full(full_bgr: np.ndarray):
 
     # デバッグ描画
     dbg = full_bgr.copy()
-    _draw_box(dbg, head_rect,  (0, 255,   0), 2, "HEAD")
-    _draw_box(dbg, clock_rect, (0, 255, 255), 2, "CLOCK")   # 黄色
-    _draw_box(dbg, center_rect,(255,  0,   0), 2, "CENTER")
-    _draw_box(dbg, cease_rect, (255,  0, 255), 2, "CEASE")
+    _draw_box(dbg, head_rect,   (0, 255,   0), 2, "HEAD")
+    _draw_box(dbg, clock_rect,  (0, 255, 255), 2, "CLOCK")   # 黄色
+    _draw_box(dbg, center_rect, (255,   0,   0), 2, "CENTER")
+    _draw_box(dbg, cease_rect,  (255,   0, 255), 2, "CEASE")
 
     return dbg, head_rect, clock_rect, center_rect, cease_rect
     
@@ -943,6 +977,13 @@ HEAD_RIGHT_RATIO  = float(os.getenv("HEAD_RIGHT_RATIO", "1.00"))  # 右端は少
 # ニュース帯を避ける“内側”クロップ（!srvdebug / !oaiocr 共通）
 HEAD_INNER_TOP    = float(os.getenv("HEAD_INNER_TOP", "0.12"))
 HEAD_INNER_BOTTOM = float(os.getenv("HEAD_INNER_BOTTOM", "0.28"))
+
+# ===== Center の微調整（比率でオフセット）=====
+# 画像全体の高さに対する割合ぶん、CENTERの各辺を内側に寄せる
+CENTER_TOP_PAD_RATIO    = float(os.getenv("CENTER_TOP_PAD_RATIO", "0.02"))  # ← 上端を下へ 2%
+CENTER_BOTTOM_PAD_RATIO = float(os.getenv("CENTER_BOTTOM_PAD_RATIO", "0.00"))
+CENTER_LEFT_PAD_RATIO   = float(os.getenv("CENTER_LEFT_PAD_RATIO", "0.00"))
+CENTER_RIGHT_PAD_RATIO  = float(os.getenv("CENTER_RIGHT_PAD_RATIO", "0.00"))
 
 # ヘッダ単体もOpenAIに投げて比較するか（True推奨）
 DEBUG_ATTACH_TO_OPENAI = os.getenv("SRVDEBUG_ATTACH_OAI", "1") == "1"
