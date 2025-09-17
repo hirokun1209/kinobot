@@ -554,7 +554,7 @@ COMP_HEAD_BOTTOM = float(os.getenv("COMP_HEAD_BOTTOM", "0.25"))
 COMP_HEAD_RIGHT  = float(os.getenv("COMP_HEAD_RIGHT", "1.00"))
 
 # --- スイッチ：合成後からヘッダを読む（1でON） ---
-USE_COMPOSITE_FOR_HEADER = os.getenv("USE_COMPOSITE_FOR_HEADER", "1") == "1"
+USE_COMPOSITE_FOR_HEADER = os.getenv("USE_COMPOSITE_FOR_HEADER", "0") == "1"
 
 def cleanup_old_entries():
     now = now_jst()
