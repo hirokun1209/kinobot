@@ -542,6 +542,20 @@ def now_jst():
 def _file_from_bytes(filename: str, byts: bytes):
     return discord.File(io.BytesIO(byts), filename=filename)
 
+# --- 合成PNG(bytes) → BGR(ndarray) ---
+def _bgr_from_png_bytes(png_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(png_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
+
+# --- 合成画像内のヘッダ帯の割合（必要なら環境変数で微調整） ---
+COMP_HEAD_TOP    = float(os.getenv("COMP_HEAD_TOP", "0.00"))
+COMP_HEAD_BOTTOM = float(os.getenv("COMP_HEAD_BOTTOM", "0.25"))
+COMP_HEAD_RIGHT  = float(os.getenv("COMP_HEAD_RIGHT", "1.00"))
+
+# --- スイッチ：合成後からヘッダを読む（1でON） ---
+USE_COMPOSITE_FOR_HEADER = os.getenv("USE_COMPOSITE_FOR_HEADER", "1") == "1"
+
 def cleanup_old_entries():
     now = now_jst()
     for k in list(pending_places):
@@ -606,20 +620,12 @@ def _normalize_server4(text: Optional[str]) -> Optional[str]:
                 return d[:4]
     return None
 
-def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], Dict]:
-    """
-    ヘッダ帯から Paddle / Google / OpenAI を実行し、
-    ・『越域/駐騎(車)場』を含む行を優先
-    ・複数 [s****] があれば『一番後ろ』を採用
-    ・OpenAIが4桁なら最優先 → それ以外は多数決
-    """
-    # 1) 各エンジン
+def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], dict]:
     pp_lines = ocr_center_paddle(head_bgr) or []
     if isinstance(pp_lines, str): pp_lines = [pp_lines]
     gv_lines = extract_text_from_image(head_bgr) or []
     if isinstance(gv_lines, str): gv_lines = [gv_lines]
-    oai_prompt = ("Read server id like [s1234] in header. "
-                  "Return ONLY the four digits; if unsure, return NONE.")
+    oai_prompt = ("Read server id like [s1234] in header. Return ONLY the four digits; if unsure, return NONE.")
     try:
         oai_text = call_openai_vision(head_bgr, prompt=oai_prompt) or ""
     except Exception:
@@ -627,18 +633,20 @@ def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], 
 
     cand_raw = {"pp": "\n".join(pp_lines), "gv": "\n".join(gv_lines), "oai": oai_text}
 
-    # 2) エンジンごとに“最後の番号”を選ぶ（キーワード行を優先）
     def _prefer_last(lines):
         lines = list(lines or [])
+        # キーワード行を優先（越域/駐騎/駐車）
         for ln in lines:
             ln2 = unicodedata.normalize("NFKC", str(ln))
             if ("越域" in ln2) or ("駐騎" in ln2) or ("駐車" in ln2):
                 n = _pick_last_server_from_lines([ln2])
                 if n: return n
+        # [s を含む行を次点
         for ln in lines:
             if "[s" in str(ln):
                 n = _pick_last_server_from_lines([ln])
                 if n: return n
+        # 全行で最後
         return _pick_last_server_from_lines(lines)
 
     pick_pp  = _prefer_last(pp_lines)
@@ -646,11 +654,10 @@ def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], 
     pick_oai = _normalize_server4(oai_text)
 
     cand_norm = {"pp": pick_pp, "gv": pick_gv, "oai": pick_oai}
-
-    # 3) 決定
-    if cand_norm.get("oai"):
+    if cand_norm.get("oai"):  # OAIが4桁なら最優先
         return cand_norm["oai"], {"raw": cand_raw, "norm": cand_norm, "winner": "oai"}
-    votes: Dict[str,int] = {}
+
+    votes = {}
     for n in (pick_pp, pick_gv, pick_oai):
         if n: votes[n] = votes.get(n, 0) + 1
     if votes:
@@ -3731,6 +3738,40 @@ async def on_message(message):
         base_clock_ocr  = _extract_clock_from_top_txts(top_txts)
         base_clock_meta = base_time_from_metadata(raw)
         base_clock_str  = base_clock_ocr or base_clock_meta
+
+        # === 合成からヘッダ帯を読む（USE_COMPOSITE_FOR_HEADER=1 のとき優先） ===
+        head_src_bgr = full_bgr  # 既定は原寸
+        if USE_COMPOSITE_FOR_HEADER:
+            comp_png = ((j.get("_echo") or {}).get("composite_png") or None)
+            if comp_png:
+                comp_bgr = _bgr_from_png_bytes(comp_png)
+                if comp_bgr is not None:
+                    Hc, Wc = comp_bgr.shape[:2]
+                    y1c = int(Hc * COMP_HEAD_TOP);   y2c = int(Hc * COMP_HEAD_BOTTOM)
+                    x1c = 0;                         x2c = int(Wc * COMP_HEAD_RIGHT)
+                    head_src_bgr = comp_bgr[y1c:y2c, x1c:x2c]
+        
+        # （!srvdebugと同じ比率で最終クロップ）
+        Hh, Wh = head_src_bgr.shape[:2]
+        y1 = int(Hh * HEAD_TOP_RATIO); y2 = int(Hh * HEAD_BOTTOM_RATIO)
+        x1 = 0;                        x2 = int(Wh * HEAD_RIGHT_RATIO)
+        head_img_bgr = head_src_bgr[y1:y2, x1:x2]
+        
+        # 3エンジン比較でサーバ確定（“最後の番号”ルール込み）
+        server_from_head, dbg = _triage_read_server_from_head(head_img_bgr)
+        server_struct = _normalize_server4((j.get("structured") or {}).get("server"))
+        server_final  = server_from_head or server_struct
+        
+        # （任意デバッグ）
+        if os.getenv("OAI_HEADER_DEBUG") == "1":
+            lines = [
+                "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
+                f"・Paddle: {repr(dbg.get('raw',{}).get('pp'))} → norm={dbg.get('norm',{}).get('pp')!r}",
+                f"・Google: {repr(dbg.get('raw',{}).get('gv'))} → norm={dbg.get('norm',{}).get('gv')!r}",
+                f"・OpenAI: {repr(dbg.get('raw',{}).get('oai'))} → norm={dbg.get('norm',{}).get('oai')!r}",
+                f"➡️ 採用(server_final): {server_final!r}",
+            ]
+            await message.channel.send("\n".join(lines))
 
         # server は OpenAI優先 → ヘッダから補完
         server_from_head = _extract_server_from_header(full_bgr)
