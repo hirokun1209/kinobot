@@ -3803,20 +3803,6 @@ async def on_message(message):
             server_override=server_final
         )
         parsed = list(parsed_preview)
-        # --- 不正行のガード：server一致 & place>0 以外は捨てる ---
-        if 'server_final' in locals() and server_final:
-            filtered = []
-            for dt, txt, raw_dur in parsed:
-                m = re.search(r'^\S+\s+(\d{3,5})-([0-9]+)-', txt)
-                if not m:
-                    continue
-                srv_txt, place_txt = m.group(1), m.group(2)
-                if srv_txt != server_final:
-                    continue
-                if place_txt in ("0", ""):
-                    continue
-                filtered.append((dt, txt, raw_dur))
-            parsed = filtered
             
         # rows / center からのフォールバック復元（ダミー生成なし）
         if not parsed:
@@ -3847,8 +3833,23 @@ async def on_message(message):
                     dt, unlock = add_time(base_clock_str, dur)
                     if dt:
                         parsed.append((dt, f"{mode} {srv}-{place}-{unlock}", dur))
-        
         # 3) それでも parsed が空なら、何も登録しない（ダミー禁止）
+
+        # --- 最終ガード：server一致 & place>0 以外は捨てる（フォールバック後に適用） ---
+        if server_final:
+            filtered = []
+            for dt, txt, raw_dur in parsed:
+                m = re.search(r'^\S+\s+(\d{3,5})-([0-9]+)-', txt)
+                if not m:
+                    continue
+                srv_txt, place_txt = m.group(1), m.group(2)
+                if srv_txt != server_final:
+                    continue
+                if place_txt in ("0", ""):
+                    continue
+                filtered.append((dt, txt, raw_dur))
+            parsed = filtered
+
         # ===== 登録処理（既存設計に合わせる）=====
         image_results = []
         structured_entries_for_this_image = []
