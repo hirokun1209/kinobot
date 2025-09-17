@@ -595,13 +595,6 @@ def shrink_long_side(bgr: np.ndarray, max_side: int = 768) -> np.ndarray:
     r = max_side / s
     return cv2.resize(bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_AREA)
 
-def extract_places_from_center(center_txts):
-    text = "\n".join(center_txts or [])
-    nums = re.findall(r'越域駐[騎車]場\s*([0-9]{1,2})', text)
-    if not nums:
-        nums = re.findall(r'越域\s*駐[騎車]場\s*([0-9]{1,2})', text)
-    return [int(n) for n in nums]
-
 def _pick_last_server_from_lines(lines) -> Optional[str]:
     """
     OCR行から [s1234]/s1234/1234/s268 などを全部拾い、
@@ -691,19 +684,34 @@ def _draw_box(img_bgr, rect, color=(0,255,255), thick=2, label=None):
         cv2.putText(img_bgr, label, (x1+6, max(14,y1-6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
+# 任意で環境調整できる比率
+CLOCK_TOP_RATIO    = float(os.getenv("CLOCK_TOP_RATIO", "0.20"))  # １ブロック下げ版
+CLOCK_BOTTOM_RATIO = float(os.getenv("CLOCK_BOTTOM_RATIO", "0.38"))
+CEASE_FALLBACK_TOP = float(os.getenv("CEASE_FALLBACK_TOP", "0.85"))
+
 def _mark_regions_on_full(full_bgr):
     H,W = full_bgr.shape[:2]
+
+    # HEAD：環境比率
     head  = (0, int(H*HEAD_TOP_RATIO), int(W*HEAD_RIGHT_RATIO), int(H*HEAD_BOTTOM_RATIO))
-    clock = (int(W*0.70), 0, W, int(H*0.20))
-    center= (0, int(H*0.30), W, int(H*0.72))
-    # 停戦帯はPaddle検出→無ければフォールバック
-    rects = find_ceasefire_regions_full_img(full_bgr) or [(int(W*0.12), int(H*0.25), int(W*0.88), int(H*0.30))]
-    cease = rects[0]
+
+    # CLOCK：環境比率（黄色を一段下げ）
+    clock = (int(W*0.72), int(H*CLOCK_TOP_RATIO), int(W*0.98), int(H*CLOCK_BOTTOM_RATIO))
+
+    # CEASE：検出 → 無ければフォールバック（下側帯）
+    rects = find_ceasefire_regions_full_img(full_bgr)
+    if rects:
+        cease = rects[0]
+    else:
+        cease = (0, int(H*CEASE_FALLBACK_TOP), W, H)
+
+    # CENTER：HEADの下端〜CEASEの上端（“間”を全部）
+    center = (0, head[3], W, cease[1])
 
     dbg = full_bgr.copy()
     _draw_box(dbg, head,  (0,255,0),   2, "HEAD")
-    _draw_box(dbg, clock, (0,255,255), 2, "CLOCK")
-    _draw_box(dbg, center,(255,0,0),   2, "CENTER")
+    _draw_box(dbg, clock (255,255,0),  2, "CLOCK")
+    _draw_box(dbg, center,(0,128,255), 2, "CENTER")
     _draw_box(dbg, cease, (255,0,255), 2, "CEASE")
     return dbg, head, clock, center, cease
 
@@ -897,8 +905,8 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
                 model=OPENAI_MODEL,
                 messages=[{"role":"user","content":[
                     {"type":"text","text":instruction},
-                    {"type":"image_url","image_url":{"url":data_uri,"detail":"low"}},
-                ]}],
+                    {"type":"image_url","image_url":{"url":data_uri,"detail":"high"}},  # ← low→high
+                ]}]],
                 max_tokens=200,
                 temperature=0
             )
@@ -1250,11 +1258,11 @@ async def oai_ocr_all_in_one_async(top_bgr: np.ndarray, center_bgr: np.ndarray, 
 
     content_chat = [
         {"type": "text", "text": instruction},
-        {"type": "image_url", "image_url": {"url": img1, "detail": "low"}},
-        {"type": "image_url", "image_url": {"url": img2, "detail": "low"}},
+        {"type": "image_url", "image_url": {"url": img1, "detail": "high"}},  # ← low→high
+        {"type": "image_url", "image_url": {"url": img2, "detail": "high"}},  # ← low→high
     ]
     if img3:
-        content_chat.append({"type": "image_url", "image_url": {"url": img3, "detail": "low"}})
+        content_chat.append({"type": "image_url", "image_url": {"url": img3, "detail": "high"}})  # ← low→high
 
     backoff = 1.0
     for _ in range(5):
@@ -2149,9 +2157,6 @@ def _extract_server_from_header(full_bgr: np.ndarray) -> Optional[str]:
     y1 = int(H * HEAD_TOP_RATIO);  y2 = int(H * HEAD_BOTTOM_RATIO)
     head_outer = full_bgr[y1:y2, x1:x2]
     sid, _ = _triage_read_server_from_head(head_outer)
-    return sid
-
-    # 2) 外側（既存のヘッダ帯）
     return sid
 
 def add_time(base_time_str, duration_str):
@@ -3800,15 +3805,6 @@ async def on_message(message):
             server_struct = _normalize_server((j.get("structured") or {}).get("server"))
         
         server_final = server_from_head or server_struct
-        if os.getenv("OAI_HEADER_DEBUG") == "1":
-        dbg_lines = [
-            "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
-            f"・Paddle: {repr(dbg.get('raw',{}).get('pp'))} → norm={dbg.get('norm',{}).get('pp')!r}",
-            f"・Google: {repr(dbg.get('raw',{}).get('gv'))} → norm={dbg.get('norm',{}).get('gv')!r}",
-            f"・OpenAI: {repr(dbg.get('raw',{}).get('oai'))} → norm={dbg.get('norm',{}).get('oai')!r}",
-            f"➡️ 採用(server_final): {server_final!r}",
-        ]
-        await message.channel.send("\n".join(dbg_lines))
         # ----- Center 追OCR補完：OpenAI が場所を落としたときだけ実行 -----
         places0 = extract_places_from_center(center_txts)
         if not places0:
