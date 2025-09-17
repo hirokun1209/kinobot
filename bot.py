@@ -553,7 +553,7 @@ COMP_HEAD_TOP    = float(os.getenv("COMP_HEAD_TOP", "0.00"))
 COMP_HEAD_BOTTOM = float(os.getenv("COMP_HEAD_BOTTOM", "0.25"))
 COMP_HEAD_RIGHT  = float(os.getenv("COMP_HEAD_RIGHT", "1.00"))
 
-# --- スイッチ：合成後からヘッダを読む（1でON） ---
+# --- スイッチ：合成からヘッダを読む（1でON / 既定OFF） ---
 USE_COMPOSITE_FOR_HEADER = os.getenv("USE_COMPOSITE_FOR_HEADER", "1") == "1"
 
 def cleanup_old_entries():
@@ -3675,6 +3675,28 @@ async def on_message(message):
             center_txts = ocr_center_with_fallback(center_bgr) or []
 
             base_clock_str = _extract_clock_from_top_txts(top_txts) or base_time_from_metadata(raw)
+            # === 失敗時も合成からヘッダを読む（任意） ===
+            if USE_COMPOSITE_FOR_HEADER:
+                try:
+                    comp_bgr_local, _ = compose_center_with_clock_and_cease(full_bgr)
+                    if comp_bgr_local is not None:
+                        Hc, Wc = comp_bgr_local.shape[:2]
+                        y1c = int(Hc * COMP_HEAD_TOP);   y2c = int(Hc * COMP_HEAD_BOTTOM)
+                        x1c = 0;                         x2c = int(Wc * COMP_HEAD_RIGHT)
+                        head_src_bgr = comp_bgr_local[y1c:y2c, x1c:x2c]
+            
+                        Hh, Wh = head_src_bgr.shape[:2]
+                        y1 = int(Hh * HEAD_TOP_RATIO); y2 = int(Hh * HEAD_BOTTOM_RATIO)
+                        x1 = 0;                        x2 = int(Wh * HEAD_RIGHT_RATIO)
+                        head_img_bgr = head_src_bgr[y1:y2, x1:x2]
+            
+                        srv_fb, _ = _triage_read_server_from_head(head_img_bgr)
+                    else:
+                        srv_fb = _extract_server_from_header(full_bgr)
+                except Exception:
+                    srv_fb = _extract_server_from_header(full_bgr)
+            else:
+                srv_fb = _extract_server_from_header(full_bgr)
             srv_fb = _extract_server_from_header(full_bgr)
             # --- 3エンジン比較デバッグ（失敗フォールバック時） ---
             # ヘッダ帯のBGR画像を用意
@@ -3737,7 +3759,6 @@ async def on_message(message):
         base_clock_ocr  = _extract_clock_from_top_txts(top_txts)
         base_clock_meta = base_time_from_metadata(raw)
         base_clock_str  = base_clock_ocr or base_clock_meta
-
         # === 合成からヘッダ帯を読む（USE_COMPOSITE_FOR_HEADER=1 のとき優先） ===
         head_src_bgr = full_bgr  # 既定は原寸
         if USE_COMPOSITE_FOR_HEADER:
@@ -3757,11 +3778,19 @@ async def on_message(message):
         head_img_bgr = head_src_bgr[y1:y2, x1:x2]
         
         # 3エンジン比較でサーバ確定（“最後の番号”ルール込み）
-        server_from_head, dbg = _triage_read_server_from_head(head_img_bgr)
-        server_struct = _normalize_server4((j.get("structured") or {}).get("server"))
-        server_final  = server_from_head or server_struct
+        try:
+            server_from_head, dbg = _triage_read_server_from_head(head_img_bgr)
+        except NameError:
+            server_from_head = _extract_server_from_header(full_bgr)
+            dbg = {"raw": {}, "norm": {}, "winner": "fallback(_extract_server_from_header)"}
         
-        # （任意デバッグ）
+        try:
+            server_struct = _normalize_server4((j.get("structured") or {}).get("server"))
+        except NameError:
+            server_struct = _normalize_server((j.get("structured") or {}).get("server"))
+        
+        server_final = server_from_head or server_struct
+        
         if os.getenv("OAI_HEADER_DEBUG") == "1":
             lines = [
                 "📚 **ヘッダ帯 3エンジン比較（!oaiocr success）**",
@@ -3770,8 +3799,7 @@ async def on_message(message):
                 f"・OpenAI: {repr(dbg.get('raw',{}).get('oai'))} → norm={dbg.get('norm',{}).get('oai')!r}",
                 f"➡️ 採用(server_final): {server_final!r}",
             ]
-            await message.channel.send("\n".join(lines))
-
+            await message.channel.send("\n".join(
         # server は OpenAI優先 → ヘッダから補完
         server_from_head = _extract_server_from_header(full_bgr)
         # --- ヘッダ帯から server を最優先で決定（3エンジン＋最後の番号ルールで確定） ---
