@@ -1550,7 +1550,7 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
 
     # 4) 実際にOpenAIへ送っている「合成PNG」を作る（必ず full_bgr から）
     comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
-        comp_bgr = percent_crop(
+    comp_bgr = percent_crop(
         comp_bgr,
         left=COMP_TRIM_LEFT_RATIO,
         top=COMP_TRIM_TOP_RATIO,
