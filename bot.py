@@ -586,6 +586,34 @@ def _rect_from_ratio(H, W, L, T, R, B):
     y2 = max(y1+1, min(int(H*B), H))
     return (x1, y1, x2, y2)
 
+def _mask_below_clock_until_cease(
+    bgr: np.ndarray,
+    clock_rect: tuple[int, int, int, int],
+    cease_rect: tuple[int, int, int, int],
+    x_pad_ratio: float = 0.003,   # 横方向の少しの余白
+    y_gap_px: int = 2,            # 時計と黒塗りの間に1-2px隙間
+    color: tuple[int, int, int] = (0, 0, 0),
+) -> np.ndarray:
+    """
+    右上時計の“横幅”で、時計の【下端】→停戦帯【上端】の範囲だけ黒塗りする。
+    時計そのものは塗らない（下から塗る）。
+    """
+    if bgr is None or not getattr(bgr, "size", 0):
+        return bgr
+    H, W = bgr.shape[:2]
+    cx1, cy1, cx2, cy2 = clock_rect  # (x1,y1,x2,y2) ここで cy2 が時計の下端
+    pad_x = int(W * max(0.0, float(x_pad_ratio)))
+    x1 = max(0, cx1 - pad_x)
+    x2 = min(W, cx2 + pad_x)
+    y1 = min(H, max(0, cy2 + int(y_gap_px)))   # ← 時計の“下端”から
+    y2 = min(H, max(y1, cease_rect[1]))        # ← 停戦帯の“上端”まで
+
+    if x2 <= x1 or y2 <= y1:
+        return bgr
+    out = bgr.copy()
+    out[y1:y2, x1:x2] = color
+    return out
+
 def mask_right_column_until_cease(
     bgr,
     clock_rect,          # (x1,y1,x2,y2) 右上の時計の矩形（_mark_regions_on_full の戻り値）
@@ -1102,9 +1130,20 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
     if OA_ASYNC is None:
         return None
 
-    # ---------- フォールバック（外部未定義でも動くように） ----------
-    # percent_crop が無ければローカル実装を使う
-    def _percent_crop_local(bgr, left=0.0, top=0.0, right=0.0, bottom=0.0):
+    # ---- ROI を取得して、時計下端→停戦帯上端を黒塗りした“送信用ソース”を作る ----
+    _marked, head_rect, clock_rect, center_rect, cease_rect = _mark_regions_on_full(full_bgr)
+    src_for_comp = _mask_below_clock_until_cease(
+        full_bgr, clock_rect=clock_rect, cease_rect=cease_rect,
+        x_pad_ratio=0.003, y_gap_px=2, color=(0, 0, 0)
+    )
+
+    # ---- 合成PNG作成 ----
+    comp_bgr, _comp_dbg = compose_center_with_clock_and_cease(src_for_comp)
+
+    # ---- 追加トリミング（環境変数で比率変更可能） ----
+    def _pcrop(bgr, left=0.0, top=0.0, right=0.0, bottom=0.0):
+        if 'percent_crop' in globals():  # 既存があればそれを使う
+            return percent_crop(bgr, left=left, top=top, right=right, bottom=bottom)
         H, W = bgr.shape[:2]
         x1 = max(0, int(W * float(left)))
         y1 = max(0, int(H * float(top)))
@@ -1113,60 +1152,13 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
         if x2 <= x1 or y2 <= y1:
             return bgr
         return bgr[y1:y2, x1:x2]
-    pcrop = globals().get("percent_crop", _percent_crop_local)
 
-    # COMP_TRIM_* が未定義でも 0.0 を使って安全に動作
-    _COMP_TRIM_LEFT    = float(globals().get("COMP_TRIM_LEFT_RATIO",   0.0))
-    _COMP_TRIM_TOP     = float(globals().get("COMP_TRIM_TOP_RATIO",    0.0))
-    _COMP_TRIM_RIGHT   = float(globals().get("COMP_TRIM_RIGHT_RATIO",  0.0))
-    _COMP_TRIM_BOTTOM  = float(globals().get("COMP_TRIM_BOTTOM_RATIO", 0.0))
-
-    # 右上時計の横幅ぶんを、停戦帯の上端まで黒塗りする（!srvdebug と共通の見え方に）
-    def _mask_right_column_until_cease(bgr: np.ndarray,
-                                       clock_rect: tuple,
-                                       cease_rect: tuple,
-                                       pad_ratio: float = 0.003,
-                                       color=(0, 0, 0)) -> np.ndarray:
-        if bgr is None or not getattr(bgr, "size", 0):
-            return bgr
-        H, W = bgr.shape[:2]
-        cx1, cy1, cx2, cy2 = clock_rect
-        pad = int(W * max(0.0, float(pad_ratio)))
-        x1 = max(0, cx1 - pad)
-        x2 = min(W, cx2 + pad)
-        y1 = 0
-        # 停戦帯の「上端」まで塗る（帯ごと隠したいなら cease_rect[3] に変更）
-        y2 = max(0, min(H, cease_rect[1]))
-        out = bgr.copy()
-        if x2 > x1 and y2 > y1:
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness=-1)
-        return out
-    # --------------------------------------------------------------
-
-    # === フル画像上で領域を算出（HEAD/CLOCK/CENTER/CEASE） ===
-    # これで oai/srvdebug 共通の座標系で扱える
-    _dbg_mark, head_rect, clock_rect, center_rect, cease_rect = _mark_regions_on_full(full_bgr)
-
-    # === OpenAI 送信“直前”の右端黒塗り ===
-    # 右上時計の横幅ぶんで、停戦帯の上端まで黒塗りしてノイズを削る
-    oa_src_bgr = _mask_right_column_until_cease(
-        full_bgr,
-        clock_rect=clock_rect,
-        cease_rect=cease_rect,
-        pad_ratio=0.003,    # 余白を増やしたい場合は 0.006 などに調整
-        color=(0, 0, 0),
-    )
-
-    # --- 合成PNG作成（黒塗りした画像を入力に使う） ---
-    comp_bgr, _comp_dbg = compose_center_with_clock_and_cease(oa_src_bgr)
-
-    # 合成後の安全トリム（上部を少し削りたい等）。未定義でも 0.0 で通る
-    comp_bgr = pcrop(
+    comp_bgr = _pcrop(
         comp_bgr,
-        left=_COMP_TRIM_LEFT,
-        top=_COMP_TRIM_TOP,
-        right=_COMP_TRIM_RIGHT,
-        bottom=_COMP_TRIM_BOTTOM,
+        left=float(globals().get("COMP_TRIM_LEFT_RATIO",   0.0)),
+        top=float(globals().get("COMP_TRIM_TOP_RATIO",     0.0)),
+        right=float(globals().get("COMP_TRIM_RIGHT_RATIO", 0.0)),
+        bottom=float(globals().get("COMP_TRIM_BOTTOM_RATIO",0.0)),
     )
 
     # 送信用に縮小
@@ -1187,7 +1179,6 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
         ' 数字/コロンは正規化して。'
     )
 
-    # OpenAI へ送る（detail は high）
     content = [
         {"type": "input_text",  "text": instruction},
         {"type": "input_image", "image_url": data_uri, "detail": "high"},
@@ -1198,7 +1189,7 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
         if OA_SUPPORTS_RESPONSES:
             res = await OA_ASYNC.responses.create(
                 model=OPENAI_MODEL,
-                input=[{"role": "user", "content": content}],
+                input=[{"role":"user","content":content}],
                 max_output_tokens=200,
                 temperature=0
             )
@@ -1218,7 +1209,6 @@ async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
         txt = _strip_code_fences(txt)
         out = json.loads(txt) if txt.startswith("{") else None
         if out is not None:
-            # デバッグ用に、送信した合成PNGも同梱
             out["_echo"] = {"composite_png": png_bytes}
         return out
     except Exception as e:
@@ -1703,24 +1693,31 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
             cease_bgr = _crop_rect_safe(masked_bgr, (x1, y1, x2, y2))
     except Exception:
         pass
-
-    # 4) OpenAIに送る直前と同じ“右端黒塗り”を適用 → 合成PNG作成 → トリム → 縮小
-    oa_src_bgr = _mask_right_column_until_cease(
+    
+    # ・・・上の前処理はそのまま・・・
+    
+    # 4) 実際にOpenAIへ送っている「合成PNG」を作る（必ず “黒塗り適用版” から）
+    oa_src_bgr = _mask_below_clock_until_cease(
         full_bgr,
         clock_rect=clock_rect,
         cease_rect=cease_rect,
-        pad_ratio=0.003,
+        x_pad_ratio=0.003,
+        y_gap_px=2,
         color=(0, 0, 0),
     )
     comp_bgr, _ = compose_center_with_clock_and_cease(oa_src_bgr)
-    comp_bgr = pcrop(
-        comp_bgr,
-        left=_COMP_TRIM_LEFT,
-        top=_COMP_TRIM_TOP,
-        right=_COMP_TRIM_RIGHT,
-        bottom=_COMP_TRIM_BOTTOM,
-    )
+    
+    # ここから下は既存通り（必要ならトリミング→縮小）
+    comp_bgr = (percent_crop(comp_bgr,
+                             left=float(globals().get("COMP_TRIM_LEFT_RATIO",   0.0)),
+                             top=float(globals().get("COMP_TRIM_TOP_RATIO",     0.0)),
+                             right=float(globals().get("COMP_TRIM_RIGHT_RATIO", 0.0)),
+                             bottom=float(globals().get("COMP_TRIM_BOTTOM_RATIO",0.0)))
+                if 'percent_crop' in globals() else comp_bgr)
     comp_small = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
+    
+    # Discord 添付の “srvdebug_composite_sent.jpg” も comp_small を使うので、
+    # OpenAI に送る見た目と完全一致します。
 
     # 5) 3エンジン比較（ヘッダ帯のみで確認）
     paddle_lines = ocr_center_paddle(head_bgr)
