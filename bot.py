@@ -588,25 +588,25 @@ def _rect_from_ratio(H, W, L, T, R, B):
 
 def _mask_below_clock_until_cease(
     bgr: np.ndarray,
-    clock_rect: tuple[int, int, int, int],
-    cease_rect: tuple[int, int, int, int],
-    x_pad_ratio: float = 0.003,   # 横方向の少しの余白
-    y_gap_px: int = 2,            # 時計と黒塗りの間に1-2px隙間
-    color: tuple[int, int, int] = (0, 0, 0),
+    clock_rect: tuple[int,int,int,int],
+    cease_rect: tuple[int,int,int,int],
+    x_pad_ratio: float = 0.003,   # 横に少しだけ広げる
+    y_gap_px: int = 2,            # 時計と黒塗りの間に微小の隙間
+    color: tuple[int,int,int] = (0,0,0),
 ) -> np.ndarray:
     """
-    右上時計の“横幅”で、時計の【下端】→停戦帯【上端】の範囲だけ黒塗りする。
-    時計そのものは塗らない（下から塗る）。
+    合成後画像上で、時計の【下端】→停戦帯【上端】を、時計の“横幅”で黒塗りする。
+    時計そのものは塗らない（下からだけ塗る）。
     """
     if bgr is None or not getattr(bgr, "size", 0):
         return bgr
     H, W = bgr.shape[:2]
-    cx1, cy1, cx2, cy2 = clock_rect  # (x1,y1,x2,y2) ここで cy2 が時計の下端
+    cx1, cy1, cx2, cy2 = clock_rect
     pad_x = int(W * max(0.0, float(x_pad_ratio)))
     x1 = max(0, cx1 - pad_x)
     x2 = min(W, cx2 + pad_x)
-    y1 = min(H, max(0, cy2 + int(y_gap_px)))   # ← 時計の“下端”から
-    y2 = min(H, max(y1, cease_rect[1]))        # ← 停戦帯の“上端”まで
+    y1 = min(H, max(0, cy2 + int(y_gap_px)))    # 時計の下端から開始
+    y2 = min(H, max(y1, cease_rect[1]))         # 停戦帯の上端まで
 
     if x2 <= x1 or y2 <= y1:
         return bgr
@@ -1122,66 +1122,79 @@ def percent_crop(bgr, left=0.0, top=0.0, right=1.0, bottom=1.0):
     return bgr[y1:y2, x1:x2]
 
 async def oai_ocr_oneimg_async(full_bgr: np.ndarray) -> dict | None:
-    """
-    合成1枚だけを OpenAI に送り、既存と互換の JSON を返す。
-    返り値例:
-      {"top_clock_lines":["22:18:42"], "center_lines":["[s1275]...", "..."], "ceasefire_end":"02:07:52", "structured":{...}}
-    """
     if OA_ASYNC is None:
         return None
 
-    # ---- ROI を取得して、時計下端→停戦帯上端を黒塗りした“送信用ソース”を作る ----
-    _marked, head_rect, clock_rect, center_rect, cease_rect = _mark_regions_on_full(full_bgr)
-    src_for_comp = _mask_below_clock_until_cease(
-        full_bgr, clock_rect=clock_rect, cease_rect=cease_rect,
-        x_pad_ratio=0.003, y_gap_px=2, color=(0, 0, 0)
+    # 1) 合成PNGを作成（生画像には触らない）
+    comp_bgr, _comp_dbg = compose_center_with_clock_and_cease(full_bgr)
+
+    # 2) --- 合成後に黒塗り（OpenAIに送る直前） ---
+    Hc, Wc = comp_bgr.shape[:2]
+
+    # 合成画像内の時計と停戦帯の位置（比率で指定）
+    # 必要に応じて環境変数で上書き可能（未定義なら既定値）
+    CCLK_L = float(os.getenv("COMP_CLOCK_LEFT_RATIO",   "0.72"))
+    CCLK_T = float(os.getenv("COMP_CLOCK_TOP_RATIO",    "0.00"))
+    CCLK_R = float(os.getenv("COMP_CLOCK_RIGHT_RATIO",  "0.98"))
+    CCLK_B = float(os.getenv("COMP_CLOCK_BOTTOM_RATIO", "0.12"))
+
+    CCE_T  = float(os.getenv("COMP_CEASE_TOP_RATIO",    "0.87"))
+    CCE_B  = float(os.getenv("COMP_CEASE_BOTTOM_RATIO", "1.00"))
+    CCE_L  = float(os.getenv("COMP_CEASE_LEFT_RATIO",   "0.00"))
+    CCE_R  = float(os.getenv("COMP_CEASE_RIGHT_RATIO",  "1.00"))
+
+    clock_rect_comp = (
+        int(Wc * CCLK_L), int(Hc * CCLK_T),
+        int(Wc * CCLK_R), int(Hc * CCLK_B),
+    )
+    cease_rect_comp = (
+        int(Wc * CCE_L),  int(Hc * CCE_T),
+        int(Wc * CCE_R),  int(Hc * CCE_B),
     )
 
-    # ---- 合成PNG作成 ----
-    comp_bgr, _comp_dbg = compose_center_with_clock_and_cease(src_for_comp)
+    comp_bgr = _mask_below_clock_until_cease(
+        comp_bgr,
+        clock_rect=clock_rect_comp,
+        cease_rect=cease_rect_comp,
+        x_pad_ratio=float(os.getenv("COMP_MASK_PAD_X", "0.003")),
+        y_gap_px=int(os.getenv("COMP_MASK_GAP_PX", "2")),
+        color=(0,0,0),
+    )
 
-    # ---- 追加トリミング（環境変数で比率変更可能） ----
+    # 3) （任意）さらに合成後をパーセントトリム
     def _pcrop(bgr, left=0.0, top=0.0, right=0.0, bottom=0.0):
-        if 'percent_crop' in globals():  # 既存があればそれを使う
+        if 'percent_crop' in globals():
             return percent_crop(bgr, left=left, top=top, right=right, bottom=bottom)
         H, W = bgr.shape[:2]
         x1 = max(0, int(W * float(left)))
         y1 = max(0, int(H * float(top)))
         x2 = min(W, int(W * (1.0 - float(right))))
         y2 = min(H, int(H * (1.0 - float(bottom))))
-        if x2 <= x1 or y2 <= y1:
-            return bgr
-        return bgr[y1:y2, x1:x2]
+        return bgr if x2 <= x1 or y2 <= y1 else bgr[y1:y2, x1:x2]
 
     comp_bgr = _pcrop(
         comp_bgr,
-        left=float(globals().get("COMP_TRIM_LEFT_RATIO",   0.0)),
-        top=float(globals().get("COMP_TRIM_TOP_RATIO",     0.0)),
-        right=float(globals().get("COMP_TRIM_RIGHT_RATIO", 0.0)),
-        bottom=float(globals().get("COMP_TRIM_BOTTOM_RATIO",0.0)),
+        left=float(os.getenv("COMP_TRIM_LEFT_RATIO",   "0.0")),
+        top=float(os.getenv("COMP_TRIM_TOP_RATIO",     "0.0")),
+        right=float(os.getenv("COMP_TRIM_RIGHT_RATIO", "0.0")),
+        bottom=float(os.getenv("COMP_TRIM_BOTTOM_RATIO","0.0")),
     )
 
-    # 送信用に縮小
+    # 4) 縮小 → Data URI → OpenAI
     comp_small = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
-
-    # Data URI 化
     png_bytes, data_uri = _bgr_to_png_bytes_and_data_uri(comp_small)
     if not data_uri:
         return None
 
-    # 出力最小化のため指示は短く・JSONのみ
     instruction = (
         '{"top_clock_lines":[],"center_lines":[],"ceasefire_end":null,'
         '"structured":{"server":"","rows":[{"place":0,"status":"免戦中","duration":"00:00:00"}]}}'
-        ' 上のJSONだけ返す。'
-        ' 右上はゲーム内時計、中央は一覧、最下部は「停戦終了 HH:MM:SS」。'
-        ' 配列要素は必ず文字列（str）にし、オブジェクトを入れないこと。'
-        ' 数字/コロンは正規化して。'
+        ' 上のJSONだけ返す。右上はゲーム内時計、中央は一覧、最下部は「停戦終了 HH:MM:SS」。'
+        ' 配列要素は必ず str。数字/コロンは正規化。'
     )
-
     content = [
-        {"type": "input_text",  "text": instruction},
-        {"type": "input_image", "image_url": data_uri, "detail": "high"},
+        {"type":"input_text","text":instruction},
+        {"type":"input_image","image_url":data_uri,"detail":"high"},
     ]
 
     await _ensure_openai_slot()
