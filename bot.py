@@ -1709,25 +1709,44 @@ async def _srvdebug_from_bytes(img_bytes: bytes, filename: str, channel_id: int)
     
     # ・・・上の前処理はそのまま・・・
     
-    # 4) 実際にOpenAIへ送っている「合成PNG」を作る（必ず “黒塗り適用版” から）
-    oa_src_bgr = _mask_below_clock_until_cease(
-        full_bgr,
-        clock_rect=clock_rect,
-        cease_rect=cease_rect,
-        x_pad_ratio=0.003,
-        y_gap_px=2,
-        color=(0, 0, 0),
-    )
-    comp_bgr, _ = compose_center_with_clock_and_cease(oa_src_bgr)
+    # 4) 実際にOpenAIへ送っている「合成PNG」を作る（必ず full_bgr から）
+    comp_bgr, _ = compose_center_with_clock_and_cease(full_bgr)
     
-    # ここから下は既存通り（必要ならトリミング→縮小）
-    comp_bgr = (percent_crop(comp_bgr,
-                             left=float(globals().get("COMP_TRIM_LEFT_RATIO",   0.0)),
-                             top=float(globals().get("COMP_TRIM_TOP_RATIO",     0.0)),
-                             right=float(globals().get("COMP_TRIM_RIGHT_RATIO", 0.0)),
-                             bottom=float(globals().get("COMP_TRIM_BOTTOM_RATIO",0.0)))
-                if 'percent_crop' in globals() else comp_bgr)
+    # --- 合成後に時計下→停戦帯まで黒塗り（oai_ocr と同じ比率を使う） ---
+    Hc, Wc = comp_bgr.shape[:2]
+    clock_rect_comp = (
+        int(Wc * float(os.getenv("COMP_CLOCK_LEFT_RATIO",   "0.72"))),
+        int(Hc * float(os.getenv("COMP_CLOCK_TOP_RATIO",    "0.00"))),
+        int(Wc * float(os.getenv("COMP_CLOCK_RIGHT_RATIO",  "0.98"))),
+        int(Hc * float(os.getenv("COMP_CLOCK_BOTTOM_RATIO", "0.12"))),
+    )
+    cease_rect_comp = (
+        int(Wc * float(os.getenv("COMP_CEASE_LEFT_RATIO",   "0.00"))),
+        int(Hc * float(os.getenv("COMP_CEASE_TOP_RATIO",    "0.87"))),
+        int(Wc * float(os.getenv("COMP_CEASE_RIGHT_RATIO",  "1.00"))),
+        int(Hc * float(os.getenv("COMP_CEASE_BOTTOM_RATIO", "1.00"))),
+    )
+    comp_bgr = _mask_below_clock_until_cease(
+        comp_bgr,
+        clock_rect=clock_rect_comp,
+        cease_rect=cease_rect_comp,
+        x_pad_ratio=float(os.getenv("COMP_MASK_PAD_X", "0.003")),
+        y_gap_px=int(os.getenv("COMP_MASK_GAP_PX", "2")),
+        color=(0,0,0),
+    )
+    
+    # --- percent_crop（oai_ocr と同じ環境変数） ---
+    comp_bgr = percent_crop(
+        comp_bgr,
+        left=float(os.getenv("COMP_TRIM_LEFT_RATIO",   "0.0")),
+        top=float(os.getenv("COMP_TRIM_TOP_RATIO",     "0.0")),
+        right=float(os.getenv("COMP_TRIM_RIGHT_RATIO", "0.0")),
+        bottom=float(os.getenv("COMP_TRIM_BOTTOM_RATIO","0.0")),
+    )
+    
+    # これをそのままDiscord添付に使う
     comp_small = shrink_long_side(comp_bgr, SINGLEIMG_MAX_SIDE)
+    _add("srvdebug_composite_sent.jpg", comp_small)
     
     # Discord 添付の “srvdebug_composite_sent.jpg” も comp_small を使うので、
     # OpenAI に送る見た目と完全一致します。
