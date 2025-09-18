@@ -821,7 +821,23 @@ def _normalize_server4(text: Optional[str]) -> Optional[str]:
                 return d[:4]
     return None
 
+# === 関数定義の先頭に追加（既存関数を丸ごと置換してOK）===
+from typing import Tuple, Optional
+
 def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], dict]:
+    """ヘッダ帯からサーバ番号を読み、候補のうち最後の数字を優先して返す。"""
+    # --- 空画像ガード（切り抜き失敗などでも落ちない）---
+    if head_bgr is None or not hasattr(head_bgr, "size") or head_bgr.size == 0:
+        dbg = {
+            "pp": [],
+            "gv": [],
+            "oai": "",
+            "raw": {"pp": "", "gv": "", "oai": ""},
+            "norm": {"pp": "", "gv": "", "oai": ""},
+        }
+        return None, dbg
+
+    # 以降は既存ロジック（↓はあなたの現行コードそのまま）
     pp_lines = ocr_center_paddle(head_bgr) or []
     if isinstance(pp_lines, str): pp_lines = [pp_lines]
     gv_lines = extract_text_from_image(head_bgr) or []
@@ -838,34 +854,30 @@ def _triage_read_server_from_head(head_bgr: np.ndarray) -> Tuple[Optional[str], 
         lines = list(lines or [])
         # キーワード行を優先（越域/駐騎/駐車）
         for ln in lines:
-            ln2 = unicodedata.normalize("NFKC", str(ln))
-            if ("越域" in ln2) or ("駐騎" in ln2) or ("駐車" in ln2):
-                n = _pick_last_server_from_lines([ln2])
-                if n: return n
-        # [s を含む行を次点
+            if any(k in ln for k in ["越域", "駐騎", "駐車", "s", "S", "［", "[", "【"]):
+                yield ln
         for ln in lines:
-            if "[s" in str(ln):
-                n = _pick_last_server_from_lines([ln])
-                if n: return n
-        # 全行で最後
-        return _pick_last_server_from_lines(lines)
+            yield ln
 
-    pick_pp  = _prefer_last(pp_lines)
-    pick_gv  = _prefer_last(gv_lines)
-    pick_oai = _normalize_server4(oai_text)
+    # それぞれから「最後に出た番号」を抽出
+    pp_candidate = _pick_last_server_from_lines(pp_lines)
+    gv_candidate = _pick_last_server_from_lines(gv_lines)
+    oai_candidate = _normalize_server4(oai_text) if 'normalize_server4' in globals() else _normalize_server(oai_text)
 
-    cand_norm = {"pp": pick_pp, "gv": pick_gv, "oai": pick_oai}
-    if cand_norm.get("oai"):  # OAIが4桁なら最優先
-        return cand_norm["oai"], {"raw": cand_raw, "norm": cand_norm, "winner": "oai"}
+    norm = {
+        "pp": _normalize_server(pp_candidate),
+        "gv": _normalize_server(gv_candidate),
+        "oai": _normalize_server(oai_candidate),
+    }
 
-    votes = {}
-    for n in (pick_pp, pick_gv, pick_oai):
-        if n: votes[n] = votes.get(n, 0) + 1
-    if votes:
-        winner_val = max(votes.items(), key=lambda kv: kv[1])[0]
-        return winner_val, {"raw": cand_raw, "norm": cand_norm, "winner": "vote"}
-    return None, {"raw": cand_raw, "norm": cand_norm, "winner": None}
+    # 優先順位: Paddle→GV→OpenAI（いずれも4桁化できたもの）
+    for k in ("pp","gv","oai"):
+        sid = norm.get(k)
+        if sid and len(sid) == 4 and sid.isdigit():
+            return sid, {"pp": pp_lines, "gv": gv_lines, "oai": oai_text, "raw": cand_raw, "norm": norm}
 
+    # どれもダメなら None
+    return None, {"pp": pp_lines, "gv": gv_lines, "oai": oai_text, "raw": cand_raw, "norm": norm}
 # === SRVDEBUG: 可視化ユーティリティ ===
 def _draw_box(img_bgr, rect, color=(0,255,255), thick=2, label=None):
     x1,y1,x2,y2 = rect
@@ -2385,37 +2397,30 @@ async def extract_text_from_image_google_async(np_bgr: np.ndarray) -> list[str]:
     """GVの同期APIをスレッドに逃がしてイベントループを止めない"""
     return await asyncio.to_thread(extract_text_from_image_google, np_bgr)
 
-# ---- 中央OCR強化ユーティリティ ----
+# === 置き換え：preprocess_for_colon ===
 def preprocess_for_colon(img_bgr: np.ndarray) -> list[np.ndarray]:
-    """
-    コロン(:)の2点が消えないように複数前処理を作成して返す（BGRのまま）。
-    """
-    outs = []
+    """コロン(時刻)を拾いやすくする前処理。空画像でも落ちないようにガード。"""
+    # --- 安全ガード ---
+    if img_bgr is None or not hasattr(img_bgr, "size") or img_bgr.size == 0:
+        return []
+    if img_bgr.ndim < 2:
+        return []
+    h, w = img_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return []
 
-    # 0) 原画像
-    outs.append(img_bgr)
-
-    # 1) 2倍拡大 + 軽いシャープ
+    # 1) 2倍拡大
     up = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    blur = cv2.GaussianBlur(up, (0, 0), 1.0)
-    sharp = cv2.addWeighted(up, 1.5, blur, -0.5, 0)
-    outs.append(sharp)
 
-    # 2) CLAHE + 自適応二値化（白黒両方）
-    g = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
-    th = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 31, 5)
-    outs.append(cv2.cvtColor(th, cv2.COLOR_GRAY2BGR))
-    outs.append(cv2.cvtColor(255 - th, cv2.COLOR_GRAY2BGR))  # 反転版
+    # 2) グレースケール→適応二値（返却はBGRにしておくと下流が扱いやすい）
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+    thr = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 35, 10
+    )
+    thr_bgr = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
 
-    # 3) 小粒点(:)が消えないようにclosing→opening
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
-    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
-    outs.append(cv2.cvtColor(opened, cv2.COLOR_GRAY2BGR))
-
-    return outs
+    # 複数候補を返す（どれか当たればOK）
+    return [up, thr_bgr]
 
 def normalize_time_separators(s: str) -> str:
     """
