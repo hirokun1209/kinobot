@@ -33,9 +33,9 @@ INPUT_CHANNEL_IDS = {
 }
 # 通知（一覧＋開始時刻⏰）チャンネル
 NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or 0)
-# コピー専用チャンネル（時間順一覧を“編集で並び替え”）
+# コピー専用チャンネル（即時通知／時間が過ぎたら削除）
 COPY_CHANNEL_ID = int(os.environ.get("COPY_CHANNEL_ID", "0") or 0)
-# アラート専用チャンネル（2分前/1分前/15秒前、5秒後に削除）
+# アラート専用チャンネル（2分前/15秒前、5秒後に削除）
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0") or 0)
 # タイムゾーン（例: Asia/Tokyo）
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tokyo"))
@@ -97,12 +97,12 @@ SCHEDULE_LOCK = asyncio.Lock()
 # item: {
 #   "when": datetime, "server": str, "place": int, "timestr": "HH:MM:SS",
 #   "key": (server, place, timestr),
-#   "skip2m": bool, "sent_2m": bool, "sent_1m": bool, "sent_15s": bool
+#   "skip2m": bool, "sent_2m": bool, "sent_15s": bool,
+#   "copy_msg_id": Optional[int]
 # }
 SCHEDULE: List[Dict] = []
 
-SCHEDULE_MSG_ID: Optional[int] = None     # 通知チャンネルの一覧メッセージ
-COPY_MSG_ID: Optional[int] = None         # コピー専用チャンネルの一覧メッセージ
+SCHEDULE_MSG_ID: Optional[int] = None  # 通知チャンネルの一覧メッセージ
 
 def _next_occurrence_today_or_tomorrow(hms: str) -> datetime:
     """今日のその時刻、過ぎていれば翌日の同時刻（TZ考慮）"""
@@ -116,55 +116,32 @@ def _next_occurrence_today_or_tomorrow(hms: str) -> datetime:
 def _render_schedule_board() -> str:
     """
     通知チャンネルのスケジュール表示:
-      - 予定あり:   「🗓️ 今後のスケジュール」+ 行ごと表示
-      - 予定なし:   「🗓️ 今後のスケジュール\n🈳 登録された予定はありません」
+      - 予定あり:   「🗓️ 今後のスケジュール🗓️」+ 行ごと表示（・server-place-HH:MM:SS）
+      - 予定なし:   「🗓️ 今後のスケジュール🗓️\n🈳 登録された予定はありません」
     """
-    header = "🗓️ 今後のスケジュール"
+    header = "🗓️ 今後のスケジュール🗓️"
     if not SCHEDULE:
         return f"{header}\n🈳 登録された予定はありません"
     lines = []
     for item in SCHEDULE:
         t = item["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
-        lines.append(f"・{t}  {item['server']}-{item['place']}")
+        lines.append(f"・{item['server']}-{item['place']}-{t}")
     return f"{header}\n" + "\n".join(lines)
 
-def _render_copy_board() -> str:
-    """コピー専用チャンネルの時間順ボード（編集で並び替え）"""
-    header = "📋 コピー（時間順）"
-    if not SCHEDULE:
-        return f"{header}\n🈳 登録された予定はありません"
-    lines = []
-    for idx, item in enumerate(SCHEDULE, start=1):
-        t = item["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
-        lines.append(f"{idx:02d}) {t}  {item['server']}-{item['place']}")
-    return f"{header}\n" + "\n".join(lines)
-
-async def _ensure_message(channel: discord.TextChannel, *, which: str) -> None:
-    """which: 'notify' or 'copy'"""
-    global SCHEDULE_MSG_ID, COPY_MSG_ID
-    if which == "notify":
-        content = _render_schedule_board()
-        target_id = SCHEDULE_MSG_ID
-    else:
-        content = _render_copy_board()
-        target_id = COPY_MSG_ID
-
-    if target_id is None:
+async def _ensure_schedule_message(channel: discord.TextChannel) -> None:
+    """一覧の固定メッセージを作成/更新"""
+    global SCHEDULE_MSG_ID
+    content = _render_schedule_board()
+    if SCHEDULE_MSG_ID is None:
         msg = await channel.send(content)
-        if which == "notify":
-            SCHEDULE_MSG_ID = msg.id
-        else:
-            COPY_MSG_ID = msg.id
+        SCHEDULE_MSG_ID = msg.id
     else:
         try:
-            msg = await channel.fetch_message(target_id)
+            msg = await channel.fetch_message(SCHEDULE_MSG_ID)
             await msg.edit(content=content)
         except discord.NotFound:
             msg = await channel.send(content)
-            if which == "notify":
-                SCHEDULE_MSG_ID = msg.id
-            else:
-                COPY_MSG_ID = msg.id
+            SCHEDULE_MSG_ID = msg.id
 
 def _recompute_skip2m_flags() -> None:
     """次の予定が5分以内ならこの予定の2分前通知を抑制する"""
@@ -175,51 +152,12 @@ def _recompute_skip2m_flags() -> None:
             if (nxt["when"] - it["when"]) <= timedelta(minutes=5):
                 it["skip2m"] = True
 
-async def _refresh_boards():
-    """通知/コピー両方のボードを最新化"""
+async def _refresh_board():
+    """通知用のボードを最新化"""
     if NOTIFY_CHANNEL_ID:
         ch = bot.get_channel(NOTIFY_CHANNEL_ID) or await bot.fetch_channel(NOTIFY_CHANNEL_ID)  # type: ignore
         if isinstance(ch, discord.TextChannel):
-            await _ensure_message(ch, which="notify")
-    if COPY_CHANNEL_ID:
-        ch2 = bot.get_channel(COPY_CHANNEL_ID) or await bot.fetch_channel(COPY_CHANNEL_ID)  # type: ignore
-        if isinstance(ch2, discord.TextChannel):
-            await _ensure_message(ch2, which="copy")
-
-async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
-    """
-    pairs: [(server, place, timestr)]
-    - 重複は登録しない（server, place, timestr が同一）
-    - 追加して時間順に整列
-    - ボード（通知/コピー）を即時更新
-    """
-    if not pairs:
-        return
-    async with SCHEDULE_LOCK:
-        # 現在のキー集合
-        existing = { (it["server"], it["place"], it["timestr"]) for it in SCHEDULE }
-        added_any = False
-        for server, place, timestr in pairs:
-            key = (server, place, timestr)
-            if key in existing:
-                continue  # 同じスケジュールは登録しない
-            when = _next_occurrence_today_or_tomorrow(timestr)
-            SCHEDULE.append({
-                "when": when, "server": server, "place": place, "timestr": timestr,
-                "key": key, "skip2m": False, "sent_2m": False, "sent_1m": False, "sent_15s": False
-            })
-            added_any = True
-
-        if not added_any:
-            return
-
-        # 時間順に並べる
-        SCHEDULE.sort(key=lambda x: x["when"])
-        # 2分前抑制フラグ再計算
-        _recompute_skip2m_flags()
-
-    # ボード更新（既存メッセージを編集）
-    await _refresh_boards()
+            await _ensure_schedule_message(ch)
 
 async def _send_temp_alert(channel: discord.TextChannel, text: str):
     """アラート送信→5秒後に削除"""
@@ -235,13 +173,84 @@ async def _send_temp_alert(channel: discord.TextChannel, text: str):
     except Exception as e:
         print(f"[alert] send/delete failed: {e}")
 
+async def _delete_copy_message_if_exists(it: Dict):
+    """コピー専用チャンネルの個別メッセージを削除"""
+    if not COPY_CHANNEL_ID:
+        return
+    mid = it.get("copy_msg_id")
+    if not mid:
+        return
+    try:
+        ch = bot.get_channel(COPY_CHANNEL_ID) or await bot.fetch_channel(COPY_CHANNEL_ID)  # type: ignore
+        if isinstance(ch, discord.TextChannel):
+            msg = await ch.fetch_message(mid)
+            await msg.delete()
+    except Exception:
+        pass
+    finally:
+        it["copy_msg_id"] = None
+
+async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
+    """
+    pairs: [(server, place, timestr)]
+    - 重複は登録しない（server, place, timestr が同一）
+    - 追加して時間順に整列
+    - 通知ボードを更新
+    - コピー専用チャンネルへは**即時通知**（登録時に都度送信）、時間が過ぎたら削除
+    """
+    if not pairs:
+        return
+
+    new_items: List[Dict] = []
+
+    async with SCHEDULE_LOCK:
+        existing = { (it["server"], it["place"], it["timestr"]) for it in SCHEDULE }
+        for server, place, timestr in pairs:
+            key = (server, place, timestr)
+            if key in existing:
+                continue  # 同じスケジュールは登録しない
+            when = _next_occurrence_today_or_tomorrow(timestr)
+            item = {
+                "when": when, "server": server, "place": place, "timestr": timestr,
+                "key": key, "skip2m": False, "sent_2m": False, "sent_15s": False,
+                "copy_msg_id": None
+            }
+            SCHEDULE.append(item)
+            new_items.append(item)
+
+        if not new_items:
+            return
+
+        SCHEDULE.sort(key=lambda x: x["when"])
+        _recompute_skip2m_flags()
+
+    # コピー専用チャンネルに即時通知（送れたら message_id を保持）
+    if COPY_CHANNEL_ID:
+        try:
+            ch = bot.get_channel(COPY_CHANNEL_ID) or await bot.fetch_channel(COPY_CHANNEL_ID)  # type: ignore
+            if isinstance(ch, discord.TextChannel):
+                for it in new_items:
+                    content = f"📌 登録: **{it['server']}-{it['place']}-{it['timestr']}**"
+                    try:
+                        msg = await ch.send(content)
+                        async with SCHEDULE_LOCK:
+                            it["copy_msg_id"] = msg.id
+                    except Exception as e:
+                        print(f"[copy] send failed: {e}")
+        except Exception as e:
+            print(f"[copy] channel fetch failed: {e}")
+
+    # 通知ボード更新（既存メッセージを編集）
+    await _refresh_board()
+
 @tasks.loop(seconds=1.0)
 async def scheduler_tick():
     """
     毎秒チェックして：
-      - 2分前/1分前/15秒前をアラートチャンネルに通知（5秒後削除）
+      - 2分前/15秒前をアラートチャンネルに通知（5秒後削除）
         ※ 次の予定が5分以内なら2分前は通知しない
       - 本番時刻到達で通知チャンネルに⏰通知を出し、一覧から削除→ボード編集
+      - その際、コピー専用チャンネルの個別メッセージも削除
     """
     now = datetime.now(TIMEZONE)
 
@@ -254,26 +263,19 @@ async def scheduler_tick():
 
     fired: List[Dict] = []
     to_alert_2m: List[Dict] = []
-    to_alert_1m: List[Dict] = []
     to_alert_15s: List[Dict] = []
 
     async with SCHEDULE_LOCK:
         for it in SCHEDULE:
-            # しきい値チェック
             dt = (it["when"] - now).total_seconds()
 
             # 2分前（抑制フラグが True の場合は送らない）
-            if not it.get("sent_2m", False) and not it.get("skip2m", False) and dt <= 120 and dt > 0:
+            if not it.get("sent_2m", False) and not it.get("skip2m", False) and 0 < dt <= 120:
                 it["sent_2m"] = True
                 to_alert_2m.append(it)
 
-            # 1分前
-            if not it.get("sent_1m", False) and dt <= 60 and dt > 0:
-                it["sent_1m"] = True
-                to_alert_1m.append(it)
-
             # 15秒前
-            if not it.get("sent_15s", False) and dt <= 15 and dt > 0:
+            if not it.get("sent_15s", False) and 0 < dt <= 15:
                 it["sent_15s"] = True
                 to_alert_15s.append(it)
 
@@ -282,32 +284,31 @@ async def scheduler_tick():
                 fired.append(it)
 
         if fired:
-            # 残すものだけ維持
             keys_fired = {tuple(x["key"]) for x in fired}
             SCHEDULE[:] = [x for x in SCHEDULE if tuple(x["key"]) not in keys_fired]
-            # 並びとフラグ再計算
             SCHEDULE.sort(key=lambda x: x["when"])
             _recompute_skip2m_flags()
 
     # アラート送信（5秒後削除）
     if alert_ch is not None:
         for it in to_alert_2m:
-            await _send_temp_alert(alert_ch, f"⏳ **2分前**: {it['server']}-{it['place']} {it['timestr']}")
-        for it in to_alert_1m:
-            await _send_temp_alert(alert_ch, f"⌛ **1分前**: {it['server']}-{it['place']} {it['timestr']}")
+            await _send_temp_alert(alert_ch, f"⏳ **2分前**: {it['server']}-{it['place']}-{it['timestr']}")
         for it in to_alert_15s:
-            await _send_temp_alert(alert_ch, f"⏱️ **15秒前**: {it['server']}-{it['place']} {it['timestr']}")
+            await _send_temp_alert(alert_ch, f"⏱️ **15秒前**: {it['server']}-{it['place']}-{it['timestr']}")
 
-    # 本番通知（通知チャンネルへ）
-    if fired and NOTIFY_CHANNEL_ID:
-        notify_ch = bot.get_channel(NOTIFY_CHANNEL_ID)  # type: ignore
-        if isinstance(notify_ch, discord.TextChannel):
-            for it in fired:
-                await notify_ch.send(f"⏰ 通知: **{it['server']}-{it['place']}-{it['timestr']}** になりました！")
-
-    # ボード更新（過ぎたものを消す）
+    # 本番通知（通知チャンネルへ）＋ コピー専用メッセージ削除
     if fired:
-        await _refresh_boards()
+        if NOTIFY_CHANNEL_ID:
+            notify_ch = bot.get_channel(NOTIFY_CHANNEL_ID)  # type: ignore
+            if isinstance(notify_ch, discord.TextChannel):
+                for it in fired:
+                    await notify_ch.send(f"⏰ 通知: **{it['server']}-{it['place']}-{it['timestr']}** になりました！")
+        # コピー専用チャンネルの個別メッセージを削除
+        for it in fired:
+            await _delete_copy_message_if_exists(it)
+
+        # ボード更新（過ぎたものを消す）
+        await _refresh_board()
 
 @scheduler_tick.before_loop
 async def before_scheduler():
@@ -771,7 +772,7 @@ async def oaiocr(ctx: commands.Context):
         if fileobj:
             await ctx.send(file=fileobj)
 
-        # スケジュール登録＋ボード更新
+        # スケジュール登録＋ボード更新＋コピー即時通知
         if pairs:
             await add_events_and_refresh_board(pairs)
 
@@ -809,7 +810,7 @@ async def on_message(message: discord.Message):
             # プレースホルダを編集（解析完了通知）
             await placeholder.edit(content=result_text)
 
-            # スケジュール登録＋ボード更新（通知/コピーチャンネル）
+            # スケジュール登録＋ボード更新＋コピー即時通知
             if pairs:
                 await add_events_and_refresh_board(pairs)
 
@@ -835,18 +836,14 @@ async def ping(ctx: commands.Context):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (tz={TIMEZONE.key})")
-    # 起動直後に通知/コピーチャンネルへ「今後のスケジュール」ボードを表示（既存があれば編集）
+    # 起動直後に通知チャンネルへ「今後のスケジュール」ボードを表示（既存があれば編集）
     try:
         if NOTIFY_CHANNEL_ID:
             ch = bot.get_channel(NOTIFY_CHANNEL_ID) or await bot.fetch_channel(NOTIFY_CHANNEL_ID)  # type: ignore
             if isinstance(ch, discord.TextChannel):
-                await _ensure_message(ch, which="notify")
-        if COPY_CHANNEL_ID:
-            ch2 = bot.get_channel(COPY_CHANNEL_ID) or await bot.fetch_channel(COPY_CHANNEL_ID)  # type: ignore
-            if isinstance(ch2, discord.TextChannel):
-                await _ensure_message(ch2, which="copy")
+                await _ensure_schedule_message(ch)
     except Exception as e:
-        print(f"[on_ready] ensure boards failed: {e}")
+        print(f"[on_ready] ensure board failed: {e}")
 
     if not scheduler_tick.is_running():
         scheduler_tick.start()
