@@ -1,27 +1,15 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# ---- システム依存ライブラリ ----
+# Pillow用に基本ライブラリ（zlib, jpeg 等）はデフォルトでOK。必要に応じて追加。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git curl \
-    libglib2.0-0 libsm6 libxrender1 libxext6 libgl1 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 先に requirements.txt をコピーして依存だけインストール（キャッシュが効く）
-COPY requirements.txt /app/requirements.txt
+COPY bot.py ./
 
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
-
-# ---- Bot のコードをコピー ----
-COPY . /app
-
-# ---- HTTPサーバを開ける（必要なら）----
-EXPOSE 8000
-
-# ---- 起動コマンド ----
+# Railway では自動で PORT は不要。単に python を起動
 CMD ["python", "bot.py"]
