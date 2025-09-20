@@ -216,9 +216,8 @@ def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
         if cand_bottom is not None:
             cut_at = cand_bottom  # 時間行の下端まで 残す
         else:
-            # フォールバック：ブロック上部一定割合は残す
+            # フォールバック：ブロック上部一定割合は残す（タイトルは必ず含める）
             cut_at = min(end, int(round(start + (end - start) * FALLBACK_KEEP_TOP_RATIO)))
-            # ただしタイトル自体は必ず含める
             cut_at = max(cut_at, t_y2)
 
         if cut_at > start:
@@ -229,7 +228,6 @@ def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
         return im
 
     segments = [im.crop((0, a, w, b)) for (a, b) in keep_slices]
-    # 隙間なしで詰める（gap=0）
     out_h = sum(seg.height for seg in segments)
     out = Image.new("RGBA", (w, out_h), (0, 0, 0, 0))
     y = 0
@@ -305,4 +303,60 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes
     top_row = hstack(kept[6], kept[2], gap=8)
 
     # 縦に 4、7 を下へ
-    final_img = vstack([top_row
+    final_img = vstack([top_row, kept[4], kept[7]], gap=10)
+
+    # OpenAI OCR
+    oai_text, sent_png = openai_ocr_png(final_img)
+    return final_img, oai_text, sent_png
+
+# ---------------------------
+# Discord command
+# ---------------------------
+
+@bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR まで行います。")
+async def oaiocr(ctx: commands.Context):
+    try:
+        if not ctx.message.attachments:
+            await ctx.reply("画像を添付して `!oaiocr` を実行してください。")
+            return
+
+        att: discord.Attachment = None
+        for a in ctx.message.attachments:
+            if a.content_type and a.content_type.startswith("image/"):
+                att = a
+                break
+        if att is None:
+            await ctx.reply("画像の添付が見つかりませんでした。")
+            return
+
+        # まずは即レス
+        await ctx.reply("解析中…")
+
+        data = await att.read()
+        pil = load_image_from_bytes(data)
+
+        loop = asyncio.get_event_loop()
+        final_img, oai_text, sent_png = await loop.run_in_executor(None, process_image_pipeline, pil)
+
+        out_buf = io.BytesIO()
+        final_img.convert("RGB").save(out_buf, format="PNG")
+        out_buf.seek(0)
+
+        sent_buf = io.BytesIO(sent_png)
+        sent_buf.seek(0)
+
+        files = [
+            discord.File(out_buf, filename="result.png"),
+            discord.File(sent_buf, filename="sent_to_openai.png"),
+        ]
+        await ctx.reply(content=f"OpenAI OCR 結果:\n```\n{oai_text}\n```", files=files)
+
+    except Exception as e:
+        await ctx.reply(f"エラー: {e}")
+
+@bot.command(name="ping")
+async def ping(ctx: commands.Context):
+    await ctx.reply("pong 🏓")
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
