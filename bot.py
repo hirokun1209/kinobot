@@ -16,6 +16,12 @@ from google.cloud import vision
 # OpenAI (official SDK v1)
 from openai import OpenAI
 
+# ---- PIL resample (互換) ----
+try:
+    RESAMPLE = Image.Resampling.LANCZOS
+except Exception:
+    RESAMPLE = Image.LANCZOS
+
 # ---------------------------
 # ENV/bootstrap
 # ---------------------------
@@ -76,6 +82,14 @@ def load_image_from_bytes(data: bytes) -> Image.Image:
     im = Image.open(io.BytesIO(data))
     im = ImageOps.exif_transpose(im)  # EXIFの向きを補正
     return im.convert("RGBA")
+
+def resize_to_width(img: Image.Image, target_w: int = 708) -> Image.Image:
+    """横幅を target_w に、縦は比率維持でリサイズ"""
+    w, h = img.size
+    if w == target_w:
+        return img
+    new_h = max(1, int(round(h * (target_w / float(w)))))
+    return img.resize((target_w, new_h), RESAMPLE)
 
 def slice_exact_7(im: Image.Image, cuts_pct: List[float]) -> List[Image.Image]:
     """境界％から7ブロックに分割（1..7）"""
@@ -287,6 +301,9 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes
     指定のスライス→トリム→（7を詰め処理）→合成→OpenAI OCR
     戻り値: (最終合成画像, OpenAI OCRテキスト, OpenAIへ送った画像bytes)
     """
+    # ★ 受信直後に横幅708へ統一（縦は比率維持）
+    pil_im = resize_to_width(pil_im, target_w=708)
+
     parts = slice_exact_7(pil_im, CUTS)
 
     # 1..7 のうち 2/4/6/7 を残す
