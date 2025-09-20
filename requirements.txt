@@ -1,4 +1,10 @@
 discord.py==2.3.2
 Pillow==10.4.0
-google-cloud-vision==3.5.4
-openai==1.44.0
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+paddleocr==2.7.0.3
+google-cloud-vision==3.10.2
+openai>=1.40.0,<2
+fastapi==0.110.2
+uvicorn==0.29.0
+python-dotenv==1.0.1
