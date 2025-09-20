@@ -84,7 +84,10 @@ TRIM_RULES = {
 # 正規表現 / ルール
 # ---------------------------
 
+# 「免戦中」厳密
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")
+# 「免 / 戦 / 戰 / 中」いずれか1文字でも含めば候補（誤検知抑制のため時刻併記も必須にする）
+RE_IMMUNE_LOOSE = re.compile(r"[免戦戰中]")
 
 # タイトル系（圧縮用=形）
 RE_TITLE_COMPACT = re.compile(r"(?:越\s*域|戦\s*闘)\s*駐[\u4E00-\u9FFF]{0,3}\s*場")
@@ -140,16 +143,25 @@ def _extract_time_like(s: str) -> Optional[str]:
         return f"{a}:{b}:{c}"
     return f"{a}:{b}"
 
+def _is_immune_line(s: str) -> bool:
+    """
+    その行が「免戦中系」を指しているかの緩め判定：
+    - 厳密マッチ（免\s*戦\s*中）or
+    - 1文字でも含む & 行内に時刻っぽい表記がある
+    """
+    n = unicodedata.normalize("NFKC", s)
+    return bool(RE_IMMUNE.search(n) or (RE_IMMUNE_LOOSE.search(n) and _has_time_like(n)))
+
 def _extract_place(line: str) -> Optional[int]:
     """
     タイトル行から駐騎場ナンバーだけを抽出。
     条件:
       - 行に「場/场」と、かつ「越/域/駐/驻/戦/戰/闘」のいずれかを含む
-      - 行に「免戦」を含まない（免戦中行は除外）
+      - 行に「免戦系」を含まない（免戦中行は除外）
       - 「場」の直後にある 1-3 桁の数字のみ採用（行末数字のフォールバックはしない）
     """
     s = unicodedata.normalize("NFKC", line)
-    if "免戦" in s:
+    if _is_immune_line(s):
         return None
     if not re.search(r"[场場]", s):
         return None
@@ -162,6 +174,32 @@ def _extract_place(line: str) -> Optional[int]:
         except Exception:
             return None
     return None
+
+# --------------- チャンネル取得（デバッグ出力込み） ---------------
+async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
+    if not cid:
+        print("[channel] channel id is 0")
+        return None
+    ch = bot.get_channel(cid)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(cid)  # type: ignore
+        except Exception as e:
+            print(f"[channel] fetch_channel({cid}) failed: {e}")
+            return None
+    if not isinstance(ch, discord.TextChannel):
+        print(f"[channel] {cid} is not a TextChannel: {type(ch)}")
+        return None
+    # 送信権限チェック
+    me = ch.guild.me
+    if me is None:
+        print(f"[channel] guild.me is None for {cid}")
+        return None
+    perms = ch.permissions_for(me)
+    if not perms.send_messages:
+        print(f"[channel] missing send_messages permission in {cid}")
+        return None
+    return ch
 
 # ---------------------------
 # スケジューラ（一覧ボード＋⏰通知）
@@ -229,8 +267,8 @@ def _recompute_skip2m_flags() -> None:
 async def _refresh_board():
     """通知用のボードを最新化"""
     if NOTIFY_CHANNEL_ID:
-        ch = bot.get_channel(NOTIFY_CHANNEL_ID) or await bot.fetch_channel(NOTIFY_CHANNEL_ID)  # type: ignore
-        if isinstance(ch, discord.TextChannel):
+        ch = await _get_text_channel(NOTIFY_CHANNEL_ID)
+        if ch:
             await _ensure_schedule_message(ch)
 
 async def _send_temp_alert(channel: discord.TextChannel, text: str):
@@ -255,12 +293,12 @@ async def _delete_copy_message_if_exists(it: Dict):
     if not mid:
         return
     try:
-        ch = bot.get_channel(COPY_CHANNEL_ID) or await bot.fetch_channel(COPY_CHANNEL_ID)  # type: ignore
-        if isinstance(ch, discord.TextChannel):
+        ch = await _get_text_channel(COPY_CHANNEL_ID)
+        if ch:
             msg = await ch.fetch_message(mid)
             await msg.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[copy] delete failed: {e}")
     finally:
         it["copy_msg_id"] = None
 
@@ -273,6 +311,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     - コピー専用チャンネルへは**即時通知**（登録時に都度送信）、時間が過ぎたら削除
     """
     if not pairs:
+        print("[add] no pairs")
         return
 
     new_items: List[Dict] = []
@@ -293,6 +332,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
             new_items.append(item)
 
         if not new_items:
+            print("[add] no new items (all duplicates)")
             return
 
         SCHEDULE.sort(key=lambda x: x["when"])
@@ -300,19 +340,16 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
 
     # コピー専用チャンネルに即時通知（送れたら message_id を保持）
     if COPY_CHANNEL_ID:
-        try:
-            ch = bot.get_channel(COPY_CHANNEL_ID) or await bot.fetch_channel(COPY_CHANNEL_ID)  # type: ignore
-            if isinstance(ch, discord.TextChannel):
-                for it in new_items:
-                    content = f"📌 登録: **{it['server']}-{it['place']}-{it['timestr']}**"
-                    try:
-                        msg = await ch.send(content)
-                        async with SCHEDULE_LOCK:
-                            it["copy_msg_id"] = msg.id
-                    except Exception as e:
-                        print(f"[copy] send failed: {e}")
-        except Exception as e:
-            print(f"[copy] channel fetch failed: {e}")
+        ch = await _get_text_channel(COPY_CHANNEL_ID)
+        if ch:
+            for it in new_items:
+                content = f"📌 登録: **{it['server']}-{it['place']}-{it['timestr']}**"
+                try:
+                    msg = await ch.send(content)
+                    async with SCHEDULE_LOCK:
+                        it["copy_msg_id"] = msg.id
+                except Exception as e:
+                    print(f"[copy] send failed: {e}")
 
     # 通知ボード更新（既存メッセージを編集）
     await _refresh_board()
@@ -331,9 +368,7 @@ async def scheduler_tick():
     # アラートチャンネル取得
     alert_ch: Optional[discord.TextChannel] = None
     if ALERT_CHANNEL_ID:
-        ch = bot.get_channel(ALERT_CHANNEL_ID)  # type: ignore
-        if isinstance(ch, discord.TextChannel):
-            alert_ch = ch
+        alert_ch = await _get_text_channel(ALERT_CHANNEL_ID)
 
     fired: List[Dict] = []
     to_alert_2m: List[Dict] = []
@@ -373,8 +408,8 @@ async def scheduler_tick():
     # 本番通知（通知チャンネルへ）＋ コピー専用メッセージ削除
     if fired:
         if NOTIFY_CHANNEL_ID:
-            notify_ch = bot.get_channel(NOTIFY_CHANNEL_ID)  # type: ignore
-            if isinstance(notify_ch, discord.TextChannel):
+            notify_ch = await _get_text_channel(NOTIFY_CHANNEL_ID)
+            if notify_ch:
                 for it in fired:
                     await notify_ch.send(f"⏰ 通知: **{it['server']}-{it['place']}-{it['timestr']}** になりました！")
         # コピー専用チャンネルの個別メッセージを削除
@@ -504,7 +539,8 @@ def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
         t = _norm(text)
         if RE_TITLE_COMPACT.search(t):
             titles.append((y1, y2))
-        if _has_time_like(t) or RE_IMMUNE.search(t):
+        # 「免戦中」1文字OK + 時刻っぽい も候補に
+        if _has_time_like(text) or _is_immune_line(text):
             candidates.append((y1, y2))
 
     titles.sort(key=lambda p: p[0])
@@ -666,8 +702,8 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
             if tt:
                 ceasefire_sec = _time_to_seconds(tt, prefer_mmss=False)
 
-        # base_time: 「免戦」「停戦」を含まない行の最初の時刻らしきもの
-        if base_time_sec is None and ("免戦" not in n and "停戦" not in n):
+        # base_time: 「免戦系」や「停戦」を含まない行の最初の時刻らしきもの
+        if base_time_sec is None and (not _is_immune_line(raw)) and ("停戦" not in n):
             tt = _extract_time_like(raw)
             if tt:
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
@@ -677,8 +713,8 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
         if pl is not None:
             pairs.append((pl, None))
 
-        # immune time: 「免戦」を含む行の時刻らしきもの（MM:SS 解釈）
-        if "免戦" in n:
+        # immune time: 「免戦系」行の時刻らしきもの（MM:SS 解釈）— 1文字でもOK
+        if _is_immune_line(raw):
             tt = _extract_time_like(raw)
             if tt:
                 tsec = _time_to_seconds(tt, prefer_mmss=True)
@@ -906,8 +942,8 @@ async def on_ready():
     # 起動直後に通知チャンネルへ「今後のスケジュール」ボードを表示（既存があれば編集）
     try:
         if NOTIFY_CHANNEL_ID:
-            ch = bot.get_channel(NOTIFY_CHANNEL_ID) or await bot.fetch_channel(NOTIFY_CHANNEL_ID)  # type: ignore
-            if isinstance(ch, discord.TextChannel):
+            ch = await _get_text_channel(NOTIFY_CHANNEL_ID)
+            if ch:
                 await _ensure_schedule_message(ch)
     except Exception as e:
         print(f"[on_ready] ensure board failed: {e}")
