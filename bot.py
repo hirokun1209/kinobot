@@ -80,9 +80,17 @@ TRIM_RULES = {
     2: (75.98, 10.73), # 時計
 }
 
-# 正規表現（緩め）
+# 正規表現
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")
-RE_TITLE  = re.compile(r"越\s*域\s*駐[\u4E00-\u9FFF]{1,3}\s*場")
+
+# 解析用タイトル判定（1文字でもOK／誤OCR含む）
+# 例: 越, 域, 駐(驻), 戦(戰), 闘, 場(场) のどれか1文字が含まれれば“候補”
+RE_TITLE_PARSE = re.compile(r"[越域駐驻戦戰闘场場]")
+
+# 画像圧縮用タイトル判定（やや厳しめ：語としての形）
+# 「越域駐〇場」や「戦闘駐〇場」などを想定（OCRの空白揺れ許容）
+RE_TITLE_COMPACT = re.compile(r"(?:越\s*域|戦\s*闘)\s*駐[\u4E00-\u9FFF]{0,3}\s*場")
+
 RE_TIME   = re.compile(r"\d{1,2}[:：]\d{2}(?:[:：]\d{2})?")
 RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")
 
@@ -387,6 +395,7 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
     for txt, (x1, y1, x2, y2) in words:
         cy = (y1 + y2) / 2.0
         items.append((cy, x1, y1, x2, y2, txt))
+        # x1で安定ソート
     items.sort(key=lambda t: (t[0], t[1]))
 
     lines: List[List[Tuple[int,int,int,int,str]]] = []
@@ -406,7 +415,7 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
     line_boxes: List[Tuple[str, Tuple[int,int,int,int]]] = []
     for chunks in lines:
         chunks.sort(key=lambda a: a[0])  # x1
-        text = "".join(c[4] for c in chunks)  # スペース無しで連結
+        text = "".join(c[4] for c in chunks)  # スペース無しで連結（_normで更に整形）
         x1 = min(c[0] for c in chunks)
         y1 = min(c[1] for c in chunks)
         x2 = max(c[2] for c in chunks)
@@ -428,7 +437,7 @@ def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
 
     for text, (x1, y1, x2, y2) in lines:
         t = _norm(text)
-        if RE_TITLE.search(t):
+        if RE_TITLE_COMPACT.search(t):
             titles.append((y1, y2))
         if RE_IMMUNE.search(t) or RE_TIME.search(t):
             candidates.append((y1, y2))
@@ -601,8 +610,8 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
             if tt:
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
 
-        # title: 越域駐〇場
-        if RE_TITLE.search(n):
+        # title: 越/域/駐/戦/闘/場 のいずれかを含む行を候補とし、末尾の番号を拾う
+        if RE_TITLE_PARSE.search(n):
             m_num = re.search(r"場\s*([0-9]{1,3})", raw)
             if not m_num:
                 m_num = re.search(r"([0-9]{1,3})\s*$", raw)
