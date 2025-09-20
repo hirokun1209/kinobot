@@ -1,7 +1,6 @@
 import os
 import io
 import re
-import json
 import base64
 import asyncio
 from typing import List, Tuple, Dict
@@ -35,8 +34,6 @@ if GOOGLE_CLOUD_VISION_JSON:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
 gcv_client = vision.ImageAnnotatorClient()
-print(f"✅ google-cloud-vision {vision.__version__} ready")
-
 oai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------
@@ -57,21 +54,19 @@ KEEP = [2, 4, 6, 7]
 
 # 横方向トリミング（左/右を％でカット）
 TRIM_RULES = {
-    7: (20.0, 50.0),   # 駐騎ナンバー＋免戦時間
+    7: (20.0, 50.0),   # 駐騎ナンバー＋免戦時間（左20% / 右50% を切り落として残す）
     6: (32.48, 51.50), # サーバー番号
     4: (44.0, 20.19),  # 停戦終了
     2: (75.98, 10.73), # 時計
 }
 
-# ---- 黒塗り判定用 正規表現（強化版） ----
-RE_IMMUNE = re.compile(r"免\s*戦\s*中")  # 「免戦中」
-# 「越域駐騎場 / 越域駐機場」ゆるめ（OCRの取り違えや空白に強く）
-RE_YUEYI = re.compile(r"(越\s*域\s*駐\s*[騎机]\s*場|駐\s*[騎机]\s*場)")
-# 時刻（全角コロン対応）
-RE_TIME = re.compile(r"[0-2]?\d[:：][0-5]\d[:：][0-5]\d")
+# 行検出に使う正規表現（スペースや全角半角ゆらぎを吸収）
+RE_YUEYI_LINE = re.compile(r"越\s*域\s*駐\s*[騎機]\s*場", re.I)
+RE_IMMUNE_LINE = re.compile(r"免\s*戦\s*中", re.I)
 
-TOP_MARGIN_AFTER_IMMUNE = 6   # 免戦行の直下 +6px
-BOTTOM_MARGIN_BEFORE_NEXT = 2 # 次のタイトル行直上 -2px
+# 文字にギリ触れないようにほんの少しだけ余白
+TOP_PAD = 0       # 黒塗りの開始側（下方向へ何px下げるか）
+BOTTOM_PAD = 0    # 黒塗りの終了側（上方向へ何px上げるか）
 
 # ---------------------------
 # Helpers
@@ -79,10 +74,11 @@ BOTTOM_MARGIN_BEFORE_NEXT = 2 # 次のタイトル行直上 -2px
 
 def load_image_from_bytes(data: bytes) -> Image.Image:
     im = Image.open(io.BytesIO(data))
-    im = ImageOps.exif_transpose(im)
+    im = ImageOps.exif_transpose(im)  # EXIFの向きを補正
     return im.convert("RGBA")
 
 def slice_exact_7(im: Image.Image, cuts_pct: List[float]) -> List[Image.Image]:
+    """境界％に従って7ブロックへ分割（1..7を返す）"""
     w, h = im.size
     boundaries = [int(round(h * p / 100.0)) for p in cuts_pct]
     y = [0] + boundaries + [h]
@@ -99,26 +95,23 @@ def trim_lr_percent(im: Image.Image, left_pct: float, right_pct: float) -> Image
     right = max(left+1, min(right, w))
     return im.crop((left, 0, right, h))
 
-def google_ocr_word_boxes(pil_im: Image.Image) -> List[Tuple[str, Tuple[int,int,int,int]]]:
-    """Google Vision で word 単位の文字とバウンディングボックスを返す (text, (x1,y1,x2,y2))"""
+# ---------- OCR (word -> line) ----------
+
+def _google_ocr_words(pil_im: Image.Image):
+    """Google Vision で word 単位の [(text, (x1,y1,x2,y2))] を返す"""
     buf = io.BytesIO()
     pil_im.convert("RGB").save(buf, format="JPEG", quality=95)
-    content = buf.getvalue()
-    image = vision.Image(content=content)
-
-    response = gcv_client.document_text_detection(image=image)
-    if response.error.message:
-        raise RuntimeError(response.error.message)
+    image = vision.Image(content=buf.getvalue())
+    resp = gcv_client.document_text_detection(image=image)
+    if resp.error.message:
+        raise RuntimeError(resp.error.message)
 
     words = []
-    if not response.full_text_annotation.pages:
-        return words
-
-    for page in response.full_text_annotation.pages:
+    for page in resp.full_text_annotation.pages:
         for block in page.blocks:
             for para in block.paragraphs:
                 for word in para.words:
-                    txt = "".join([s.text for s in word.symbols])
+                    txt = "".join(s.text for s in word.symbols)
                     xs = [v.x for v in word.bounding_box.vertices]
                     ys = [v.y for v in word.bounding_box.vertices]
                     x1, x2 = min(xs), max(xs)
@@ -126,99 +119,103 @@ def google_ocr_word_boxes(pil_im: Image.Image) -> List[Tuple[str, Tuple[int,int,
                     words.append((txt, (x1, y1, x2, y2)))
     return words
 
-# === ここから：行クラスタリング & 黒塗り ===
+def _cluster_lines_by_y(words: List[Tuple[str, Tuple[int,int,int,int]]], height: int):
+    """
+    y中心で近い単語を同一行としてクラスタリング。
+    返り値: list[ {text, top, bottom, items=[(t,box),...]} ] を y順で。
+    """
+    if not words:
+        return []
+    # y中心でソート
+    items = [ (t, box, (box[1]+box[3])//2) for t, box in words ]
+    items.sort(key=lambda x: x[2])
 
-def _group_words_into_lines(words: List[Tuple[str, Tuple[int,int,int,int]]], img_h: int
-                            ) -> List[Tuple[str, Tuple[int,int,int,int]]]:
-    """
-    単語を“行”にまとめて返す。
-    返り値: [(行テキスト(空白除去), (x1,y1,x2,y2))...] を上から順に。
-    """
-    # yセンターが近いものを同一行としてまとめる
-    thr = max(12, int(img_h * 0.012))  # 画像高さに応じてしきい値
-    items = []
-    for txt, (x1, y1, x2, y2) in words:
-        cy = (y1 + y2) // 2
-        items.append((cy, x1, txt, (x1, y1, x2, y2)))
-    items.sort()  # cy, x1 でソート
+    # 行しきい値（画像高さの約1.8% or 12px の大きい方）
+    thr = max(12, int(round(height * 0.018)))
 
     lines = []
-    for cy, x1, txt, box in items:
-        placed = False
-        for ln in lines:
-            if abs(cy - ln["cy"]) <= thr:
-                ln["parts"].append((x1, txt, box))
-                ln["top"] = min(ln["top"], box[1])
-                ln["bot"] = max(ln["bot"], box[3])
-                ln["cy"] = (ln["top"] + ln["bot"]) // 2
-                placed = True
-                break
-        if not placed:
-            lines.append({"parts":[(x1, txt, box)], "top":box[1], "bot":box[3], "cy":cy})
+    cur = [items[0]]
+    for t, box, cy in items[1:]:
+        prev_cy = cur[-1][2]
+        if abs(cy - prev_cy) <= thr:
+            cur.append((t, box, cy))
+        else:
+            lines.append(cur)
+            cur = [(t, box, cy)]
+    lines.append(cur)
 
     out = []
-    for ln in lines:
-        ln["parts"].sort(key=lambda t: t[0])  # xでソート
-        text = "".join(p[1] for p in ln["parts"]).replace(" ", "")
-        x1 = ln["parts"][0][2][0]
-        x2 = ln["parts"][-1][2][2]
-        out.append((text, (x1, ln["top"], x2, ln["bot"])))
-    out.sort(key=lambda t: t[1][1])  # y1で
+    for line in lines:
+        top = min(b[1] for _, b, _ in line)
+        bot = max(b[3] for _, b, _ in line)
+        # 行テキストはスペース無しと有りの両方作る
+        joined_no_space = "".join(t for t, _, _ in line)
+        joined_with_space = " ".join(t for t, _, _ in line)
+        out.append({
+            "top": top, "bottom": bot,
+            "text_raw": joined_with_space,
+            "text_compact": joined_no_space,
+            "items": [(t,b) for t,b,_ in line],
+        })
+    # yで整列
+    out.sort(key=lambda d: (d["top"], d["bottom"]))
     return out
+
+# ---------- 7番ブロックの黒塗り（新ルール） ----------
 
 def draw_black_bars_for_7(pil_im: Image.Image) -> Image.Image:
     """
-    7番ブロック画像内で、
-    免戦行（=「免戦中」または HH:MM:SS を含む行）の bottom+6px 〜
-    次の タイトル行（=「越域駐騎/駐機場」）の top-2px を黒塗り。
-    タイトル行が見当たらない場合は、次の免戦行の top-2px。
-    それも無い場合は画像の一番下まで。
+    7番ブロック：
+      ・各「越域駐騎(機)場◯」行の下端から、次の「越域駐騎(機)場◯」行の上端まで黒塗り
+      ・途中に「免戦中…」行がある場合は、その行の下端から次の「越域駐騎(機)場◯」行の上端まで黒塗り
+      ・最後は一番下まで
     """
     im = pil_im.copy()
     draw = ImageDraw.Draw(im)
     w, h = im.size
 
-    words = google_ocr_word_boxes(im)
-    lines = _group_words_into_lines(words, h)
+    words = _google_ocr_words(im)
+    lines = _cluster_lines_by_y(words, h)
 
-    immune_lines: List[Tuple[int,int]] = []
-    title_lines:  List[Tuple[int,int]] = []
+    # 対象行を抽出
+    title_lines = []   # 「越域駐騎場」行
+    immune_lines = []  # 「免戦中」行
+    for ln in lines:
+        t = ln["text_compact"]
+        if RE_YUEYI_LINE.search(t):
+            title_lines.append(ln)
+        if RE_IMMUNE_LINE.search(t):
+            immune_lines.append(ln)
 
-    for text, (x1, y1, x2, y2) in lines:
-        t = text  # 既に空白除去済み
-        is_immune = RE_IMMUNE.search(t) is not None or RE_TIME.search(t) is not None
-        is_title  = RE_YUEYI.search(t) is not None
-        if is_immune:
-            immune_lines.append((y1, y2))
-        if is_title:
-            title_lines.append((y1, y2))
+    # タイトル行が無ければ何もしない
+    if not title_lines:
+        return im
 
-    immune_lines.sort()
-    title_lines.sort()
+    # 各タイトル行ごとに黒塗り区間を決定
+    for i, cur_title in enumerate(title_lines):
+        cur_bottom = cur_title["bottom"]
+        next_top = title_lines[i+1]["top"] if i+1 < len(title_lines) else h
 
-    for idx, (iy1, iy2) in enumerate(immune_lines):
-        top = iy2 + TOP_MARGIN_AFTER_IMMUNE
+        # この区間に含まれる「免戦中」行を（タイトル直下に最も近いもの）探す
+        chosen_start = cur_bottom
+        for imm in immune_lines:
+            if cur_bottom <= imm["top"] <= next_top:
+                chosen_start = max(chosen_start, imm["bottom"])
+                break  # 一番近いのが見つかったら採用
 
-        # 次のタイトル行
-        next_title_top = next((ty1 for (ty1, ty2) in title_lines if ty1 > top), None)
-        # 代替：次の免戦行
-        next_immune_top = next((jy1 for (jy1, jy2) in immune_lines[idx+1:] if jy1 > top), None)
+        top_y = min(next_top, chosen_start + TOP_PAD)
+        bot_y = max(top_y, next_top - BOTTOM_PAD)
 
-        if next_title_top is not None:
-            bottom = max(top, next_title_top - BOTTOM_MARGIN_BEFORE_NEXT)
-        elif next_immune_top is not None:
-            bottom = max(top, next_immune_top - BOTTOM_MARGIN_BEFORE_NEXT)
-        else:
-            bottom = h
-
-        if bottom > top:
-            draw.rectangle([(0, top), (w, bottom)], fill=(0, 0, 0, 255))
+        if bot_y > top_y:
+            # 横は全幅を塗りつぶし
+            draw.rectangle([(0, top_y), (w, bot_y)], fill=(0, 0, 0, 255))
 
     return im
 
-# ---- ここまで黒塗り ----
+# ---------- 合成系 ----------
 
 def hstack(im_left: Image.Image, im_right: Image.Image, gap: int = 8, bg=(0,0,0,0)) -> Image.Image:
+    """左右に結合（高さは大きい方に合わせ中央寄せ）"""
     h = max(im_left.height, im_right.height)
     w = im_left.width + gap + im_right.width
     canvas = Image.new("RGBA", (w, h), bg)
@@ -229,6 +226,7 @@ def hstack(im_left: Image.Image, im_right: Image.Image, gap: int = 8, bg=(0,0,0,
     return canvas
 
 def vstack(images: List[Image.Image], gap: int = 8, bg=(0,0,0,0)) -> Image.Image:
+    """縦結合（幅は最大に合わせ中央寄せ）"""
     if not images:
         raise ValueError("no images to stack")
     max_w = max(img.width for img in images)
@@ -241,7 +239,10 @@ def vstack(images: List[Image.Image], gap: int = 8, bg=(0,0,0,0)) -> Image.Image
         y += img.height + gap
     return canvas
 
+# ---------- OpenAI OCR ----------
+
 def openai_ocr_png(pil_im: Image.Image) -> Tuple[str, bytes]:
+    """OpenAI へ画像OCR依頼。返り値: (テキスト, 送ったPNGバイト列)"""
     buf = io.BytesIO()
     pil_im.convert("RGB").save(buf, format="PNG")
     png_bytes = buf.getvalue()
@@ -252,7 +253,7 @@ def openai_ocr_png(pil_im: Image.Image) -> Tuple[str, bytes]:
         messages=[{
             "role":"user",
             "content":[
-                {"type":"text", "text":"以下の画像に写っている日本語テキストを、そのまま読み取ってください（改行と数字も保持）。"},
+                {"type":"text", "text":"以下の画像内の日本語テキストを改行・数字を保持してそのまま読み取ってください。"},
                 {"type":"image_url", "image_url":{"url": f"data:image/png;base64,{b64}"}}
             ]
         }],
@@ -261,7 +262,13 @@ def openai_ocr_png(pil_im: Image.Image) -> Tuple[str, bytes]:
     text = resp.choices[0].message.content.strip()
     return text, png_bytes
 
+# ---------- パイプライン ----------
+
 def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes]:
+    """
+    指定のスライス→トリム→黒塗り→合成→OpenAI OCR
+    戻り値: (最終合成画像, OpenAI OCRテキスト, OpenAIへ送った画像bytes)
+    """
     parts = slice_exact_7(pil_im, CUTS)
 
     kept: Dict[int, Image.Image] = {}
@@ -270,7 +277,7 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes
         l_pct, r_pct = TRIM_RULES[idx]
         kept[idx] = trim_lr_percent(block, l_pct, r_pct)
 
-    # 7番に黒塗り（改良版）
+    # 7番に新ルールで黒塗り
     kept[7] = draw_black_bars_for_7(kept[7])
 
     # 6の右隣に 2 を横並び（時計はサーバー番号の隣）
@@ -281,11 +288,13 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes
 
     # OpenAI OCR
     oai_text, sent_png = openai_ocr_png(final_img)
+
     return final_img, oai_text, sent_png
 
 # ---------------------------
 # Discord command
 # ---------------------------
+
 @bot.command(name="oaiocr", help="画像を添付して実行。処理→黒塗り→OpenAI OCR まで行います。")
 async def oaiocr(ctx: commands.Context):
     try:
@@ -312,8 +321,7 @@ async def oaiocr(ctx: commands.Context):
         final_img.convert("RGB").save(out_buf, format="PNG")
         out_buf.seek(0)
 
-        sent_buf = io.BytesIO(sent_png)
-        sent_buf.seek(0)
+        sent_buf = io.BytesIO(sent_png); sent_buf.seek(0)
 
         files = [
             discord.File(out_buf, filename="result.png"),
