@@ -4,7 +4,7 @@ import re
 import base64
 import asyncio
 import unicodedata
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import discord
 from discord.ext import commands
@@ -15,12 +15,6 @@ from google.cloud import vision
 
 # OpenAI (official SDK v1)
 from openai import OpenAI
-
-# ---- PIL resample (互換) ----
-try:
-    RESAMPLE = Image.Resampling.LANCZOS
-except Exception:
-    RESAMPLE = Image.LANCZOS
 
 # ---------------------------
 # ENV/bootstrap
@@ -53,6 +47,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Parameters / Config
 # ---------------------------
 
+# 入力画像は最初に横幅708へ等比リサイズ
+TARGET_WIDTH = 708
+
 # スライス境界（%）
 CUTS = [7.51, 11.63, 25.21, 29.85, 33.62, 38.41, 61.90]  # 上からの境界％
 # 残すブロック番号（1始まり）
@@ -70,6 +67,7 @@ TRIM_RULES = {
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")                                 # 「免戦中」
 RE_TITLE  = re.compile(r"越\s*域\s*駐[\u4E00-\u9FFF]{1,3}\s*場")         # 「越域駐〇場」誤OCRも拾う
 RE_TIME   = re.compile(r"\d{1,2}[:：]\d{2}(?:[:：]\d{2})?")              # 05:53 / 01:02:13 など
+RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")                 # [s1296] / s1296
 
 # フォールバック：ブロック高さに対する“必ず残す”上部割合
 FALLBACK_KEEP_TOP_RATIO = 0.35
@@ -78,18 +76,19 @@ FALLBACK_KEEP_TOP_RATIO = 0.35
 # Helpers
 # ---------------------------
 
+def _norm(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).replace(" ", "")
+
 def load_image_from_bytes(data: bytes) -> Image.Image:
     im = Image.open(io.BytesIO(data))
     im = ImageOps.exif_transpose(im)  # EXIFの向きを補正
     return im.convert("RGBA")
 
-def resize_to_width(img: Image.Image, target_w: int = 708) -> Image.Image:
-    """横幅を target_w に、縦は比率維持でリサイズ"""
-    w, h = img.size
-    if w == target_w:
-        return img
-    new_h = max(1, int(round(h * (target_w / float(w)))))
-    return img.resize((target_w, new_h), RESAMPLE)
+def resize_to_width(im: Image.Image, width: int = TARGET_WIDTH) -> Image.Image:
+    if im.width == width:
+        return im
+    h = int(round(im.height * width / im.width))
+    return im.resize((width, h), Image.LANCZOS)
 
 def slice_exact_7(im: Image.Image, cuts_pct: List[float]) -> List[Image.Image]:
     """境界％から7ブロックに分割（1..7）"""
@@ -175,9 +174,6 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
         y2 = max(c[3] for c in chunks)
         line_boxes.append((text, (x1, y1, x2, y2)))
     return line_boxes
-
-def _norm(s: str) -> str:
-    return unicodedata.normalize("NFKC", s).replace(" ", "")
 
 def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
     """
@@ -275,6 +271,10 @@ def vstack(images: List[Image.Image], gap: int = 8, bg=(0,0,0,0)) -> Image.Image
         y += img.height + gap
     return canvas
 
+# ---------------------------
+# OpenAI OCR
+# ---------------------------
+
 def openai_ocr_png(pil_im: Image.Image) -> Tuple[str, bytes]:
     """OpenAI へ画像OCR依頼。返り値: (テキスト, 送ったPNGバイト列)"""
     buf = io.BytesIO()
@@ -296,15 +296,146 @@ def openai_ocr_png(pil_im: Image.Image) -> Tuple[str, bytes]:
     text = resp.choices[0].message.content.strip()
     return text, png_bytes
 
-def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes]:
-    """
-    指定のスライス→トリム→（7を詰め処理）→合成→OpenAI OCR
-    戻り値: (最終合成画像, OpenAI OCRテキスト, OpenAIへ送った画像bytes)
-    """
-    # ★ 受信直後に横幅708へ統一（縦は比率維持）
-    pil_im = resize_to_width(pil_im, target_w=708)
+# ---------------------------
+# 計算 & フォーマット
+# ---------------------------
 
-    parts = slice_exact_7(pil_im, CUTS)
+def _time_to_seconds(t: str) -> int:
+    t = _norm(t).replace("：", ":")
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", t)
+    if not m:
+        return 0
+    h = int(m.group(1))
+    m_ = int(m.group(2))
+    s = int(m.group(3)) if m.group(3) else 0
+    return h*3600 + m_*60 + s
+
+def _seconds_to_hms(sec: int) -> str:
+    sec %= 24*3600
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[Tuple[int, str]]]:
+    """
+    OCRテキストから
+      server(str), base_time(HH:MM:SS), ceasefire(HH:MM:SS), results[(place, time_str)]
+    を返す。足りない場合は None。
+    """
+    lines = [ln.strip() for ln in oai_text.splitlines() if ln.strip()]
+    if not lines:
+        return None, None, None, []
+
+    server = None
+    base_time_sec: Optional[int] = None
+    ceasefire_sec: Optional[int] = None
+
+    pairs: List[Tuple[int, Optional[int]]] = []  # (place, immune_sec)
+
+    def find_time_in_text(txt: str) -> Optional[str]:
+        m = RE_TIME.search(txt)
+        return m.group(0).replace("：", ":") if m else None
+
+    # 1周: サーバー / 基準 / 停戦終了 / 越域駐〇場 + 免戦 を順に拾う
+    for raw in lines:
+        n = _norm(raw)
+        # server
+        if server is None:
+            m = RE_SERVER.search(n)
+            if m:
+                server = m.group(1)
+
+        # ceasefire: 行内に「停戦」があればその行の時刻を採用（前後どちらでもOK）
+        if "停戦" in n:
+            tt = find_time_in_text(raw)
+            if tt:
+                ceasefire_sec = _time_to_seconds(tt)
+                # 停戦行は基準ではないので continue せず次も見る（問題なし）
+
+        # base_time: 「免戦」「停戦」を含まない最初の時刻
+        if base_time_sec is None and ("免戦" not in n and "停戦" not in n):
+            tt = find_time_in_text(raw)
+            if tt:
+                base_time_sec = _time_to_seconds(tt)
+
+        # title: 越域駐〇場
+        if RE_TITLE.search(n):
+            # 番号の抽出（末尾数字 or 「場」の後の数字）
+            m_num = re.search(r"場\s*([0-9]{1,3})", raw)
+            if not m_num:
+                m_num = re.search(r"([0-9]{1,3})\s*$", raw)
+            if m_num:
+                place = int(m_num.group(1))
+                pairs.append((place, None))
+
+        # immune time
+        if "免戦" in n:
+            tt = find_time_in_text(raw)
+            if tt:
+                tsec = _time_to_seconds(tt)
+                # 直近の未設定ペアに充当
+                for i in range(len(pairs)-1, -1, -1):
+                    if pairs[i][1] is None:
+                        pairs[i] = (pairs[i][0], tsec)
+                        break
+
+    if base_time_sec is None or not pairs:
+        return server, None, None, []
+
+    # 計算
+    calc: List[Tuple[int, int]] = []  # (place, sec_from_midnight)
+    for place, immune in pairs:
+        if immune is None:
+            continue
+        calc.append((place, (base_time_sec + immune) % (24*3600)))
+
+    if not calc:
+        return server, _seconds_to_hms(base_time_sec), _seconds_to_hms(ceasefire_sec) if ceasefire_sec is not None else None, []
+
+    # 最上ブロック（最初のcalc）と停戦終了の差で補正
+    if ceasefire_sec is not None:
+        delta = (ceasefire_sec - calc[0][1])  # 正負OK
+        calc = [(pl, (sec + delta) % (24*3600)) for (pl, sec) in calc]
+        # 念のため先頭は停戦終了に合わせる
+        calc[0] = (calc[0][0], ceasefire_sec % (24*3600))
+
+    # 出力整形
+    results: List[Tuple[int, str]] = [(pl, _seconds_to_hms(sec)) for (pl, sec) in calc]
+    base_str = _seconds_to_hms(base_time_sec)
+    cease_str = _seconds_to_hms(ceasefire_sec) if ceasefire_sec is not None else None
+    return server, base_str, cease_str, results
+
+def build_result_message(server: Optional[str],
+                         base_str: Optional[str],
+                         cease_str: Optional[str],
+                         results: List[Tuple[int, str]]) -> str:
+    # 例） ✅ 解析完了！⏱️ 基準時間:17:26:45 (21:07:21)
+    #      1296-2-21:07:21
+    #      ...
+    if not base_str or not results or not server:
+        return "⚠️ 解析完了… ですが計算できませんでした。画像やOCR結果をご確認ください。"
+
+    head = f"✅ 解析完了！⏱️ 基準時間:{base_str}"
+    if cease_str:
+        head += f" ({cease_str})"
+
+    body_lines = [f"{server}-{pl}-{t}" for (pl, t) in results]
+    return head + "\n" + "\n".join(body_lines)
+
+# ---------------------------
+# パイプライン
+# ---------------------------
+
+def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes, str]:
+    """
+    リサイズ→スライス→トリム→（7を詰め処理）→合成→OpenAI OCR→計算
+    戻り値: (最終合成画像, OpenAI OCRテキスト, OpenAIへ送った画像bytes, 結果メッセージ)
+    """
+    # まず横幅708へ
+    base = resize_to_width(pil_im, TARGET_WIDTH)
+
+    parts = slice_exact_7(base, CUTS)
 
     # 1..7 のうち 2/4/6/7 を残す
     kept: Dict[int, Image.Image] = {}
@@ -313,7 +444,7 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes
         l_pct, r_pct = TRIM_RULES[idx]
         kept[idx] = trim_lr_percent(block, l_pct, r_pct)
 
-    # 7番：黒塗りではなく“削除して詰める”
+    # 7番：不要部分を削除して詰める
     kept[7] = compact_7_by_removing_sections(kept[7])
 
     # 6の右隣に 2 を横並び（時計はサーバー番号の隣）
@@ -324,20 +455,25 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, bytes
 
     # OpenAI OCR
     oai_text, sent_png = openai_ocr_png(final_img)
-    return final_img, oai_text, sent_png
+
+    # 解析＆整形メッセージ
+    server, base_str, cease_str, results = parse_and_compute(oai_text)
+    message = build_result_message(server, base_str, cease_str, results)
+
+    return final_img, oai_text, sent_png, message
 
 # ---------------------------
 # Discord command
 # ---------------------------
 
-@bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR まで行います。")
+@bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR→計算まで行います。")
 async def oaiocr(ctx: commands.Context):
     try:
         if not ctx.message.attachments:
             await ctx.reply("画像を添付して `!oaiocr` を実行してください。")
             return
 
-        att: discord.Attachment = None
+        att: Optional[discord.Attachment] = None
         for a in ctx.message.attachments:
             if a.content_type and a.content_type.startswith("image/"):
                 att = a
@@ -347,13 +483,13 @@ async def oaiocr(ctx: commands.Context):
             return
 
         # まずは即レス
-        await ctx.reply("解析中…")
+        await ctx.reply("解析中…🔎")
 
         data = await att.read()
         pil = load_image_from_bytes(data)
 
         loop = asyncio.get_event_loop()
-        final_img, oai_text, sent_png = await loop.run_in_executor(None, process_image_pipeline, pil)
+        final_img, oai_text, sent_png, message = await loop.run_in_executor(None, process_image_pipeline, pil)
 
         out_buf = io.BytesIO()
         final_img.convert("RGB").save(out_buf, format="PNG")
@@ -366,7 +502,7 @@ async def oaiocr(ctx: commands.Context):
             discord.File(out_buf, filename="result.png"),
             discord.File(sent_buf, filename="sent_to_openai.png"),
         ]
-        await ctx.reply(content=f"OpenAI OCR 結果:\n```\n{oai_text}\n```", files=files)
+        await ctx.reply(content=message, files=files)
 
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
