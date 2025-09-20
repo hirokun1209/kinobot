@@ -300,15 +300,23 @@ def openai_ocr_png(pil_im: Image.Image) -> Tuple[str, bytes]:
 # 計算 & フォーマット
 # ---------------------------
 
-def _time_to_seconds(t: str) -> int:
+def _time_to_seconds(t: str, *, prefer_mmss: bool = False) -> int:
+    """
+    時刻/時間文字列を秒に。
+    prefer_mmss=True のとき、2 区切りは MM:SS と解釈（免戦中向け）。
+    """
     t = _norm(t).replace("：", ":")
-    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", t)
-    if not m:
-        return 0
-    h = int(m.group(1))
-    m_ = int(m.group(2))
-    s = int(m.group(3)) if m.group(3) else 0
-    return h*3600 + m_*60 + s
+    m3 = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})$", t)
+    if m3:
+        h, m, s = map(int, m3.groups())
+        return h*3600 + m*60 + s
+    m2 = re.match(r"^(\d{1,2}):(\d{2})$", t)
+    if m2:
+        a, b = map(int, m2.groups())
+        if prefer_mmss:
+            return a*60 + b      # MM:SS として扱う（例: 58:40 -> 00:58:40）
+        return a*3600 + b*60     # HH:MM（基準/停戦）
+    return 0
 
 def _seconds_to_hms(sec: int) -> str:
     sec %= 24*3600
@@ -346,18 +354,17 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
             if m:
                 server = m.group(1)
 
-        # ceasefire: 行内に「停戦」があればその行の時刻を採用（前後どちらでもOK）
+        # ceasefire: 行内に「停戦」があればその行の時刻を採用
         if "停戦" in n:
             tt = find_time_in_text(raw)
             if tt:
-                ceasefire_sec = _time_to_seconds(tt)
-                # 停戦行は基準ではないので continue せず次も見る（問題なし）
+                ceasefire_sec = _time_to_seconds(tt, prefer_mmss=False)
 
         # base_time: 「免戦」「停戦」を含まない最初の時刻
         if base_time_sec is None and ("免戦" not in n and "停戦" not in n):
             tt = find_time_in_text(raw)
             if tt:
-                base_time_sec = _time_to_seconds(tt)
+                base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
 
         # title: 越域駐〇場
         if RE_TITLE.search(n):
@@ -369,11 +376,11 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
                 place = int(m_num.group(1))
                 pairs.append((place, None))
 
-        # immune time
+        # immune time（2 区切りは MM:SS として解釈）
         if "免戦" in n:
             tt = find_time_in_text(raw)
             if tt:
-                tsec = _time_to_seconds(tt)
+                tsec = _time_to_seconds(tt, prefer_mmss=True)
                 # 直近の未設定ペアに充当
                 for i in range(len(pairs)-1, -1, -1):
                     if pairs[i][1] is None:
@@ -397,7 +404,7 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
     if ceasefire_sec is not None:
         delta = (ceasefire_sec - calc[0][1])  # 正負OK
         calc = [(pl, (sec + delta) % (24*3600)) for (pl, sec) in calc]
-        # 念のため先頭は停戦終了に合わせる
+        # 先頭は停戦終了に合わせる
         calc[0] = (calc[0][0], ceasefire_sec % (24*3600))
 
     # 出力整形
@@ -411,8 +418,6 @@ def build_result_message(server: Optional[str],
                          cease_str: Optional[str],
                          results: List[Tuple[int, str]]) -> str:
     # 例） ✅ 解析完了！⏱️ 基準時間:17:26:45 (21:07:21)
-    #      1296-2-21:07:21
-    #      ...
     if not base_str or not results or not server:
         return "⚠️ 解析完了… ですが計算できませんでした。画像やOCR結果をご確認ください。"
 
@@ -495,14 +500,8 @@ async def oaiocr(ctx: commands.Context):
         final_img.convert("RGB").save(out_buf, format="PNG")
         out_buf.seek(0)
 
-        sent_buf = io.BytesIO(sent_png)
-        sent_buf.seek(0)
-
-        files = [
-            discord.File(out_buf, filename="result.png"),
-            discord.File(sent_buf, filename="sent_to_openai.png"),
-        ]
-        await ctx.reply(content=message, files=files)
+        # 画像は1枚だけ返す（sent_to_openai.png は送らない）
+        await ctx.reply(content=message, file=discord.File(out_buf, filename="result.png"))
 
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
