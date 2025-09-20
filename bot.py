@@ -215,7 +215,7 @@ def draw_black_bars_for_7(pil_im: Image.Image) -> Image.Image:
         else:
             top = start
 
-        bottom = max(top, end - MARGIN_BEFORE_NEXT)
+        bottom = max(top, end - MARGIN_BEFORE_NEXT_TITLE)
         if bottom > top:
             draw.rectangle([(0, top), (w, bottom)], fill=(0, 0, 0, 255))
 
