@@ -86,14 +86,12 @@ TRIM_RULES = {
 
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")
 
-# タイトル系（解析用=一文字でもOK／圧縮用=形）
-RE_TITLE_PARSE = re.compile(r"[越域駐驻戦戰闘场場]")  # ← 一文字一致
+# タイトル系（圧縮用=形）
 RE_TITLE_COMPACT = re.compile(r"(?:越\s*域|戦\s*闘)\s*駐[\u4E00-\u9FFF]{0,3}\s*場")
 
 # 時刻検出
-# きっちり（従来）
 RE_TIME_STRICT = re.compile(r"\d{1,2}[：:]\d{2}(?:[：:]\d{2})?")
-# 緩め（区切りに . ・ / などや空白を許容。分/秒が1桁でもOK）← 一文字一致イメージ
+# 緩め（区切りに . ・ / などや空白を許容。分/秒が1桁でもOK）
 RE_TIME_LOOSE  = re.compile(
     r"\d{1,2}\s*[：:\.\-・／/]\s*\d{1,2}(?:\s*[：:\.\-・／/]\s*\d{1,2})?"
 )
@@ -135,13 +133,35 @@ def _extract_time_like(s: str) -> Optional[str]:
     if len(parts) < 2 or len(parts) > 3:
         return None
 
-    # 0埋め整形
-    a = parts[0]  # H or HH / or MM when prefer_mmss=True で使う
+    a = parts[0]
     b = parts[1].zfill(2)
     if len(parts) == 3:
         c = parts[2].zfill(2)
         return f"{a}:{b}:{c}"
     return f"{a}:{b}"
+
+def _extract_place(line: str) -> Optional[int]:
+    """
+    タイトル行から駐騎場ナンバーだけを抽出。
+    条件:
+      - 行に「場/场」と、かつ「越/域/駐/驻/戦/戰/闘」のいずれかを含む
+      - 行に「免戦」を含まない（免戦中行は除外）
+      - 「場」の直後にある 1-3 桁の数字のみ採用（行末数字のフォールバックはしない）
+    """
+    s = unicodedata.normalize("NFKC", line)
+    if "免戦" in s:
+        return None
+    if not re.search(r"[场場]", s):
+        return None
+    if not re.search(r"[越域駐驻戦戰闘]", s):
+        return None
+    m = re.search(r"[场場]\s*([0-9]{1,3})\b", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
 
 # ---------------------------
 # スケジューラ（一覧ボード＋⏰通知）
@@ -652,14 +672,10 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
             if tt:
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
 
-        # title: 越/域/駐/戦/闘/場 のいずれかを含む行を候補とし、末尾の番号を拾う
-        if RE_TITLE_PARSE.search(n):
-            m_num = re.search(r"場\s*([0-9]{1,3})", raw)
-            if not m_num:
-                m_num = re.search(r"([0-9]{1,3})\s*$", raw)
-            if m_num:
-                place = int(m_num.group(1))
-                pairs.append((place, None))
+        # place: タイトル行から「場」の直後の数字のみ採用（免戦行は除外、終端数字フォールバック無し）
+        pl = _extract_place(raw)
+        if pl is not None:
+            pairs.append((pl, None))
 
         # immune time: 「免戦」を含む行の時刻らしきもの（MM:SS 解釈）
         if "免戦" in n:
