@@ -35,6 +35,8 @@ if GOOGLE_CLOUD_VISION_JSON:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
 gcv_client = vision.ImageAnnotatorClient()
+print(f"✅ google-cloud-vision {vision.__version__} ready")  # ← 追加
+
 oai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------
