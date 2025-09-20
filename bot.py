@@ -103,15 +103,18 @@ def _next_occurrence_today_or_tomorrow(hms: str) -> datetime:
     return candidate
 
 def _render_schedule_board() -> str:
-    """スケジュール一覧のテキストを生成（時間順）"""
+    """
+    通知チャンネルのスケジュール表示:
+      - 予定あり:   「今後のスケジュール」+ 行ごと表示
+      - 予定なし:   「今後のスケジュール\n登録された予定がありません」
+    """
     if not SCHEDULE:
-        return f"🗓️ スケジュール（{TIMEZONE.key}）\n（予定はありません）"
+        return "今後のスケジュール\n登録された予定がありません"
     lines = []
     for item in SCHEDULE:
         t = item["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
-        lines.append(f"{t}  {item['server']}-{item['place']}")
-    body = "\n".join(lines)
-    return f"🗓️ スケジュール（{TIMEZONE.key}）\n```\n{body}\n```"
+        lines.append(f"・{t}  {item['server']}-{item['place']}")
+    return "今後のスケジュール\n" + "\n".join(lines)
 
 async def _ensure_schedule_message(channel: discord.TextChannel) -> None:
     """一覧の固定メッセージを作成/更新"""
@@ -530,7 +533,9 @@ def build_result_message(server: Optional[str],
 
     head = f"✅ 解析完了！⏱️ 基準時間:{base_str}"
     if cease_str:
-        head += f" ({cease_str})"
+        head += f" ({cecease_str})"  # ← typo 修正: 直下で正しい行を上書き
+    # 正しい行
+    head = f"✅ 解析完了！⏱️ 基準時間:{base_str}" + (f" ({cease_str})" if cease_str else "")
 
     body_lines = [f"{server}-{pl}-{t}" for (pl, t) in results]
     return head + "\n" + "\n".join(body_lines)
@@ -692,22 +697,22 @@ async def on_message(message: discord.Message):
             pass
 
 # ---------------------------
-# Ping
+# Ping / Ready
 # ---------------------------
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     await ctx.reply("pong 🏓")
 
-# ---------------------------
-# Run
-# ---------------------------
-
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (tz={TIMEZONE.key})")
     if not scheduler_tick.is_running():
         scheduler_tick.start()
+
+# ---------------------------
+# Run
+# ---------------------------
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
