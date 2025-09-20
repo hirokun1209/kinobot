@@ -80,22 +80,68 @@ TRIM_RULES = {
     2: (75.98, 10.73), # 時計
 }
 
-# 正規表現
+# ---------------------------
+# 正規表現 / ルール
+# ---------------------------
+
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")
 
-# 解析用タイトル判定（1文字でもOK／誤OCR含む）
-# 例: 越, 域, 駐(驻), 戦(戰), 闘, 場(场) のどれか1文字が含まれれば“候補”
-RE_TITLE_PARSE = re.compile(r"[越域駐驻戦戰闘场場]")
-
-# 画像圧縮用タイトル判定（やや厳しめ：語としての形）
-# 「越域駐〇場」や「戦闘駐〇場」などを想定（OCRの空白揺れ許容）
+# タイトル系（解析用=一文字でもOK／圧縮用=形）
+RE_TITLE_PARSE = re.compile(r"[越域駐驻戦戰闘场場]")  # ← 一文字一致
 RE_TITLE_COMPACT = re.compile(r"(?:越\s*域|戦\s*闘)\s*駐[\u4E00-\u9FFF]{0,3}\s*場")
 
-RE_TIME   = re.compile(r"\d{1,2}[:：]\d{2}(?:[:：]\d{2})?")
+# 時刻検出
+# きっちり（従来）
+RE_TIME_STRICT = re.compile(r"\d{1,2}[：:]\d{2}(?:[：:]\d{2})?")
+# 緩め（区切りに . ・ / などや空白を許容。分/秒が1桁でもOK）← 一文字一致イメージ
+RE_TIME_LOOSE  = re.compile(
+    r"\d{1,2}\s*[：:\.\-・／/]\s*\d{1,2}(?:\s*[：:\.\-・／/]\s*\d{1,2})?"
+)
+
 RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")
 
 # フォールバック：ブロック高さに対する“必ず残す”上部割合
 FALLBACK_KEEP_TOP_RATIO = 0.35
+
+def _has_time_like(s: str) -> bool:
+    """行に“時刻っぽい”表記があるか（緩め判定）"""
+    s = unicodedata.normalize("NFKC", s)
+    return bool(RE_TIME_STRICT.search(s) or RE_TIME_LOOSE.search(s))
+
+def _extract_time_like(s: str) -> Optional[str]:
+    """
+    行から時刻らしきものを1つ抽出（厳密→緩めの順）。
+    抽出したら区切りを : に統一し、MM/SS が1桁なら0埋めして返す。
+    例）"7:5" -> "7:05", "7・5・3" -> "7:05:03"
+    """
+    if not s:
+        return None
+    s = unicodedata.normalize("NFKC", s)
+    # 区切りを : に寄せる
+    s = re.sub(r"[．。·•･・／/]", ":", s)
+    s = re.sub(r"\s+", "", s)
+
+    m = RE_TIME_STRICT.search(s)
+    if not m:
+        m = RE_TIME_LOOSE.search(s)
+    if not m:
+        return None
+
+    raw = m.group(0)
+    raw = re.sub(r"[．。·•･・／/]", ":", raw)
+    raw = re.sub(r"\s+", "", raw)
+
+    parts = re.split(r"[：:]", raw)
+    if len(parts) < 2 or len(parts) > 3:
+        return None
+
+    # 0埋め整形
+    a = parts[0]  # H or HH / or MM when prefer_mmss=True で使う
+    b = parts[1].zfill(2)
+    if len(parts) == 3:
+        c = parts[2].zfill(2)
+        return f"{a}:{b}:{c}"
+    return f"{a}:{b}"
 
 # ---------------------------
 # スケジューラ（一覧ボード＋⏰通知）
@@ -395,7 +441,6 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
     for txt, (x1, y1, x2, y2) in words:
         cy = (y1 + y2) / 2.0
         items.append((cy, x1, y1, x2, y2, txt))
-        # x1で安定ソート
     items.sort(key=lambda t: (t[0], t[1]))
 
     lines: List[List[Tuple[int,int,int,int,str]]] = []
@@ -415,7 +460,7 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
     line_boxes: List[Tuple[str, Tuple[int,int,int,int]]] = []
     for chunks in lines:
         chunks.sort(key=lambda a: a[0])  # x1
-        text = "".join(c[4] for c in chunks)  # スペース無しで連結（_normで更に整形）
+        text = "".join(c[4] for c in chunks)  # スペース無しで連結
         x1 = min(c[0] for c in chunks)
         y1 = min(c[1] for c in chunks)
         x2 = max(c[2] for c in chunks)
@@ -439,7 +484,7 @@ def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
         t = _norm(text)
         if RE_TITLE_COMPACT.search(t):
             titles.append((y1, y2))
-        if RE_IMMUNE.search(t) or RE_TIME.search(t):
+        if _has_time_like(t) or RE_IMMUNE.search(t):
             candidates.append((y1, y2))
 
     titles.sort(key=lambda p: p[0])
@@ -558,8 +603,8 @@ def _time_to_seconds(t: str, *, prefer_mmss: bool = False) -> int:
     if m2:
         a, b = map(int, m2.groups())
         if prefer_mmss:
-            return a*60 + b      # MM:SS（例: 58:40 -> 00:58:40）
-        return a*3600 + b*60     # HH:MM（基準/停戦）
+            return a*60 + b      # MM:SS
+        return a*3600 + b*60     # HH:MM
     return 0
 
 def _seconds_to_hms(sec: int) -> str:
@@ -585,28 +630,25 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
 
     pairs: List[Tuple[int, Optional[int]]] = []  # (place, immune_sec)
 
-    def find_time_in_text(txt: str) -> Optional[str]:
-        m = RE_TIME.search(txt)
-        return m.group(0).replace("：", ":") if m else None
-
     # 1周: サーバー / 基準 / 停戦終了 / 越域駐〇場 + 免戦 を順に拾う
     for raw in lines:
         n = _norm(raw)
+
         # server
         if server is None:
             m = RE_SERVER.search(n)
             if m:
                 server = m.group(1)
 
-        # ceasefire: 行内に「停戦」があればその行の時刻
+        # ceasefire（行内に「停戦」キーワードがあれば、その行の時刻らしきもの）
         if "停戦" in n:
-            tt = find_time_in_text(raw)
+            tt = _extract_time_like(raw)
             if tt:
                 ceasefire_sec = _time_to_seconds(tt, prefer_mmss=False)
 
-        # base_time: 「免戦」「停戦」を含まない最初の時刻
+        # base_time: 「免戦」「停戦」を含まない行の最初の時刻らしきもの
         if base_time_sec is None and ("免戦" not in n and "停戦" not in n):
-            tt = find_time_in_text(raw)
+            tt = _extract_time_like(raw)
             if tt:
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
 
@@ -619,9 +661,9 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
                 place = int(m_num.group(1))
                 pairs.append((place, None))
 
-        # immune time（2 区切りは MM:SS として解釈）
+        # immune time: 「免戦」を含む行の時刻らしきもの（MM:SS 解釈）
         if "免戦" in n:
-            tt = find_time_in_text(raw)
+            tt = _extract_time_like(raw)
             if tt:
                 tsec = _time_to_seconds(tt, prefer_mmss=True)
                 # 直近の未設定ペアに充当
