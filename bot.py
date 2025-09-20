@@ -61,7 +61,7 @@ TRIM_RULES = {
 
 # 正規表現（OCR解析兼 詰め処理）
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")
-RE_TITLE  = re.compile(r"越\s*域\s*駐\s*[騎機車]\s*場")
+RE_TITLE  = re.compile(r"越\s*域\s*駐[\u4E00-\u9FFF]{1,3}\s*場")
 
 # 余白（必要なら調整）
 MARGIN_AFTER_IMMUNE = 0           # 免戦中の直下 +0px（＝下端から）
