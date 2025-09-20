@@ -206,6 +206,8 @@ async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
 # ---------------------------
 
 SCHEDULE_LOCK = asyncio.Lock()
+COPY_LOCK = asyncio.Lock()  # コピーCHの並べ替え挿入を直列化
+
 # item: {
 #   "when": datetime, "server": str, "place": int, "timestr": "HH:MM:SS",
 #   "key": (server, place, timestr),
@@ -302,6 +304,161 @@ async def _delete_copy_message_if_exists(it: Dict):
     finally:
         it["copy_msg_id"] = None
 
+# ---- ここから：コピーCHの安全な“割り込み挿入”ロジック ----
+
+def _fmt_copy_line(it: Dict) -> str:
+    return f"{it['server']}-{it['place']}-{it['timestr']}"
+
+async def _insert_copy_sorted(new_items: List[Dict]):
+    """
+    既存のコピーCHメッセージ列に、new_items を時間順で“割り込み”挿入。
+    アルゴリズム：
+      1) SCHEDULE は既に when 昇順に並んでいる前提
+      2) 各 new_item について、その位置 idx 以降で最初に copy_msg_id を持つ item を target とする
+      3) target のメッセージ内容を new_item に“置換編集”
+      4) 置き換えで“押し出された”テキストを、次の item のメッセージに編集…を連鎖
+         途中でメッセージが無い箇所/末尾に来たら send() で新規発行して終了
+    競合は COPY_LOCK で直列化する
+    """
+    if not COPY_CHANNEL_ID or not new_items:
+        return
+    ch = await _get_text_channel(COPY_CHANNEL_ID)
+    if not ch:
+        return
+
+    # 時間順で処理
+    new_items = sorted(new_items, key=lambda x: x["when"])
+
+    async with COPY_LOCK:
+        for it in new_items:
+            line_new = _fmt_copy_line(it)
+
+            # SCHEDULE のスナップショット & 自分の位置と target を特定
+            async with SCHEDULE_LOCK:
+                sched = list(SCHEDULE)
+                try:
+                    idx = next(i for i, x in enumerate(sched) if tuple(x["key"]) == tuple(it["key"]))
+                except StopIteration:
+                    # 見つからないなら末尾扱いで送る
+                    idx = len(sched)
+
+            # idx 以降で最初に copy_msg_id を持つ item を探す
+            target = None
+            for k in range(idx, len(sched)):
+                if sched[k].get("copy_msg_id"):
+                    target = (k, sched[k])
+                    break
+
+            if not target:
+                # 末尾に新規送信
+                try:
+                    msg = await ch.send(line_new)
+                    async with SCHEDULE_LOCK:
+                        it["copy_msg_id"] = msg.id
+                except Exception as e:
+                    print(f"[copy] send failed (tail): {e}")
+                continue
+
+            k, tgt_item = target
+            target_msg_id = tgt_item["copy_msg_id"]
+
+            # 1) target を new に置換
+            try:
+                msg_obj = await ch.fetch_message(target_msg_id)
+            except Exception as e:
+                print(f"[copy] fetch target failed: {e}")
+                # ターゲットが消えてたら普通に送る
+                try:
+                    msg = await ch.send(line_new)
+                    async with SCHEDULE_LOCK:
+                        it["copy_msg_id"] = msg.id
+                except Exception as e2:
+                    print(f"[copy] fallback send failed: {e2}")
+                continue
+
+            carry_text = msg_obj.content  # 押し出される本文
+            carry_item = tgt_item
+
+            try:
+                await msg_obj.edit(content=line_new)
+                async with SCHEDULE_LOCK:
+                    it["copy_msg_id"] = msg_obj.id   # msg_id は新アイテムに紐付け直し
+                    carry_item["copy_msg_id"] = None  # 押し出されたアイテムは一旦未割当
+            except Exception as e:
+                print(f"[copy] edit target failed: {e}")
+                # 置換失敗なら新規送信
+                try:
+                    msg = await ch.send(line_new)
+                    async with SCHEDULE_LOCK:
+                        it["copy_msg_id"] = msg.id
+                except Exception as e2:
+                    print(f"[copy] fallback send failed2: {e2}")
+                continue
+
+            # 2) 連鎖で後続へ押し出し
+            pos = k + 1
+            while True:
+                async with SCHEDULE_LOCK:
+                    next_item = SCHEDULE[pos] if pos < len(SCHEDULE) else None
+                    next_msg_id = next_item.get("copy_msg_id") if next_item else None
+
+                if not next_item:
+                    # 末尾まで到達 → 新規送信
+                    try:
+                        msg2 = await ch.send(carry_text)
+                        async with SCHEDULE_LOCK:
+                            carry_item["copy_msg_id"] = msg2.id
+                    except Exception as e:
+                        print(f"[copy] chain tail send failed: {e}")
+                    break
+
+                if not next_msg_id:
+                    # 次のアイテムにメッセージが無い → ここで新規送信して終了
+                    try:
+                        msg2 = await ch.send(carry_text)
+                        async with SCHEDULE_LOCK:
+                            carry_item["copy_msg_id"] = msg2.id
+                    except Exception as e:
+                        print(f"[copy] chain send(no next id) failed: {e}")
+                    break
+
+                # 次メッセージを編集して、内容をさらに押し出す
+                try:
+                    next_msg = await ch.fetch_message(next_msg_id)
+                except Exception as e:
+                    print(f"[copy] fetch next failed: {e}")
+                    # 取得できなければ新規送信で終了
+                    try:
+                        msg2 = await ch.send(carry_text)
+                        async with SCHEDULE_LOCK:
+                            carry_item["copy_msg_id"] = msg2.id
+                    except Exception as e2:
+                        print(f"[copy] chain tail send2 failed: {e2}")
+                    break
+
+                prev_text = next_msg.content
+                try:
+                    await next_msg.edit(content=carry_text)
+                    async with SCHEDULE_LOCK:
+                        carry_item["copy_msg_id"] = next_msg.id
+                except Exception as e:
+                    print(f"[copy] edit next failed: {e}")
+                    # 編集が失敗 → 新規送信で終了
+                    try:
+                        msg2 = await ch.send(carry_text)
+                        async with SCHEDULE_LOCK:
+                            carry_item["copy_msg_id"] = msg2.id
+                    except Exception as e2:
+                        print(f"[copy] chain fallback send failed: {e2}")
+                    break
+
+                # 次へ
+                carry_text = prev_text
+                carry_item = next_item
+                pos += 1
+
+# ---- ここまで：コピーCHの安全な“割り込み挿入”ロジック ----
+
 async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     """
     pairs: [(server, place, timestr)]
@@ -309,7 +466,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
       ※ 同一バッチ内の重複も除去
     - 追加して時間順に整列
     - 通知ボードを更新
-    - コピー専用チャンネルへは**即時通知**（登録時に都度送信）、時間が過ぎたら削除
+    - コピー専用チャンネルへは**時間順で割り込み**（編集＋必要分だけ新規送信）
     """
     if not pairs:
         print("[add] no pairs")
@@ -349,18 +506,8 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
         SCHEDULE.sort(key=lambda x: x["when"])
         _recompute_skip2m_flags()
 
-    # コピー専用チャンネルに即時通知（送れたら message_id を保持）
-    if COPY_CHANNEL_ID:
-        ch = await _get_text_channel(COPY_CHANNEL_ID)
-        if ch:
-            for it in new_items:
-                content = f"📌 登録: **{it['server']}-{it['place']}-{it['timestr']}**"
-                try:
-                    msg = await ch.send(content)
-                    async with SCHEDULE_LOCK:
-                        it["copy_msg_id"] = msg.id
-                except Exception as e:
-                    print(f"[copy] send failed: {e}")
+    # コピー専用チャンネル：安全に割り込み挿入（編集＋最小限の新規送信）
+    await _insert_copy_sorted(new_items)
 
     # 通知ボード更新（既存メッセージを編集）
     await _refresh_board()
@@ -880,7 +1027,7 @@ async def oaiocr(ctx: commands.Context):
         if fileobj:
             await ctx.send(file=fileobj)
 
-        # スケジュール登録＋ボード更新＋コピー即時通知
+        # スケジュール登録＋ボード更新＋コピー即時通知（割り込み挿入）
         if pairs:
             await add_events_and_refresh_board(pairs)
 
@@ -918,7 +1065,7 @@ async def on_message(message: discord.Message):
             # プレースホルダを編集（解析完了通知）
             await placeholder.edit(content=result_text)
 
-            # スケジュール登録＋ボード更新＋コピー即時通知
+            # スケジュール登録＋ボード更新＋コピー即時通知（割り込み挿入）
             if pairs:
                 await add_events_and_refresh_board(pairs)
 
