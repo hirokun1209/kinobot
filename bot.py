@@ -62,9 +62,10 @@ TRIM_RULES = {
 # 正規表現
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")                         # 「免戦中」
 RE_TITLE  = re.compile(r"越\s*域\s*駐\s*[騎機]\s*場")             # 「越域駐騎場/越域駐機場」
+RE_TIME   = re.compile(r"\d{1,2}[:：]\d{2}(?:[:：]\d{2})?")       # 05:53 / 01:02:13 など（全角コロン対応）
 
 # 余白（必要なら調整）
-MARGIN_AFTER_IMMUNE = 0           # 免戦中の直下 +0px（ご要望どおり“下端から”）
+MARGIN_AFTER_IMMUNE = 0           # 免戦中（や時間）の直下 +0px（“下端から”塗り開始）
 MARGIN_BEFORE_NEXT_TITLE = 0      # 次タイトル直上 -0px
 
 # ---------------------------
@@ -120,56 +121,68 @@ def google_ocr_word_boxes(pil_im: Image.Image) -> List[Tuple[str, Tuple[int,int,
                     words.append((txt, (x1, y1, x2, y2)))
     return words
 
-def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 14) -> List[Tuple[str, Tuple[int,int,int,int]]]:
+def _words_to_lines(words: List[Tuple[str, Tuple[int,int,int,int]]],
+                    y_tol: int) -> List[Tuple[str, Tuple[int,int,int,int]]]:
+    """
+    words: [(text, (x1,y1,x2,y2)), ...] を y中心の近さで行にまとめる
+    戻り:  [(joined_text, (x1,y1,x2,y2)), ...] 上から順
+    """
+    if not words:
+        return []
+    # y中心でソート
+    words = sorted(words, key=lambda w: ( (w[1][1]+w[1][3])//2, w[1][0] ))
+    lines = []
+    cur = []
+
+    def flush():
+        if not cur: return
+        xs = [b[0] for _,b in cur] + [b[2] for _,b in cur]
+        ys = [b[1] for _,b in cur] + [b[3] for _,b in cur]
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        text = "".join(t for t,_ in sorted(cur, key=lambda w: w[1][0]))  # 日本語は空白無しでOK
+        lines.append((text, (x1,y1,x2,y2)))
+
+    # 行クラスタ
+    base_y = None
+    for t, (x1,y1,x2,y2) in words:
+        yc = (y1+y2)//2
+        if base_y is None:
+            base_y = yc
+            cur = [(t,(x1,y1,x2,y2))]
+            continue
+        if abs(yc - base_y) <= y_tol:
+            cur.append((t,(x1,y1,x2,y2)))
+        else:
+            flush()
+            base_y = yc
+            cur = [(t,(x1,y1,x2,y2))]
+    flush()
+
+    # 上から順
+    return sorted(lines, key=lambda it: it[1][1])
+
+def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = None) -> List[Tuple[str, Tuple[int,int,int,int]]]:
     """
     wordをY座標で行グループ化して (line_text, (x1,y1,x2,y2)) を返す。
-    y_tol は同一行とみなす上下許容ピクセル。
+    y_tol は同一行とみなす上下許容ピクセル（デフォは高さの1% or 最低8px）
     """
     words = google_ocr_word_boxes(pil_im)
     if not words:
         return []
-
-    # 中心Yでソート
-    items = []
-    for txt, (x1, y1, x2, y2) in words:
-        cy = (y1 + y2) / 2.0
-        items.append((cy, x1, y1, x2, y2, txt))
-    items.sort(key=lambda t: (t[0], t[1]))
-
-    lines: List[List[Tuple[int,int,int,int,str]]] = []
-    for cy, x1, y1, x2, y2, txt in items:
-        if not lines:
-            lines.append([(x1, y1, x2, y2, txt)])
-            continue
-        # 直近行の代表cyと比較
-        last = lines[-1]
-        ly1 = min(a[1] for a in last)
-        ly2 = max(a[3] for a in last)
-        lcy = (ly1 + ly2) / 2.0
-        if abs(cy - lcy) <= y_tol:
-            last.append((x1, y1, x2, y2, txt))
-        else:
-            lines.append([(x1, y1, x2, y2, txt)])
-
-    line_boxes: List[Tuple[str, Tuple[int,int,int,int]]] = []
-    for chunks in lines:
-        chunks.sort(key=lambda a: a[0])  # x1
-        text = "".join(c[4] for c in chunks)  # スペース無しで連結（日本語はこれでOK）
-        x1 = min(c[0] for c in chunks)
-        y1 = min(c[1] for c in chunks)
-        x2 = max(c[2] for c in chunks)
-        y2 = max(c[3] for c in chunks)
-        line_boxes.append((text, (x1, y1, x2, y2)))
-    return line_boxes
+    if y_tol is None:
+        y_tol = max(8, int(round(pil_im.height * 0.01)))
+    return _words_to_lines(words, y_tol)
 
 def draw_black_bars_for_7(pil_im: Image.Image) -> Image.Image:
     """
     7番ブロック内で、
       ・各「越域駐騎(機)場」行をタイトルとみなす
       ・タイトルiの下端 〜 タイトルi+1の上端 を“ワンブロック”
-      ・そのブロックに「免戦中」があれば「免戦中」の下端＋MARGIN_AFTER_IMMUNE 〜 次タイトル上端−MARGIN_BEFORE_NEXT を黒塗り
-      ・免戦中が無ければ タイトルiの下端 〜 次タイトル上端 を黒塗り
-      ・最後のブロックは下端まで
+      ・ブロック内に「免戦中」または「時刻(05:53/01:02:13等)」があれば、
+         その“最後に出る行”の下端＋MARGIN_AFTER_IMMUNE から塗る
+      ・どちらも無ければ タイトルiの下端 から塗る
+      ・塗りの終端は 次タイトルの上端−MARGIN_BEFORE_NEXT_TITLE（最後のブロックは画像の下端）
     """
     im = pil_im.copy()
     draw = ImageDraw.Draw(im)
@@ -177,45 +190,39 @@ def draw_black_bars_for_7(pil_im: Image.Image) -> Image.Image:
 
     lines = google_ocr_line_boxes(im)
 
-    # タイトル行と免戦行のY範囲を抽出
+    # タイトル行と「免戦中/時刻」行のY範囲を抽出
     titles: List[Tuple[int,int]] = []   # (top, bottom)
-    immunes: List[Tuple[int,int]] = []  # (top, bottom)
+    info_rows: List[Tuple[int,int]] = []  # (top, bottom)
 
     for text, (x1, y1, x2, y2) in lines:
         t = text.replace(" ", "")
         if RE_TITLE.search(t):
             titles.append((y1, y2))
-        if RE_IMMUNE.search(t):
-            immunes.append((y1, y2))
+        if RE_IMMUNE.search(t) or RE_TIME.search(text):
+            info_rows.append((y1, y2))
 
-    # Yで整列
     titles.sort(key=lambda p: p[0])
-    immunes.sort(key=lambda p: p[0])
+    info_rows.sort(key=lambda p: p[0])
 
     if not titles:
-        # タイトルが取れなかったら何もしない（安全側）
-        return im
+        return im  # タイトルが無いときは何もしない
 
-    # 各ブロックで黒塗り範囲を決定・描画
+    # 各ブロックで黒塗り
     for i, (t_y1, t_y2) in enumerate(titles):
-        start = t_y2  # タイトルの下端
-        end = titles[i + 1][0] if i + 1 < len(titles) else h  # 次タイトルの上端 or 画像下端
-
+        start = t_y2  # タイトル下端
+        end = titles[i + 1][0] if i + 1 < len(titles) else h  # 次タイトル上端 or 下端
         if end <= start:
             continue
 
-        # このブロック内の「免戦中」を探す（最後に出るものを優先）
-        immune_bottom_in_block = None
-        for iy1, iy2 in immunes:
+        # ブロック内の info_rows の“最後（最下部）”を採用
+        info_bottom = None
+        for iy1, iy2 in info_rows:
             if start <= iy1 < end:
-                immune_bottom_in_block = iy2  # 最後にヒットしたものが残る
+                info_bottom = iy2
 
-        if immune_bottom_in_block is not None:
-            top = immune_bottom_in_block + MARGIN_AFTER_IMMUNE
-        else:
-            top = start
-
+        top = (info_bottom + MARGIN_AFTER_IMMUNE) if info_bottom is not None else start
         bottom = max(top, end - MARGIN_BEFORE_NEXT_TITLE)
+
         if bottom > top:
             draw.rectangle([(0, top), (w, bottom)], fill=(0, 0, 0, 255))
 
@@ -324,7 +331,8 @@ async def oaiocr(ctx: commands.Context):
         final_img.convert("RGB").save(out_buf, format="PNG")
         out_buf.seek(0)
 
-        sent_buf = io.BytesIO(sent_png); sent_buf.seek(0)
+        sent_buf = io.BytesIO(sent_png)
+        sent_buf.seek(0)
 
         files = [
             discord.File(out_buf, filename="result.png"),
