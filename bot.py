@@ -7,7 +7,7 @@ import unicodedata
 from typing import List, Tuple, Dict, Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from PIL import Image, ImageDraw, ImageOps
 
 # Google Vision
@@ -31,7 +31,7 @@ GOOGLE_CLOUD_VISION_JSON = os.environ.get("GOOGLE_CLOUD_VISION_JSON", "")
 INPUT_CHANNEL_IDS = {
     int(x) for x in os.environ.get("INPUT_CHANNEL_IDS", "").split(",") if x.strip().isdigit()
 }
-# 通知を投げるチャンネル
+# 通知を投げるチャンネル（スケジュール一覧＋⏰発火）
 NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or 0)
 # タイムゾーン（例: Asia/Tokyo）
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tokyo"))
@@ -85,8 +85,104 @@ RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")                 # [s1296
 # フォールバック：ブロック高さに対する“必ず残す”上部割合
 FALLBACK_KEEP_TOP_RATIO = 0.35
 
-# スケジュールタスク保持（GC防止）
-SCHEDULED_TASKS: List[asyncio.Task] = []
+# ---------------------------
+# スケジューラ（一覧ボード＋⏰通知）
+# ---------------------------
+
+SCHEDULE_LOCK = asyncio.Lock()
+SCHEDULE: List[Dict] = []           # {when(dt), server, place, timestr}
+SCHEDULE_MSG_ID: Optional[int] = None  # 通知チャンネルに置く一覧メッセージID
+
+def _next_occurrence_today_or_tomorrow(hms: str) -> datetime:
+    """今日のその時刻、過ぎていれば翌日の同時刻（TZ考慮）"""
+    now = datetime.now(TIMEZONE)
+    hh, mm, ss = map(int, hms.split(":"))
+    candidate = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+def _render_schedule_board() -> str:
+    """スケジュール一覧のテキストを生成（時間順）"""
+    if not SCHEDULE:
+        return f"🗓️ スケジュール（{TIMEZONE.key}）\n（予定はありません）"
+    lines = []
+    for item in SCHEDULE:
+        t = item["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
+        lines.append(f"{t}  {item['server']}-{item['place']}")
+    body = "\n".join(lines)
+    return f"🗓️ スケジュール（{TIMEZONE.key}）\n```\n{body}\n```"
+
+async def _ensure_schedule_message(channel: discord.TextChannel) -> None:
+    """一覧の固定メッセージを作成/更新"""
+    global SCHEDULE_MSG_ID
+    content = _render_schedule_board()
+    if SCHEDULE_MSG_ID is None:
+        msg = await channel.send(content)
+        SCHEDULE_MSG_ID = msg.id
+    else:
+        try:
+            msg = await channel.fetch_message(SCHEDULE_MSG_ID)
+            await msg.edit(content=content)
+        except discord.NotFound:
+            msg = await channel.send(content)
+            SCHEDULE_MSG_ID = msg.id
+
+async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
+    """
+    pairs: [(server, place, timestr)]
+    - 追加して時間順に整列
+    - 通知チャンネルに一覧を即時表示/更新
+    """
+    if NOTIFY_CHANNEL_ID == 0:
+        return
+    channel = bot.get_channel(NOTIFY_CHANNEL_ID) or await bot.fetch_channel(NOTIFY_CHANNEL_ID)  # type: ignore
+    if not isinstance(channel, discord.TextChannel):
+        return
+    async with SCHEDULE_LOCK:
+        for server, place, timestr in pairs:
+            when = _next_occurrence_today_or_tomorrow(timestr)
+            SCHEDULE.append({
+                "when": when,
+                "server": server,
+                "place": place,
+                "timestr": timestr,
+            })
+        SCHEDULE.sort(key=lambda x: x["when"])
+        await _ensure_schedule_message(channel)
+
+@tasks.loop(seconds=1.0)
+async def scheduler_tick():
+    """毎秒チェックして到達したものを通知し、一覧から消して編集。"""
+    if NOTIFY_CHANNEL_ID == 0:
+        return
+    channel = bot.get_channel(NOTIFY_CHANNEL_ID)  # type: ignore
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    now = datetime.now(TIMEZONE)
+    fired: List[Dict] = []
+    async with SCHEDULE_LOCK:
+        remain = []
+        for item in SCHEDULE:
+            if item["when"] <= now:
+                fired.append(item)
+            else:
+                remain.append(item)
+        if fired:
+            SCHEDULE[:] = remain
+
+    if fired:
+        # ⏰通知を出す
+        for it in fired:
+            await channel.send(f"⏰ 通知: **{it['server']}-{it['place']}-{it['timestr']}** になりました！")
+        # 一覧を更新
+        async with SCHEDULE_LOCK:
+            await _ensure_schedule_message(channel)
+
+@scheduler_tick.before_loop
+async def before_scheduler():
+    await bot.wait_until_ready()
 
 # ---------------------------
 # Helpers（画像系）
@@ -466,47 +562,7 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, 
     server, base_str, cease_str, results = parse_and_compute(oai_text)
     message = build_result_message(server, base_str, cease_str, results)
 
-    return final_img, message, server or "", results
-
-# ---------------------------
-# スケジューラ
-# ---------------------------
-
-def _next_occurrence_today_or_tomorrow(hms: str) -> datetime:
-    """今日のその時刻、過ぎていれば翌日の同時刻（TZ考慮）"""
-    now = datetime.now(TIMEZONE)
-    hh, mm, ss = map(int, hms.split(":"))
-    candidate = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
-
-async def _schedule_message(channel_id: int, when_dt: datetime, content: str):
-    """指定時刻にメッセージを投げる"""
-    async def _runner():
-        try:
-            while True:
-                now = datetime.now(TIMEZONE)
-                delay = (when_dt - now).total_seconds()
-                if delay <= 0:
-                    break
-                await asyncio.sleep(min(delay, 60))  # 1分刻みで近づく（長時間sleepの安全策）
-            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-            await channel.send(content)
-        except Exception as e:
-            print(f"[scheduler] error: {e}")
-
-    task = asyncio.create_task(_runner())
-    SCHEDULED_TASKS.append(task)
-
-def schedule_notifications(server: str, results: List[Tuple[int, str]]):
-    """結果の各時刻を通知専用チャンネルへスケジュール登録"""
-    if NOTIFY_CHANNEL_ID <= 0 or not server or not results:
-        return
-    for place, hms in results:
-        when_dt = _next_occurrence_today_or_tomorrow(hms)
-        content = f"⏰ 通知: **{server}-{place}-{hms}** になりました！"
-        _schedule_message(NOTIFY_CHANNEL_ID, when_dt, content)
+    return final_img, message, (server or ""), results
 
 # ---------------------------
 # 共通実行（複数画像対応）
@@ -520,12 +576,17 @@ def _is_image_attachment(a: discord.Attachment) -> bool:
         return True
     return a.filename.lower().endswith(IMAGE_EXTS)
 
-async def run_pipeline_for_attachments(atts: List[discord.Attachment], *, want_image: bool) -> Tuple[Optional[discord.File], str]:
-    """複数画像を処理。want_image=True の時は画像1枚（縦結合）を返す。"""
+async def run_pipeline_for_attachments(atts: List[discord.Attachment], *, want_image: bool) -> Tuple[Optional[discord.File], str, List[Tuple[str, int, str]]]:
+    """
+    複数画像を処理。
+    return:
+      - fileobj: 画像を返す場合は1枚（縦結合）
+      - message: 全結果の連結テキスト
+      - pairs:   [(server, place, timestr)] スケジュール登録用
+    """
     images: List[Image.Image] = []
     messages: List[str] = []
-    merged_results: List[Tuple[int, str]] = []
-    server_for_notify: Optional[str] = None
+    pairs_all: List[Tuple[str, int, str]] = []
 
     loop = asyncio.get_event_loop()
 
@@ -535,23 +596,25 @@ async def run_pipeline_for_attachments(atts: List[discord.Attachment], *, want_i
         final_img, msg, server, results = await loop.run_in_executor(None, process_image_pipeline, pil)
         images.append(final_img)
         messages.append(msg)
-        if server and not server_for_notify:
-            server_for_notify = server
-        # スケジュール登録
-        schedule_notifications(server, results)
+
+        # スケジュール用抽出
+        for place, tstr in results:
+            if server:
+                pairs_all.append((server, place, tstr))
 
     # テキストは連結
-    full_message = "\n\n".join(messages)
+    full_message = "\n\n".join(messages) if messages else "⚠️ 結果がありませんでした。"
 
     # 画像は1枚にまとめる or 返さない
+    fileobj: Optional[discord.File] = None
     if want_image and images:
         merged = vstack_uniform_width(images, width=TARGET_WIDTH)
         out = io.BytesIO()
         merged.convert("RGB").save(out, format="PNG")
         out.seek(0)
-        return discord.File(out, filename="result.png"), full_message
+        fileobj = discord.File(out, filename="result.png")
 
-    return None, full_message
+    return fileobj, full_message, pairs_all
 
 # ---------------------------
 # Commands（デバッグ）
@@ -568,12 +631,16 @@ async def oaiocr(ctx: commands.Context):
         # まずは即レス（のちに編集）
         placeholder = await ctx.reply("解析中…🔎")
 
-        fileobj, message = await run_pipeline_for_attachments(atts, want_image=True)
+        fileobj, message, pairs = await run_pipeline_for_attachments(atts, want_image=True)
 
         # 結果に編集差し替え。画像は別送（1枚に統合）
         await placeholder.edit(content=message)
         if fileobj:
             await ctx.send(file=fileobj)
+
+        # スケジュール登録＋ボード更新
+        if pairs:
+            await add_events_and_refresh_board(pairs)
 
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
@@ -604,13 +671,16 @@ async def on_message(message: discord.Message):
             placeholder = await message.channel.send("解析中…🔎")
 
             # 解析（画像は返さない）
-            _, result_text = await run_pipeline_for_attachments(atts, want_image=False)
+            _, result_text, pairs = await run_pipeline_for_attachments(atts, want_image=False)
 
-            # プレースホルダを編集
+            # プレースホルダを編集（解析完了通知）
             await placeholder.edit(content=result_text)
 
-            # on_message の最後にコマンド処理（通常は不要だが念のため）
-            return
+            # スケジュール登録＋ボード更新（通知チャンネル）
+            if pairs:
+                await add_events_and_refresh_board(pairs)
+
+            return  # ここで終了
 
         # その他はそのまま
         await bot.process_commands(message)
@@ -632,6 +702,12 @@ async def ping(ctx: commands.Context):
 # ---------------------------
 # Run
 # ---------------------------
+
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} (tz={TIMEZONE.key})")
+    if not scheduler_tick.is_running():
+        scheduler_tick.start()
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
