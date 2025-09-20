@@ -31,7 +31,7 @@ GOOGLE_CLOUD_VISION_JSON = os.environ.get("GOOGLE_CLOUD_VISION_JSON", "")
 INPUT_CHANNEL_IDS = {
     int(x) for x in os.environ.get("INPUT_CHANNEL_IDS", "").split(",") if x.strip().isdigit()
 }
-# 通知（一覧＋開始時刻⏰）チャンネル
+# 通知（一覧＋開始時刻ボード）チャンネル
 NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or 0)
 # コピー専用チャンネル（即時通知／時間が過ぎたら削除）
 COPY_CHANNEL_ID = int(os.environ.get("COPY_CHANNEL_ID", "0") or 0)
@@ -202,7 +202,7 @@ async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
     return ch
 
 # ---------------------------
-# スケジューラ（一覧ボード＋⏰通知）
+# スケジューラ（一覧ボード＋アラート＋コピーメッセ削除）
 # ---------------------------
 
 SCHEDULE_LOCK = asyncio.Lock()
@@ -306,6 +306,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     """
     pairs: [(server, place, timestr)]
     - 重複は登録しない（server, place, timestr が同一）
+      ※ 同一バッチ内の重複も除去
     - 追加して時間順に整列
     - 通知ボードを更新
     - コピー専用チャンネルへは**即時通知**（登録時に都度送信）、時間が過ぎたら削除
@@ -314,14 +315,24 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
         print("[add] no pairs")
         return
 
+    # --- 入力バッチ内の重複除去 ---
+    dedup_pairs: List[Tuple[str, int, str]] = []
+    seen_in_batch = set()
+    for server, place, timestr in pairs:
+        key = (server, place, timestr)
+        if key in seen_in_batch:
+            continue
+        seen_in_batch.add(key)
+        dedup_pairs.append(key)
+
     new_items: List[Dict] = []
 
     async with SCHEDULE_LOCK:
         existing = { (it["server"], it["place"], it["timestr"]) for it in SCHEDULE }
-        for server, place, timestr in pairs:
+        for server, place, timestr in dedup_pairs:
             key = (server, place, timestr)
             if key in existing:
-                continue  # 同じスケジュールは登録しない
+                continue  # 既存重複は登録しない
             when = _next_occurrence_today_or_tomorrow(timestr)
             item = {
                 "when": when, "server": server, "place": place, "timestr": timestr,
@@ -360,8 +371,9 @@ async def scheduler_tick():
     毎秒チェックして：
       - 2分前/15秒前をアラートチャンネルに通知（5秒後削除）
         ※ 次の予定が5分以内なら2分前は通知しない
-      - 本番時刻到達で通知チャンネルに⏰通知を出し、一覧から削除→ボード編集
+      - 本番時刻到達で一覧から削除→ボード編集
       - その際、コピー専用チャンネルの個別メッセージも削除
+      - （本番時の ⏰ 通知メッセージ送信は行わない）
     """
     now = datetime.now(TIMEZONE)
 
@@ -405,18 +417,11 @@ async def scheduler_tick():
         for it in to_alert_15s:
             await _send_temp_alert(alert_ch, f"⏱️ **15秒前**: {it['server']}-{it['place']}-{it['timestr']}")
 
-    # 本番通知（通知チャンネルへ）＋ コピー専用メッセージ削除
+    # 本番：コピー専用チャンネルの個別メッセージを削除（通知送信はしない）
     if fired:
-        if NOTIFY_CHANNEL_ID:
-            notify_ch = await _get_text_channel(NOTIFY_CHANNEL_ID)
-            if notify_ch:
-                for it in fired:
-                    await notify_ch.send(f"⏰ 通知: **{it['server']}-{it['place']}-{it['timestr']}** になりました！")
-        # コピー専用チャンネルの個別メッセージを削除
         for it in fired:
             await _delete_copy_message_if_exists(it)
-
-        # ボード更新（過ぎたものを消す）
+        # ボード更新（過ぎたものを消した状態に）
         await _refresh_board()
 
 @scheduler_tick.before_loop
