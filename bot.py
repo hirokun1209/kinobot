@@ -425,7 +425,7 @@ def _time_to_seconds(t: str, *, prefer_mmss: bool = False) -> int:
     if m2:
         a, b = map(int, m2.groups())
         if prefer_mmss:
-            return a*60 + b      # MM:SS として扱う（例: 58:40 -> 00:58:40）
+            return a*60 + b      # MM:SS（例: 58:40 -> 00:58:40）
         return a*3600 + b*60     # HH:MM（基準/停戦）
     return 0
 
@@ -530,13 +530,7 @@ def build_result_message(server: Optional[str],
     # 例） ✅ 解析完了！⏱️ 基準時間:17:26:45 (21:07:21)
     if not base_str or not results or not server:
         return "⚠️ 解析完了… ですが計算できませんでした。画像やOCR結果をご確認ください。"
-
-    head = f"✅ 解析完了！⏱️ 基準時間:{base_str}"
-    if cease_str:
-        head += f" ({cecease_str})"  # ← typo 修正: 直下で正しい行を上書き
-    # 正しい行
     head = f"✅ 解析完了！⏱️ 基準時間:{base_str}" + (f" ({cease_str})" if cease_str else "")
-
     body_lines = [f"{server}-{pl}-{t}" for (pl, t) in results]
     return head + "\n" + "\n".join(body_lines)
 
@@ -544,10 +538,10 @@ def build_result_message(server: Optional[str],
 # パイプライン
 # ---------------------------
 
-def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, List[Tuple[int, str]]]:
+def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, List[Tuple[int, str]], str]:
     """
     リサイズ→スライス→トリム→（7を詰め処理）→合成→OpenAI OCR→計算
-    戻り値: (最終合成画像, 結果メッセージ, server, results)
+    戻り値: (最終合成画像, 結果メッセージ, server, results, ocr_text)
     """
     base = resize_to_width(pil_im, TARGET_WIDTH)
     parts = slice_exact_7(base, CUTS)
@@ -567,7 +561,7 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, 
     server, base_str, cease_str, results = parse_and_compute(oai_text)
     message = build_result_message(server, base_str, cease_str, results)
 
-    return final_img, message, (server or ""), results
+    return final_img, message, (server or ""), results, oai_text
 
 # ---------------------------
 # 共通実行（複数画像対応）
@@ -581,26 +575,33 @@ def _is_image_attachment(a: discord.Attachment) -> bool:
         return True
     return a.filename.lower().endswith(IMAGE_EXTS)
 
-async def run_pipeline_for_attachments(atts: List[discord.Attachment], *, want_image: bool) -> Tuple[Optional[discord.File], str, List[Tuple[str, int, str]]]:
+async def run_pipeline_for_attachments(
+    atts: List[discord.Attachment],
+    *,
+    want_image: bool
+) -> Tuple[Optional[discord.File], str, List[Tuple[str, int, str]], str]:
     """
     複数画像を処理。
     return:
       - fileobj: 画像を返す場合は1枚（縦結合）
       - message: 全結果の連結テキスト
       - pairs:   [(server, place, timestr)] スケジュール登録用
+      - ocr_joined: すべてのOCRテキストを連結（!oaiocr用デバッグ表示）
     """
     images: List[Image.Image] = []
     messages: List[str] = []
     pairs_all: List[Tuple[str, int, str]] = []
+    ocr_texts: List[str] = []
 
     loop = asyncio.get_event_loop()
 
-    for a in atts:
+    for idx, a in enumerate(atts, start=1):
         data = await a.read()
         pil = load_image_from_bytes(data)
-        final_img, msg, server, results = await loop.run_in_executor(None, process_image_pipeline, pil)
+        final_img, msg, server, results, ocr_text = await loop.run_in_executor(None, process_image_pipeline, pil)
         images.append(final_img)
         messages.append(msg)
+        ocr_texts.append(f"# 画像{idx}\n{ocr_text}")
 
         # スケジュール用抽出
         for place, tstr in results:
@@ -609,6 +610,7 @@ async def run_pipeline_for_attachments(atts: List[discord.Attachment], *, want_i
 
     # テキストは連結
     full_message = "\n\n".join(messages) if messages else "⚠️ 結果がありませんでした。"
+    ocr_joined = "\n\n".join(ocr_texts) if ocr_texts else ""
 
     # 画像は1枚にまとめる or 返さない
     fileobj: Optional[discord.File] = None
@@ -619,13 +621,13 @@ async def run_pipeline_for_attachments(atts: List[discord.Attachment], *, want_i
         out.seek(0)
         fileobj = discord.File(out, filename="result.png")
 
-    return fileobj, full_message, pairs_all
+    return fileobj, full_message, pairs_all, ocr_joined
 
 # ---------------------------
 # Commands（デバッグ）
 # ---------------------------
 
-@bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR→計算（複数画像OK）。")
+@bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR→計算（複数画像OK）。OCR原文も返します。")
 async def oaiocr(ctx: commands.Context):
     try:
         atts = [a for a in ctx.message.attachments if _is_image_attachment(a)]
@@ -636,9 +638,12 @@ async def oaiocr(ctx: commands.Context):
         # まずは即レス（のちに編集）
         placeholder = await ctx.reply("解析中…🔎")
 
-        fileobj, message, pairs = await run_pipeline_for_attachments(atts, want_image=True)
+        fileobj, message, pairs, ocr_all = await run_pipeline_for_attachments(atts, want_image=True)
 
-        # 結果に編集差し替え。画像は別送（1枚に統合）
+        # 結果＋OCR原文（コードブロック）に編集差し替え。画像は別送（1枚に統合）
+        if ocr_all:
+            message = f"{message}\n\n🧾 OpenAI OCR 原文:\n```\n{ocr_all}\n```"
+
         await placeholder.edit(content=message)
         if fileobj:
             await ctx.send(file=fileobj)
@@ -675,8 +680,8 @@ async def on_message(message: discord.Message):
             # まずは同チャンネルにプレースホルダ
             placeholder = await message.channel.send("解析中…🔎")
 
-            # 解析（画像は返さない）
-            _, result_text, pairs = await run_pipeline_for_attachments(atts, want_image=False)
+            # 解析（画像は返さない / OCR原文は自動モードでは省略）
+            _, result_text, pairs, _ = await run_pipeline_for_attachments(atts, want_image=False)
 
             # プレースホルダを編集（解析完了通知）
             await placeholder.edit(content=result_text)
