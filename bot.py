@@ -37,6 +37,10 @@ NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or 0)
 COPY_CHANNEL_ID = int(os.environ.get("COPY_CHANNEL_ID", "0") or 0)
 # アラート専用チャンネル（2分前/15秒前、5秒後に削除）
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0") or 0)
+# ⏰ アラートでメンションするロールID（カンマ区切り）
+ALERT_ROLE_IDS = {
+    int(x) for x in os.environ.get("ALERT_ROLE_IDS", "").split(",") if x.strip().isdigit()
+}
 # タイムゾーン（例: Asia/Tokyo）
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tokyo"))
 
@@ -59,6 +63,7 @@ oai_client = OpenAI(api_key=OPENAI_API_KEY)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+ALLOWED_ALERT_MENTIONS = discord.AllowedMentions(everyone=False, users=False, roles=True)
 
 # ---------------------------
 # Parameters / Config
@@ -273,10 +278,17 @@ async def _refresh_board():
         if ch:
             await _ensure_schedule_message(ch)
 
+def _alert_prefix() -> str:
+    if not ALERT_ROLE_IDS:
+        return ""
+    return " ".join(f"<@&{rid}>" for rid in ALERT_ROLE_IDS)
+
 async def _send_temp_alert(channel: discord.TextChannel, text: str):
-    """アラート送信→5秒後に削除"""
+    """アラート送信→5秒後に削除（指定ロールのみメンション）"""
     try:
-        msg = await channel.send(text)
+        prefix = _alert_prefix()
+        txt = f"{prefix} {text}".strip()
+        msg = await channel.send(txt, allowed_mentions=ALLOWED_ALERT_MENTIONS)
         async def _deleter():
             try:
                 await asyncio.sleep(5)
@@ -312,13 +324,6 @@ def _fmt_copy_line(it: Dict) -> str:
 async def _insert_copy_sorted(new_items: List[Dict]):
     """
     既存のコピーCHメッセージ列に、new_items を時間順で“割り込み”挿入。
-    アルゴリズム：
-      1) SCHEDULE は既に when 昇順に並んでいる前提
-      2) 各 new_item について、その位置 idx 以降で最初に copy_msg_id を持つ item を target とする
-      3) target のメッセージ内容を new_item に“置換編集”
-      4) 置き換えで“押し出された”テキストを、次の item のメッセージに編集…を連鎖
-         途中でメッセージが無い箇所/末尾に来たら send() で新規発行して終了
-    競合は COPY_LOCK で直列化する
     """
     if not COPY_CHANNEL_ID or not new_items:
         return
@@ -339,7 +344,6 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                 try:
                     idx = next(i for i, x in enumerate(sched) if tuple(x["key"]) == tuple(it["key"]))
                 except StopIteration:
-                    # 見つからないなら末尾扱いで送る
                     idx = len(sched)
 
             # idx 以降で最初に copy_msg_id を持つ item を探す
@@ -350,7 +354,6 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                     break
 
             if not target:
-                # 末尾に新規送信
                 try:
                     msg = await ch.send(line_new)
                     async with SCHEDULE_LOCK:
@@ -362,12 +365,10 @@ async def _insert_copy_sorted(new_items: List[Dict]):
             k, tgt_item = target
             target_msg_id = tgt_item["copy_msg_id"]
 
-            # 1) target を new に置換
             try:
                 msg_obj = await ch.fetch_message(target_msg_id)
             except Exception as e:
                 print(f"[copy] fetch target failed: {e}")
-                # ターゲットが消えてたら普通に送る
                 try:
                     msg = await ch.send(line_new)
                     async with SCHEDULE_LOCK:
@@ -376,17 +377,16 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                     print(f"[copy] fallback send failed: {e2}")
                 continue
 
-            carry_text = msg_obj.content  # 押し出される本文
+            carry_text = msg_obj.content
             carry_item = tgt_item
 
             try:
                 await msg_obj.edit(content=line_new)
                 async with SCHEDULE_LOCK:
-                    it["copy_msg_id"] = msg_obj.id   # msg_id は新アイテムに紐付け直し
-                    carry_item["copy_msg_id"] = None  # 押し出されたアイテムは一旦未割当
+                    it["copy_msg_id"] = msg_obj.id
+                    carry_item["copy_msg_id"] = None
             except Exception as e:
                 print(f"[copy] edit target failed: {e}")
-                # 置換失敗なら新規送信
                 try:
                     msg = await ch.send(line_new)
                     async with SCHEDULE_LOCK:
@@ -395,7 +395,7 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                     print(f"[copy] fallback send failed2: {e2}")
                 continue
 
-            # 2) 連鎖で後続へ押し出し
+            # 連鎖で後続へ押し出し
             pos = k + 1
             while True:
                 async with SCHEDULE_LOCK:
@@ -403,7 +403,6 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                     next_msg_id = next_item.get("copy_msg_id") if next_item else None
 
                 if not next_item:
-                    # 末尾まで到達 → 新規送信
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
@@ -413,7 +412,6 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                     break
 
                 if not next_msg_id:
-                    # 次のアイテムにメッセージが無い → ここで新規送信して終了
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
@@ -422,12 +420,10 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                         print(f"[copy] chain send(no next id) failed: {e}")
                     break
 
-                # 次メッセージを編集して、内容をさらに押し出す
                 try:
                     next_msg = await ch.fetch_message(next_msg_id)
                 except Exception as e:
                     print(f"[copy] fetch next failed: {e}")
-                    # 取得できなければ新規送信で終了
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
@@ -443,7 +439,6 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                         carry_item["copy_msg_id"] = next_msg.id
                 except Exception as e:
                     print(f"[copy] edit next failed: {e}")
-                    # 編集が失敗 → 新規送信で終了
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
@@ -452,7 +447,6 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                         print(f"[copy] chain fallback send failed: {e2}")
                     break
 
-                # 次へ
                 carry_text = prev_text
                 carry_item = next_item
                 pos += 1
@@ -462,17 +456,17 @@ async def _insert_copy_sorted(new_items: List[Dict]):
 async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     """
     pairs: [(server, place, timestr)]
-    - 重複は登録しない（server, place, timestr が同一）
-      ※ 同一バッチ内の重複も除去
+    - (server, place) が重複する場合は“遅い時間”を採用（既存を上書き/保持）
+    - 完全重複（server, place, timestr） はスキップ
     - 追加して時間順に整列
     - 通知ボードを更新
-    - コピー専用チャンネルへは**時間順で割り込み**（編集＋必要分だけ新規送信）
+    - コピー専用チャンネルへは**時間順で割り込み**
     """
     if not pairs:
         print("[add] no pairs")
         return
 
-    # --- 入力バッチ内の重複除去 ---
+    # --- 入力バッチ内の完全重複除去 ---
     dedup_pairs: List[Tuple[str, int, str]] = []
     seen_in_batch = set()
     for server, place, timestr in pairs:
@@ -482,35 +476,167 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
         seen_in_batch.add(key)
         dedup_pairs.append(key)
 
+    # --- (server, place) 被りは“遅い時間”を採用（同一バッチ内）---
+    latest_by_place: Dict[Tuple[str, int], Tuple[str, datetime]] = {}
+    for server, place, timestr in dedup_pairs:
+        when = _next_occurrence_today_or_tomorrow(timestr)
+        k = (server, place)
+        prev = latest_by_place.get(k)
+        if (not prev) or (when > prev[1]):
+            latest_by_place[k] = (timestr, when)
+
     new_items: List[Dict] = []
+    replaced_items: List[Dict] = []
 
     async with SCHEDULE_LOCK:
-        existing = { (it["server"], it["place"], it["timestr"]) for it in SCHEDULE }
-        for server, place, timestr in dedup_pairs:
+        existing_exact = { (it["server"], it["place"], it["timestr"]) for it in SCHEDULE }
+        for (server, place), (timestr, when) in latest_by_place.items():
             key = (server, place, timestr)
-            if key in existing:
-                continue  # 既存重複は登録しない
-            when = _next_occurrence_today_or_tomorrow(timestr)
+            if key in existing_exact:
+                continue  # 完全重複は何もしない
+
+            # 既存に (server, place) があれば “遅い方” を採用
+            same_place_items = [it for it in SCHEDULE if it["server"] == server and it["place"] == place]
+            if same_place_items:
+                current_latest = max(same_place_items, key=lambda x: x["when"])
+                if when > current_latest["when"]:
+                    # 新しい方が遅い → 既存を全て削除して置き換え
+                    for it in same_place_items:
+                        if it in SCHEDULE:
+                            SCHEDULE.remove(it)
+                            replaced_items.append(it)
+                else:
+                    # 既存の方が遅い（または同時刻）→ 追加不要
+                    continue
+
             item = {
                 "when": when, "server": server, "place": place, "timestr": timestr,
-                "key": key, "skip2m": False, "sent_2m": False, "sent_15s": False,
+                "key": (server, place, timestr), "skip2m": False, "sent_2m": False, "sent_15s": False,
                 "copy_msg_id": None
             }
             SCHEDULE.append(item)
             new_items.append(item)
 
-        if not new_items:
-            print("[add] no new items (all duplicates)")
+        if not new_items and not replaced_items:
+            print("[add] no changes (all duplicates or earlier than existing)")
             return
 
         SCHEDULE.sort(key=lambda x: x["when"])
         _recompute_skip2m_flags()
 
-    # コピー専用チャンネル：安全に割り込み挿入（編集＋最小限の新規送信）
+    # コピーCH：置換で消したメッセージをまず消す
+    for it in replaced_items:
+        await _delete_copy_message_if_exists(it)
+
+    # コピーCH：安全に割り込み挿入
     await _insert_copy_sorted(new_items)
 
-    # 通知ボード更新（既存メッセージを編集）
+    # 通知ボード更新
     await _refresh_board()
+
+async def _clear_all_schedules() -> int:
+    """全スケジュールを削除（コピーCHのメッセージも個別に削除）"""
+    async with SCHEDULE_LOCK:
+        items = list(SCHEDULE)
+        SCHEDULE.clear()
+        _recompute_skip2m_flags()
+    for it in items:
+        await _delete_copy_message_if_exists(it)
+    await _refresh_board()
+    return len(items)
+
+async def _delete_events(server: Optional[str] = None, place: Optional[int] = None, timestr: Optional[str] = None) -> int:
+    """
+    指定条件に一致する予定を削除し件数を返す。
+    timestrがNoneなら server+place の全件を削除。
+    """
+    to_delete: List[Dict] = []
+    async with SCHEDULE_LOCK:
+        for it in list(SCHEDULE):
+            if server is not None and it["server"] != server:
+                continue
+            if place is not None and it["place"] != place:
+                continue
+            if timestr is not None and it["timestr"] != timestr:
+                continue
+            SCHEDULE.remove(it)
+            to_delete.append(it)
+        if to_delete:
+            SCHEDULE.sort(key=lambda x: x["when"])
+            _recompute_skip2m_flags()
+    # コピーメッセ削除
+    for it in to_delete:
+        await _delete_copy_message_if_exists(it)
+    # ボード更新
+    if to_delete:
+        await _refresh_board()
+    return len(to_delete)
+
+def _parse_time_str(s: str) -> Optional[str]:
+    """'H:MM' / 'HH:MM' / 'HH:MM:SS' を 'HH:MM:SS' に整形"""
+    if not s:
+        return None
+    n = unicodedata.normalize("NFKC", s).replace("：", ":").strip()
+    m3 = re.fullmatch(r"(\d{1,2}):(\d{1,2}):(\d{1,2})", n)
+    if m3:
+        h, m, s = (int(m3.group(1)), int(m3.group(2)), int(m3.group(3)))
+        if 0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return None
+    m2 = re.fullmatch(r"(\d{1,2}):(\d{1,2})", n)
+    if m2:
+        h, m = (int(m2.group(1)), int(m2.group(2)))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return f"{h:02d}:{m:02d}:00"
+    return None
+
+def _parse_server_token(tok: str) -> Optional[str]:
+    """'s123' '[S123]' 'S123' '123' -> '123'"""
+    if not tok:
+        return None
+    m = RE_SERVER.search(unicodedata.normalize("NFKC", tok))
+    return m.group(1) if m else None
+
+def _parse_place_token(tok: str) -> Optional[int]:
+    if not tok:
+        return None
+    n = unicodedata.normalize("NFKC", tok)
+    m = re.fullmatch(r"\D*(\d{1,3})\D*", n)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+def _parse_spec_tokens(args: List[str]) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    入力の解釈（例）:
+      - s123 5 12:34[:56]
+      - s123-5-12:34[:56]
+      - s123-5       （!del で timestr 省略可）
+    """
+    one = " ".join(args).strip()
+    m = re.fullmatch(r"\s*([^\s\-]+)\s*-\s*(\d{1,3})(?:\s*-\s*([0-9:：]{3,8}))?\s*", one)
+    server = place = timestr = None
+    if m:
+        server = _parse_server_token(m.group(1))
+        place  = _parse_place_token(m.group(2))
+        timestr = _parse_time_str(m.group(3)) if m.group(3) else None
+        return server, place, timestr
+
+    if len(args) >= 2:
+        server = _parse_server_token(args[0])
+        place  = _parse_place_token(args[1])
+        timestr = _parse_time_str(args[2]) if len(args) >= 3 else None
+        return server, place, timestr
+
+    # 単体で s123 などは不可
+    return None, None, None
+
+# ---------------------------
+# スケジューラ（アラート＋消込み）
+# ---------------------------
 
 @tasks.loop(seconds=1.0)
 async def scheduler_tick():
@@ -557,7 +683,7 @@ async def scheduler_tick():
             SCHEDULE.sort(key=lambda x: x["when"])
             _recompute_skip2m_flags()
 
-    # アラート送信（5秒後削除）
+    # アラート送信（5秒後削除）※ロールメンションのみ
     if alert_ch is not None:
         for it in to_alert_2m:
             await _send_temp_alert(alert_ch, f"⏳ **2分前**: {it['server']}-{it['place']}-{it['timestr']}")
@@ -963,13 +1089,13 @@ async def run_pipeline_for_attachments(
     複数画像を処理。
     return:
       - fileobj: 画像を返す場合は1枚（縦結合）
-      - message: 全結果の連結テキスト
-      - pairs:   [(server, place, timestr)] スケジュール登録用
+      - message: 全結果の連結テキスト（※同一駐騎場の注意書き付加）
+      - pairs:   [(server, place, timestr)] スケジュール登録用（同一駐騎場は遅い時刻を採用）
       - ocr_joined: すべてのOCRテキストを連結（!oaiocr用デバッグ表示）
     """
     images: List[Image.Image] = []
     messages: List[str] = []
-    pairs_all: List[Tuple[str, int, str]] = []
+    raw_pairs_all: List[Tuple[str, int, str]] = []
     ocr_texts: List[str] = []
 
     loop = asyncio.get_event_loop()
@@ -982,13 +1108,37 @@ async def run_pipeline_for_attachments(
         messages.append(msg)
         ocr_texts.append(f"# 画像{idx}\n{ocr_text}")
 
-        # スケジュール用抽出
+        # スケジュール用抽出（画像内結果を生で収集）
         for place, tstr in results:
             if server:
-                pairs_all.append((server, place, tstr))
+                raw_pairs_all.append((server, place, tstr))
 
-    # テキストは連結
+    # ---- 同一 (server, place) は“遅い時間”を採用しつつ注意書き作成 ----
+    by_place: Dict[Tuple[str, int], Tuple[str, datetime]] = {}
+    dup_notes: List[str] = []
+    seen_counts: Dict[Tuple[str, int], int] = {}
+
+    for server, place, timestr in raw_pairs_all:
+        when = _next_occurrence_today_or_tomorrow(timestr)
+        k = (server, place)
+        seen_counts[k] = seen_counts.get(k, 0) + 1
+        prev = by_place.get(k)
+        if (not prev) or (when > prev[1]):
+            if prev:
+                # 注意書き（遅い時刻に更新）
+                old_ts = prev[0]
+                dup_notes.append(f"・S{server}-{place}: {old_ts} → {timestr}（遅い時刻を採用）")
+            by_place[k] = (timestr, when)
+
+    # 採用ペアを整形
+    pairs_all = [(srv, plc, ts) for (srv, plc), (ts, _w) in by_place.items()]
+
+    # テキストは連結 + 注意書き
     full_message = "\n\n".join(messages) if messages else "⚠️ 結果がありませんでした。"
+    if any(cnt > 1 for cnt in seen_counts.values()):
+        note = "⚠️ 同一の駐騎場番号が複数検出されました。遅い時刻を採用しています：\n" + "\n".join(dup_notes) if dup_notes else "⚠️ 同一の駐騎場番号が複数検出されました。"
+        full_message = f"{full_message}\n\n{note}"
+
     ocr_joined = "\n\n".join(ocr_texts) if ocr_texts else ""
 
     # 画像は1枚にまとめる or 返さない
@@ -1003,7 +1153,7 @@ async def run_pipeline_for_attachments(
     return fileobj, full_message, pairs_all, ocr_joined
 
 # ---------------------------
-# Commands（デバッグ）
+# Commands
 # ---------------------------
 
 @bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR→計算（複数画像OK）。OCR原文も返します。")
@@ -1031,6 +1181,59 @@ async def oaiocr(ctx: commands.Context):
         if pairs:
             await add_events_and_refresh_board(pairs)
 
+    except Exception as e:
+        await ctx.reply(f"エラー: {e}")
+
+# ------------- 手動追加 / 削除 / 全リセット --------------
+
+def _has_manage_perm(ctx: commands.Context) -> bool:
+    gp = getattr(ctx.author, "guild_permissions", None)
+    return bool(gp and (gp.administrator or gp.manage_guild or gp.manage_messages))
+
+@bot.command(name="add", aliases=["a"], help="手動追加: !add s123 5 12:34[:56]  または  !add s123-5-12:34[:56]\n同一駐騎場が既にあれば遅い時間を採用（置換）")
+async def cmd_add(ctx: commands.Context, *args):
+    try:
+        server, place, timestr = _parse_spec_tokens(list(args))
+        if not server or place is None or not timestr:
+            await ctx.reply("使い方: `!add s123 5 12:34[:56]`  または  `!add s123-5-12:34[:56]`")
+            return
+
+        # 置換ロジックは add_events_and_refresh_board に内蔵
+        await add_events_and_refresh_board([(server, place, timestr)])
+        await ctx.reply(f"追加（または置換）しました: S{server}-{place}-{timestr}")
+    except Exception as e:
+        await ctx.reply(f"エラー: {e}")
+
+@bot.command(name="del", help="削除: !del s123 5 [12:34[:56]]  または  !del s123-5[-12:34[:56]]（時刻省略でサーバー+駐騎場の全件削除）")
+async def cmd_del(ctx: commands.Context, *args):
+    try:
+        if not _has_manage_perm(ctx):
+            await ctx.reply("権限がありません。（サーバー管理/メッセージ管理）")
+            return
+        server, place, timestr = _parse_spec_tokens(list(args))
+        if not server or place is None:
+            await ctx.reply("使い方: `!del s123 5 [12:34[:56]]` または `!del s123-5[-12:34[:56]]`")
+            return
+
+        n = await _delete_events(server=server, place=place, timestr=timestr)
+        if n == 0:
+            await ctx.reply("該当する予定は見つかりませんでした。")
+        else:
+            if timestr:
+                await ctx.reply(f"削除しました: S{server}-{place}-{timestr}（{n}件）")
+            else:
+                await ctx.reply(f"削除しました: S{server}-{place}-*（{n}件）")
+    except Exception as e:
+        await ctx.reply(f"エラー: {e}")
+
+@bot.command(name="reset", help="全スケジュールをリセット（要権限）")
+async def cmd_reset(ctx: commands.Context):
+    try:
+        if not _has_manage_perm(ctx):
+            await ctx.reply("権限がありません。（サーバー管理/メッセージ管理）")
+            return
+        n = await _clear_all_schedules()
+        await ctx.reply(f"🧹 全スケジュールをリセットしました（{n}件削除）")
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
 
