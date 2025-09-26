@@ -104,6 +104,7 @@ RE_TIME_LOOSE  = re.compile(
     r"\d{1,2}\s*[：:\.\-・／/]\s*\d{1,2}(?:\s*[：:\.\-・／/]\s*\d{1,2})?"
 )
 
+# OCRでサーバー拾う用（[S1234], S1234, s1234 など）
 RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")
 
 # フォールバック：ブロック高さに対する“必ず残す”上部割合
@@ -591,11 +592,20 @@ def _parse_time_str(s: str) -> Optional[str]:
     return None
 
 def _parse_server_token(tok: str) -> Optional[str]:
-    """'s123' '[S123]' 'S123' '123' -> '123'"""
+    """
+    's123' '[S123]' 'S123' '123' -> '123' を返す
+    （ユーザー入力では s なしの「1234-1-17:00:00」形式も許可）
+    """
     if not tok:
         return None
-    m = RE_SERVER.search(unicodedata.normalize("NFKC", tok))
-    return m.group(1) if m else None
+    n = unicodedata.normalize("NFKC", tok)
+    # まずは S付きの既存パターン
+    m = RE_SERVER.search(n)
+    if m:
+        return m.group(1)
+    # 素の数字だけでもOK（2〜5桁）
+    m2 = re.fullmatch(r"\D*([0-9]{2,5})\D*", n)
+    return m2.group(1) if m2 else None
 
 def _parse_place_token(tok: str) -> Optional[int]:
     if not tok:
@@ -613,8 +623,11 @@ def _parse_spec_tokens(args: List[str]) -> Tuple[Optional[str], Optional[int], O
     """
     入力の解釈（例）:
       - s123 5 12:34[:56]
+      - 1234 5 12:34[:56]
       - s123-5-12:34[:56]
+      - 1234-5-12:34[:56]
       - s123-5       （!del で timestr 省略可）
+      - 1234-5       （!del で timestr 省略可）
     """
     one = " ".join(args).strip()
     m = re.fullmatch(r"\s*([^\s\-]+)\s*-\s*(\d{1,3})(?:\s*-\s*([0-9:：]{3,8}))?\s*", one)
@@ -631,7 +644,7 @@ def _parse_spec_tokens(args: List[str]) -> Tuple[Optional[str], Optional[int], O
         timestr = _parse_time_str(args[2]) if len(args) >= 3 else None
         return server, place, timestr
 
-    # 単体で s123 などは不可
+    # 単体で s123 / 1234 などは不可
     return None, None, None
 
 # ---------------------------
@@ -968,7 +981,7 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
     for raw in lines:
         n = _norm(raw)
 
-        # server
+        # server（OCRは S付き想定のため RE_SERVER を使用）
         if server is None:
             m = RE_SERVER.search(n)
             if m:
@@ -991,7 +1004,7 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
         if pl is not None:
             pairs.append((pl, None))
 
-        # immune time: 「免戦系」行の時刻らしきもの（MM:SS 解釈）— 1文字でもOK
+        # immune time: 「免戦系」行の時刻らしきもの（MM:SS 解釈）
         if _is_immune_line(raw):
             tt = _extract_time_like(raw)
             if tt:
@@ -1190,12 +1203,16 @@ def _has_manage_perm(ctx: commands.Context) -> bool:
     gp = getattr(ctx.author, "guild_permissions", None)
     return bool(gp and (gp.administrator or gp.manage_guild or gp.manage_messages))
 
-@bot.command(name="add", aliases=["a"], help="手動追加: !add s123 5 12:34[:56]  または  !add s123-5-12:34[:56]\n同一駐騎場が既にあれば遅い時間を採用（置換）")
+@bot.command(
+    name="add",
+    aliases=["a"],
+    help="手動追加: !add s123 5 12:34[:56] / !add 1234 5 12:34[:56] / !add s123-5-12:34[:56] / !add 1234-5-12:34[:56]\n同一駐騎場が既にあれば遅い時間を採用（置換）"
+)
 async def cmd_add(ctx: commands.Context, *args):
     try:
         server, place, timestr = _parse_spec_tokens(list(args))
         if not server or place is None or not timestr:
-            await ctx.reply("使い方: `!add s123 5 12:34[:56]`  または  `!add s123-5-12:34[:56]`")
+            await ctx.reply("使い方: `!add 1234-1-17:00:00` など（`!add s123 1 17:00` 形式も可）")
             return
 
         # 置換ロジックは add_events_and_refresh_board に内蔵
@@ -1204,7 +1221,10 @@ async def cmd_add(ctx: commands.Context, *args):
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
 
-@bot.command(name="del", help="削除: !del s123 5 [12:34[:56]]  または  !del s123-5[-12:34[:56]]（時刻省略でサーバー+駐騎場の全件削除）")
+@bot.command(
+    name="del",
+    help="削除: !del 1234-1-17:00:00 / !del 1234-1（この場合は該当駐騎場の全時刻を削除） / `s123` 形式も可"
+)
 async def cmd_del(ctx: commands.Context, *args):
     try:
         if not _has_manage_perm(ctx):
@@ -1212,7 +1232,7 @@ async def cmd_del(ctx: commands.Context, *args):
             return
         server, place, timestr = _parse_spec_tokens(list(args))
         if not server or place is None:
-            await ctx.reply("使い方: `!del s123 5 [12:34[:56]]` または `!del s123-5[-12:34[:56]]`")
+            await ctx.reply("使い方: `!del 1234-1-17:00:00` または `!del 1234-1`（全件）")
             return
 
         n = await _delete_events(server=server, place=place, timestr=timestr)
