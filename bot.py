@@ -1257,6 +1257,71 @@ async def cmd_reset(ctx: commands.Context):
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
 
+# ---- Role ID helper commands ----------------------------------------------
+
+@bot.command(
+    name="roleid",
+    help="ロールIDを表示: !roleid @ロール / !roleid ロール名 / !roleid 123456789012345678"
+)
+@commands.guild_only()
+async def roleid(ctx: commands.Context, *, query: str = ""):
+    """@メンション / 名前 / 数字ID のいずれかでロールを指定 → IDを返す"""
+    guild = ctx.guild
+    role = None
+
+    # 1) メッセージにロールメンションが含まれていれば最優先
+    if ctx.message.role_mentions:
+        role = ctx.message.role_mentions[0]
+
+    # 2) 数字（ID）っぽいものがあれば ID として解決
+    if role is None:
+        m = re.search(r"(\d{17,20})", query)
+        if m:
+            role = guild.get_role(int(m.group(1)))
+
+    # 3) 名前で検索（完全一致→部分一致）
+    if role is None and query:
+        # 完全一致（大文字小文字区別）
+        for r in guild.roles:
+            if r.name == query:
+                role = r
+                break
+        # 部分一致（大文字小文字無視）
+        if role is None:
+            q = query.casefold()
+            candidates = [r for r in guild.roles if q in r.name.casefold()]
+            if len(candidates) == 1:
+                role = candidates[0]
+            elif len(candidates) > 1:
+                lines = [f"{r.name} : {r.id}" for r in candidates[:10]]
+                txt = "候補が複数あります。より正確に指定してください：\n```\n" + "\n".join(lines) + "\n```"
+                await ctx.reply(txt, allowed_mentions=discord.AllowedMentions.none())
+                return
+
+    if role is None:
+        await ctx.reply("ロールが見つかりませんでした。`!roles` で一覧を確認してください。", 
+                        allowed_mentions=discord.AllowedMentions.none())
+        return
+
+    await ctx.reply(f"{role.name} : {role.id}", allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.command(name="roles", help="このサーバーのロール一覧とIDを表示")
+@commands.guild_only()
+async def roles(ctx: commands.Context):
+    """ロール一覧を上位順で表示"""
+    guild = ctx.guild
+    roles_sorted = sorted(guild.roles, key=lambda r: r.position, reverse=True)
+    lines = [f"{r.position:02d}  {r.name} : {r.id}" for r in roles_sorted]
+    text = "ロール一覧（上=上位）\n```\n" + "\n".join(lines) + "\n```"
+
+    # 万一 2000 文字超える場合は少しだけ丸める
+    if len(text) > 1900:
+        text = text[:1850] + "\n...（省略）\n```"
+
+    await ctx.reply(text, allowed_mentions=discord.AllowedMentions.none())
+# ---------------------------------------------------------------------------
+
 # ---------------------------
 # 自動解析（送信専用チャンネル）
 # ---------------------------
