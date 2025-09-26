@@ -4,7 +4,7 @@ import re
 import base64
 import asyncio
 import unicodedata
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Set
 
 import discord
 from discord.ext import commands, tasks
@@ -1102,7 +1102,7 @@ async def run_pipeline_for_attachments(
     複数画像を処理。
     return:
       - fileobj: 画像を返す場合は1枚（縦結合）
-      - message: 全結果の連結テキスト（※同一駐騎場の注意書き付加）
+      - message: 全結果の連結テキスト＋末尾に「登録リスト」
       - pairs:   [(server, place, timestr)] スケジュール登録用（同一駐騎場は遅い時刻を採用）
       - ocr_joined: すべてのOCRテキストを連結（!oaiocr用デバッグ表示）
     """
@@ -1110,6 +1110,9 @@ async def run_pipeline_for_attachments(
     messages: List[str] = []
     raw_pairs_all: List[Tuple[str, int, str]] = []
     ocr_texts: List[str] = []
+    # 表示用（順序保持・重複除去（完全一致））
+    display_lines_ordered: List[str] = []
+    seen_display: Set[str] = set()
 
     loop = asyncio.get_event_loop()
 
@@ -1121,36 +1124,32 @@ async def run_pipeline_for_attachments(
         messages.append(msg)
         ocr_texts.append(f"# 画像{idx}\n{ocr_text}")
 
-        # スケジュール用抽出（画像内結果を生で収集）
+        # スケジュール用抽出 & 表示用ライン作成
         for place, tstr in results:
             if server:
                 raw_pairs_all.append((server, place, tstr))
+                line = f"{server}-{place}-{tstr}"
+                if line not in seen_display:
+                    seen_display.add(line)
+                    display_lines_ordered.append(line)
 
-    # ---- 同一 (server, place) は“遅い時間”を採用しつつ注意書き作成 ----
+    # ---- スケジュール採用ロジック（同一 (server, place) は“遅い時間”を採用）----
     by_place: Dict[Tuple[str, int], Tuple[str, datetime]] = {}
-    dup_notes: List[str] = []
-    seen_counts: Dict[Tuple[str, int], int] = {}
-
     for server, place, timestr in raw_pairs_all:
         when = _next_occurrence_today_or_tomorrow(timestr)
         k = (server, place)
-        seen_counts[k] = seen_counts.get(k, 0) + 1
         prev = by_place.get(k)
         if (not prev) or (when > prev[1]):
-            if prev:
-                # 注意書き（遅い時刻に更新）
-                old_ts = prev[0]
-                dup_notes.append(f"・S{server}-{place}: {old_ts} → {timestr}（遅い時刻を採用）")
             by_place[k] = (timestr, when)
 
-    # 採用ペアを整形
+    # 採用ペアを整形（順不同だがスケジュール用なのでOK）
     pairs_all = [(srv, plc, ts) for (srv, plc), (ts, _w) in by_place.items()]
 
-    # テキストは連結 + 注意書き
+    # テキストは連結 + 末尾に「登録リスト（順不同）」を付与
     full_message = "\n\n".join(messages) if messages else "⚠️ 結果がありませんでした。"
-    if any(cnt > 1 for cnt in seen_counts.values()):
-        note = "⚠️ 同一の駐騎場番号が複数検出されました。遅い時刻を採用しています：\n" + "\n".join(dup_notes) if dup_notes else "⚠️ 同一の駐騎場番号が複数検出されました。"
-        full_message = f"{full_message}\n\n{note}"
+    if display_lines_ordered:
+        tail = "📌 登録リスト ※時間にズレがないか確認してください。ズレがある場合修正してください。\n" + "\n".join(display_lines_ordered)
+        full_message = f"{full_message}\n\n{tail}"
 
     ocr_joined = "\n\n".join(ocr_texts) if ocr_texts else ""
 
@@ -1256,6 +1255,75 @@ async def cmd_reset(ctx: commands.Context):
         await ctx.reply(f"🧹 全スケジュールをリセットしました（{n}件削除）")
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
+
+# ---- ±1秒 調整コマンド ----------------------------------------------
+
+async def _shift_items(places: Optional[Set[int]], delta_seconds: int) -> int:
+    """
+    places が None の場合は全件、そうでなければ place が一致するものだけ
+    'when' を±deltaし、'timestr' もTZに合わせて再計算する。
+    コピーCHの個別メッセージ内容も更新（順序は維持）。
+    """
+    changed: List[Dict] = []
+    async with SCHEDULE_LOCK:
+        for it in SCHEDULE:
+            if (places is None) or (it["place"] in places):
+                it["when"] = it["when"] + timedelta(seconds=delta_seconds)
+                it["timestr"] = it["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
+                changed.append(it)
+        if changed:
+            SCHEDULE.sort(key=lambda x: x["when"])
+            _recompute_skip2m_flags()
+
+    # コピーCHの内容を更新（順序はそのまま）
+    if changed and COPY_CHANNEL_ID:
+        ch = await _get_text_channel(COPY_CHANNEL_ID)
+        if ch:
+            for it in changed:
+                mid = it.get("copy_msg_id")
+                if not mid:
+                    continue
+                try:
+                    msg_obj = await ch.fetch_message(mid)
+                    await msg_obj.edit(content=_fmt_copy_line(it))
+                except Exception as e:
+                    print(f"[shift] copy edit failed: {e}")
+
+    # ボード更新
+    if changed:
+        await _refresh_board()
+    return len(changed)
+
+def _parse_places_from_args(args: Tuple[str, ...]) -> Optional[Set[int]]:
+    if not args:
+        return None
+    s: Set[int] = set()
+    for tok in args:
+        m = re.search(r"(\d{1,3})", tok)
+        if m:
+            try:
+                s.add(int(m.group(1)))
+            except Exception:
+                pass
+    return s or None
+
+@bot.command(name="1", help="駐騎ナンバーを +1 秒。例: `!1 1 4 5 6`（指定なしで全件）")
+async def cmd_plus1(ctx: commands.Context, *args):
+    places = _parse_places_from_args(args)
+    n = await _shift_items(places, +1)
+    if places:
+        await ctx.reply(f"＋1秒しました（対象:{sorted(places)} / {n}件）", allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await ctx.reply(f"＋1秒しました（全件 / {n}件）", allowed_mentions=discord.AllowedMentions.none())
+
+@bot.command(name="-1", help="駐騎ナンバーを -1 秒。例: `!-1 1 4 5 6`（指定なしで全件）")
+async def cmd_minus1(ctx: commands.Context, *args):
+    places = _parse_places_from_args(args)
+    n = await _shift_items(places, -1)
+    if places:
+        await ctx.reply(f"−1秒しました（対象:{sorted(places)} / {n}件）", allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await ctx.reply(f"−1秒しました（全件 / {n}件）", allowed_mentions=discord.AllowedMentions.none())
 
 # ---- Role ID helper commands ----------------------------------------------
 
