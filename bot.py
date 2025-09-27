@@ -447,6 +447,119 @@ async def _insert_copy_sorted(new_items: List[Dict]):
 
 # ---- ここまで：コピーCHの安全な“割り込み挿入”ロジック ----
 
+# ---- ここから：1分おきの監視・並び替えガード ----
+
+async def _reorder_copy_channel_to_match_schedule():
+    """
+    コピー用チャンネルのメッセージ内容を、SCHEDULEの**時間順**に整える。
+    - 欠落している copy_msg_id は補完（割り込み挿入）
+    - 既存メッセージは内容を入れ替えて順序を“見かけ上”揃える（送信順は変えられないため内容で整列）
+    """
+    if not COPY_CHANNEL_ID:
+        return
+    ch = await _get_text_channel(COPY_CHANNEL_ID)
+    if not ch:
+        return
+
+    # 1) まず欠落しているメッセージを補完（ロック無しで安全APIを使用）
+    async with SCHEDULE_LOCK:
+        missing_items = [it for it in SCHEDULE if not it.get("copy_msg_id")]
+    if missing_items:
+        await _insert_copy_sorted(missing_items)
+
+    # 2) 再スナップショット（copy_msg_id が生えているもの）
+    async with SCHEDULE_LOCK:
+        sched_items_with_msg = [it for it in SCHEDULE if it.get("copy_msg_id")]
+    if not sched_items_with_msg:
+        return
+
+    # 3) 実メッセージを取得（存在しないIDはクリア）
+    fetched: Dict[int, Optional[discord.Message]] = {}
+    for it in sched_items_with_msg:
+        mid = it["copy_msg_id"]
+        try:
+            msg = await ch.fetch_message(mid)  # type: ignore
+            fetched[mid] = msg
+        except Exception:
+            fetched[mid] = None
+
+    async with SCHEDULE_LOCK:
+        for it in sched_items_with_msg:
+            if not fetched.get(it["copy_msg_id"]):
+                it["copy_msg_id"] = None
+
+    # 4) 失敗したものをもう一度補完
+    async with SCHEDULE_LOCK:
+        missing_items2 = [it for it in SCHEDULE if not it.get("copy_msg_id")]
+    if missing_items2:
+        await _insert_copy_sorted(missing_items2)
+
+    # 5) 並びの修正：CH内のメッセージ送信時刻順 と SCHEDULE の when 順を対応付け
+    async with SCHEDULE_LOCK:
+        # SCHEDULE は when 昇順前提
+        sched_in_order = [it for it in SCHEDULE if it.get("copy_msg_id")]
+        msg_ids = [it["copy_msg_id"] for it in sched_in_order]
+
+    # 現在のメッセージを取得＆送信時刻順に
+    msg_objs: List[discord.Message] = []
+    for mid in msg_ids:
+        try:
+            msg = await ch.fetch_message(mid)  # type: ignore
+            msg_objs.append(msg)
+        except Exception:
+            pass
+
+    if not msg_objs:
+        return
+
+    msg_objs.sort(key=lambda m: m.created_at)
+    L = min(len(msg_objs), len(sched_in_order))
+
+    # 6) 編集で整列（必ず COPY_LOCK → SCHEDULE_LOCK の順で取得）
+    async with COPY_LOCK:
+        async with SCHEDULE_LOCK:
+            for i in range(L):
+                it = sched_in_order[i]
+                msg = msg_objs[i]
+                desired = _fmt_copy_line(it)
+                if msg.content != desired or it["copy_msg_id"] != msg.id:
+                    try:
+                        await msg.edit(content=desired)
+                    except Exception as e:
+                        print(f"[guard] copy edit failed: {e}")
+                    it["copy_msg_id"] = msg.id
+
+@tasks.loop(seconds=60.0)
+async def order_guard_tick():
+    """
+    1分おきに：
+      - SCHEDULE を厳密に when 昇順へ（timestrもwhen由来で正規化）
+      - スキップフラグ再計算
+      - 通知ボード再描画
+      - コピー用チャンネルの整列補修（欠落補完＆内容入れ替え）
+    """
+    try:
+        async with SCHEDULE_LOCK:
+            SCHEDULE.sort(key=lambda x: x["when"])
+            for it in SCHEDULE:
+                # timestr を when に合わせて正規化（ズレの蓄積を防止）
+                it["timestr"] = it["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
+            _recompute_skip2m_flags()
+    except Exception as e:
+        print(f"[guard] schedule sort failed: {e}")
+
+    await _refresh_board()
+    try:
+        await _reorder_copy_channel_to_match_schedule()
+    except Exception as e:
+        print(f"[guard] reorder copy channel failed: {e}")
+
+@order_guard_tick.before_loop
+async def before_guard():
+    await bot.wait_until_ready()
+
+# ---- ここまで：1分おきの監視・並び替えガード ----
+
 async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     """
     pairs: [(server, place, timestr)]
@@ -1456,6 +1569,8 @@ async def on_ready():
 
     if not scheduler_tick.is_running():
         scheduler_tick.start()
+    if not order_guard_tick.is_running():
+        order_guard_tick.start()
 
 # ---------------------------
 # Run
