@@ -184,26 +184,21 @@ def _extract_place(line: str) -> Optional[int]:
 # --------------- チャンネル取得（デバッグ出力込み） ---------------
 async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
     if not cid:
-        print("[channel] channel id is 0")
         return None
     ch = bot.get_channel(cid)
     if ch is None:
         try:
             ch = await bot.fetch_channel(cid)  # type: ignore
-        except Exception as e:
-            print(f"[channel] fetch_channel({cid}) failed: {e}")
+        except Exception:
             return None
     if not isinstance(ch, discord.TextChannel):
-        print(f"[channel] {cid} is not a TextChannel: {type(ch)}")
         return None
     # 送信権限チェック
     me = ch.guild.me
     if me is None:
-        print(f"[channel] guild.me is None for {cid}")
         return None
     perms = ch.permissions_for(me)
     if not perms.send_messages:
-        print(f"[channel] missing send_messages permission in {cid}")
         return None
     return ch
 
@@ -235,9 +230,7 @@ def _next_occurrence_today_or_tomorrow(hms: str) -> datetime:
 
 def _render_schedule_board() -> str:
     """
-    通知チャンネルのスケジュール表示:
-      - 予定あり:   「🗓️ 今後のスケジュール🗓️」+ 行ごと表示（・server-place-HH:MM:SS）
-      - 予定なし:   「🗓️ 今後のスケジュール🗓️\n🈳 登録された予定はありません」
+    通知チャンネルのスケジュール表示（SCHEDULEは常にwhen昇順）:
     """
     header = "🗓️ 今後のスケジュール🗓️"
     if not SCHEDULE:
@@ -324,7 +317,7 @@ def _fmt_copy_line(it: Dict) -> str:
 
 async def _insert_copy_sorted(new_items: List[Dict]):
     """
-    既存のコピーCHメッセージ列に、new_items を時間順で“割り込み”挿入。
+    コピーCHメッセージ列に new_items を**時間順**で割り込み挿入。
     """
     if not COPY_CHANNEL_ID or not new_items:
         return
@@ -332,7 +325,7 @@ async def _insert_copy_sorted(new_items: List[Dict]):
     if not ch:
         return
 
-    # 時間順で処理
+    # new_items 自体を時間順に
     new_items = sorted(new_items, key=lambda x: x["when"])
 
     async with COPY_LOCK:
@@ -347,7 +340,7 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                 except StopIteration:
                     idx = len(sched)
 
-            # idx 以降で最初に copy_msg_id を持つ item を探す
+            # idx 以降で最初に copy_msg_id を持つ item を探す（=時間順列の割込み先）
             target = None
             for k in range(idx, len(sched)):
                 if sched[k].get("copy_msg_id"):
@@ -459,7 +452,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     pairs: [(server, place, timestr)]
     - (server, place) が重複する場合は“遅い時間”を採用（既存を上書き/保持）
     - 完全重複（server, place, timestr） はスキップ
-    - 追加して時間順に整列
+    - 追加して**時間順**に整列
     - 通知ボードを更新
     - コピー専用チャンネルへは**時間順で割り込み**
     """
@@ -529,7 +522,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     for it in replaced_items:
         await _delete_copy_message_if_exists(it)
 
-    # コピーCH：安全に割り込み挿入
+    # コピーCH：安全に割り込み挿入（内部で時間順へソート）
     await _insert_copy_sorted(new_items)
 
     # 通知ボード更新
@@ -999,7 +992,7 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
             if tt:
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
 
-        # place: タイトル行から「場」の直後の数字のみ採用（免戦行は除外、終端数字フォールバック無し）
+        # place: タイトル行から「場」の直後の数字のみ採用（免戦行は除外、終端数字のフォールバック無し）
         pl = _extract_place(raw)
         if pl is not None:
             pairs.append((pl, None))
@@ -1102,17 +1095,14 @@ async def run_pipeline_for_attachments(
     複数画像を処理。
     return:
       - fileobj: 画像を返す場合は1枚（縦結合）
-      - message: 全結果の連結テキスト＋末尾に「登録リスト」
-      - pairs:   [(server, place, timestr)] スケジュール登録用（同一駐騎場は遅い時刻を採用）
+      - message: 全結果の連結テキスト＋末尾に「登録リスト（重複は遅い時刻のみ・時間順）」を付与
+      - pairs:   時間順の [(server, place, timestr)] スケジュール登録用（同一駐騎場は遅い時刻を採用）
       - ocr_joined: すべてのOCRテキストを連結（!oaiocr用デバッグ表示）
     """
     images: List[Image.Image] = []
     messages: List[str] = []
     raw_pairs_all: List[Tuple[str, int, str]] = []
     ocr_texts: List[str] = []
-    # 表示用（順序保持・重複除去（完全一致））
-    display_lines_ordered: List[str] = []
-    seen_display: Set[str] = set()
 
     loop = asyncio.get_event_loop()
 
@@ -1124,33 +1114,41 @@ async def run_pipeline_for_attachments(
         messages.append(msg)
         ocr_texts.append(f"# 画像{idx}\n{ocr_text}")
 
-        # スケジュール用抽出 & 表示用ライン作成
+        # スケジュール用抽出
         for place, tstr in results:
             if server:
                 raw_pairs_all.append((server, place, tstr))
-                line = f"{server}-{place}-{tstr}"
-                if line not in seen_display:
-                    seen_display.add(line)
-                    display_lines_ordered.append(line)
 
-    # ---- スケジュール採用ロジック（同一 (server, place) は“遅い時間”を採用）----
-    by_place: Dict[Tuple[str, int], Tuple[str, datetime]] = {}
+    # ---- 間引き：同一(server,place)は“遅い時刻のみ”採用 ----
+    latest_by_place: Dict[Tuple[str, int], Tuple[str, datetime]] = {}
     for server, place, timestr in raw_pairs_all:
         when = _next_occurrence_today_or_tomorrow(timestr)
         k = (server, place)
-        prev = by_place.get(k)
+        prev = latest_by_place.get(k)
         if (not prev) or (when > prev[1]):
-            by_place[k] = (timestr, when)
+            latest_by_place[k] = (timestr, when)
 
-    # 採用ペアを整形（順不同だがスケジュール用なのでOK）
-    pairs_all = [(srv, plc, ts) for (srv, plc), (ts, _w) in by_place.items()]
+    # ---- 時間順に並べ替え（昇順）----
+    sorted_items: List[Tuple[str, int, str, datetime]] = sorted(
+        ((srv, plc, ts, when) for (srv, plc), (ts, when) in latest_by_place.items()),
+        key=lambda x: x[3]
+    )
 
-    # テキストは連結 + 末尾に「登録リスト（順不同）」を付与
+    # スケジュール登録用も時間順で
+    pairs_all: List[Tuple[str, int, str]] = [(srv, plc, ts) for (srv, plc, ts, _w) in sorted_items]
+
+    # 表示用「登録リスト」（時間順）
+    reg_lines = [f"{srv}-{plc}-{ts}" for (srv, plc, ts, _w) in sorted_items]
+    reg_block = ""
+    if reg_lines:
+        reg_block = "📌 登録リスト ※時間にズレがないか確認してください。ズレがある場合修正してください。\n" + "\n".join(reg_lines)
+
+    # 連結テキスト
     full_message = "\n\n".join(messages) if messages else "⚠️ 結果がありませんでした。"
-    if display_lines_ordered:
-        tail = "📌 登録リスト ※時間にズレがないか確認してください。ズレがある場合修正してください。\n" + "\n".join(display_lines_ordered)
-        full_message = f"{full_message}\n\n{tail}"
+    if reg_block:
+        full_message = f"{full_message}\n\n{reg_block}"
 
+    # OCR原文（!oaiocr のみ付与）
     ocr_joined = "\n\n".join(ocr_texts) if ocr_texts else ""
 
     # 画像は1枚にまとめる or 返さない
