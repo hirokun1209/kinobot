@@ -1208,12 +1208,14 @@ async def run_pipeline_for_attachments(
     複数画像を処理。
     return:
       - fileobj: 画像を返す場合は1枚（縦結合）
-      - message: 全結果の連結テキスト＋末尾に「登録リスト（重複は遅い時刻のみ・時間順）」を付与
-      - pairs:   時間順の [(server, place, timestr)] スケジュール登録用（同一駐騎場は遅い時刻を採用）
+      - message: 全結果の連結テキスト＋末尾に
+                 「登録リスト（重複は遅い時刻のみ／並べ替えなし=OCR順で表示）」を付与
+      - pairs:   スケジュール登録用（同一(server,place)は遅い時刻のみ→時間順で整列）
       - ocr_joined: すべてのOCRテキストを連結（!oaiocr用デバッグ表示）
     """
     images: List[Image.Image] = []
     messages: List[str] = []
+    # 表示用の“生”候補（OCR検出順を保持）
     raw_pairs_all: List[Tuple[str, int, str]] = []
     ocr_texts: List[str] = []
 
@@ -1227,12 +1229,12 @@ async def run_pipeline_for_attachments(
         messages.append(msg)
         ocr_texts.append(f"# 画像{idx}\n{ocr_text}")
 
-        # スケジュール用抽出
+        # OCR順のまま収集（表示用）
         for place, tstr in results:
             if server:
                 raw_pairs_all.append((server, place, tstr))
 
-    # ---- 間引き：同一(server,place)は“遅い時刻のみ”採用 ----
+    # ---- スケジュール登録用：同一(server,place)は“遅い時刻のみ”→時間順に整列 ----
     latest_by_place: Dict[Tuple[str, int], Tuple[str, datetime]] = {}
     for server, place, timestr in raw_pairs_all:
         when = _next_occurrence_today_or_tomorrow(timestr)
@@ -1241,20 +1243,34 @@ async def run_pipeline_for_attachments(
         if (not prev) or (when > prev[1]):
             latest_by_place[k] = (timestr, when)
 
-    # ---- 時間順に並べ替え（昇順）----
     sorted_items: List[Tuple[str, int, str, datetime]] = sorted(
         ((srv, plc, ts, when) for (srv, plc), (ts, when) in latest_by_place.items()),
         key=lambda x: x[3]
     )
-
-    # スケジュール登録用も時間順で
     pairs_all: List[Tuple[str, int, str]] = [(srv, plc, ts) for (srv, plc, ts, _w) in sorted_items]
 
-    # 表示用「登録リスト」（時間順）
-    reg_lines = [f"{srv}-{plc}-{ts}" for (srv, plc, ts, _w) in sorted_items]
+    # ---- 表示用：重複は“遅い時刻”だけを1件表示、順番は並べ替えなし（OCR順） ----
+    # (server, place) -> 採用する timestr（=最遅）
+    latest_timestr_map: Dict[Tuple[str, int], str] = {k: v[0] for k, v in latest_by_place.items()}
+
+    reg_lines: List[str] = []
+    already_emitted: Set[Tuple[str, int]] = set()  # 同時刻重複対策（片方だけ表示）
+    for srv, plc, ts in raw_pairs_all:
+        want_ts = latest_timestr_map.get((srv, plc))
+        if want_ts is None:
+            continue
+        # “遅い時刻”でなければスキップ（より遅いものが後で出てくる）
+        if ts != want_ts:
+            continue
+        # 同時刻重複（完全一致）が複数来た場合は最初の1件だけ表示
+        if (srv, plc) in already_emitted:
+            continue
+        reg_lines.append(f"{srv}-{plc}-{ts}")
+        already_emitted.add((srv, plc))
+
     reg_block = ""
     if reg_lines:
-        reg_block = "📌 登録リスト ※時間にズレがないか確認してください。ズレがある場合修正してください。\n" + "\n".join(reg_lines)
+        reg_block = "📌 登録リスト（重複は“遅い時刻”のみ／並べ替えなし）\n" + "\n".join(reg_lines)
 
     # 連結テキスト
     full_message = "\n\n".join(messages) if messages else "⚠️ 結果がありませんでした。"
