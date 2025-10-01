@@ -916,7 +916,7 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
         x1 = min(c[0] for c in chunks)
         y1 = min(c[1] for c in chunks)
         x2 = max(c[2] for c in chunks)
-        y2 = max(c[3] for c[3] in chunks)
+        y2 = max(c[3] for c in chunks)
         line_boxes.append((text, (x1, y1, x2, y2)))
     return line_boxes
 
