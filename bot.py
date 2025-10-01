@@ -916,7 +916,7 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
         x1 = min(c[0] for c in chunks)
         y1 = min(c[1] for c in chunks)
         x2 = max(c[2] for c in chunks)
-        y2 = max(c[3] for c in chunks)
+        y2 = max(c[3] for c[3] in chunks)
         line_boxes.append((text, (x1, y1, x2, y2)))
     return line_boxes
 
@@ -1039,7 +1039,7 @@ def openai_ocr_png(pil_im: Image.Image) -> Tuple[str, bytes]:
     return text, png_bytes
 
 # ---------------------------
-# 計算 & フォーマット
+# 計算 & フォーマット（理由付き）
 # ---------------------------
 
 def _time_to_seconds(t: str, *, prefer_mmss: bool = False) -> int:
@@ -1067,96 +1067,150 @@ def _seconds_to_hms(sec: int) -> str:
     s = sec % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[Tuple[int, str]]]:
+def _build_failure_message(diag: Dict) -> str:
+    reasons = []
+
+    if not diag.get("base_found"):
+        reasons.append(f"基準時刻が見つかりませんでした。")
+    if diag.get("place_total", 0) == 0:
+        reasons.append("「越域/戦闘 駐◯場」のタイトル行が見つかりませんでした。")
+    else:
+        missing = diag.get("place_missing_immune", 0)
+        if missing == diag.get("place_total"):
+            reasons.append(f"駐騎場は {diag['place_total']} 件検出しましたが、免戦時間(MM:SS)が見つかりませんでした。")
+        elif missing > 0:
+            reasons.append(f"{missing} 件の駐騎場で免戦時間(MM:SS)が見つかりませんでした。")
+    if not diag.get("server_found"):
+        reasons.append("サーバー番号（例: [s1234]）が見つかりませんでした。")
+
+    msg = "⚠️ 解析完了… ですが計算できませんでした。\n\n原因:\n"
+    if reasons:
+        msg += "".join(f"- {r}\n" for r in reasons)
+    else:
+        msg += "- 原因を特定できませんでした（OCR結果に十分な情報がありませんでした）。\n"
+
+    # 未使用テキスト（当てはまらなかった行）
+    unused = diag.get("unused_lines", [])
+    if unused:
+        # Discordのメッセ長対策で40行まで
+        head = "未使用テキスト（パースに使えなかった行）:"
+        block = "\n".join(unused[:40])
+        if len(unused) > 40:
+            block += "\n…（省略）"
+        msg += f"\n{head}\n```\n{block}\n```"
+    return msg
+
+def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[Tuple[int, str]], Dict]:
     """
     OCRテキストから
-      server(str), base_time(HH:MM:SS), ceasefire(HH:MM:SS), results[(place, time_str)]
-    を返す。足りない場合は None。
+      server(str), base_time(HH:MM:SS), ceasefire(HH:MM:SS), results[(place, time_str)], diag(dict)
+    を返す。diag は失敗理由と「未使用テキスト」生成に使う。
     """
-    lines = [ln.strip() for ln in oai_text.splitlines() if ln.strip()]
+    raw_lines = [ln.rstrip() for ln in oai_text.splitlines()]
+    lines = [ln.strip() for ln in raw_lines if ln.strip()]
     if not lines:
-        return None, None, None, []
+        return None, None, None, [], {"unused_lines": [], "server_found": False, "base_found": False,
+                                      "place_total": 0, "place_missing_immune": 0}
+
+    used_idx: Set[int] = set()
 
     server = None
     base_time_sec: Optional[int] = None
     ceasefire_sec: Optional[int] = None
 
-    pairs: List[Tuple[int, Optional[int]]] = []  # (place, immune_sec)
+    # pair: {'place':int,'place_idx':int,'immune_sec':Optional[int],'immune_idx':Optional[int]}
+    pairs: List[Dict] = []
 
     # 1周: サーバー / 基準 / 停戦終了 / 越域駐〇場 + 免戦 を順に拾う
-    for raw in lines:
+    for i, raw in enumerate(lines):
         n = _norm(raw)
 
-        # server（OCRは S付き想定のため RE_SERVER を使用）
+        # server
         if server is None:
             m = RE_SERVER.search(n)
             if m:
                 server = m.group(1)
+                used_idx.add(i)
 
-        # ceasefire（行内に「停戦」キーワードがあれば、その行の時刻らしきもの）
+        # ceasefire
         if "停戦" in n:
             tt = _extract_time_like(raw)
             if tt:
                 ceasefire_sec = _time_to_seconds(tt, prefer_mmss=False)
+                used_idx.add(i)
 
-        # base_time: 「免戦系」や「停戦」を含まない行の最初の時刻らしきもの
+        # base_time（免戦/停戦行は除外）
         if base_time_sec is None and (not _is_immune_line(raw)) and ("停戦" not in n):
             tt = _extract_time_like(raw)
             if tt:
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
+                used_idx.add(i)
 
-        # place: タイトル行から「場」の直後の数字のみ採用（免戦行は除外、終端数字のフォールバック無し）
+        # place
         pl = _extract_place(raw)
         if pl is not None:
-            pairs.append((pl, None))
+            pairs.append({"place": pl, "place_idx": i, "immune_sec": None, "immune_idx": None})
 
-        # immune time: 「免戦系」行の時刻らしきもの（MM:SS 解釈）
+        # immune time
         if _is_immune_line(raw):
             tt = _extract_time_like(raw)
             if tt:
                 tsec = _time_to_seconds(tt, prefer_mmss=True)
-                # 直近の未設定ペアに充当
-                for i in range(len(pairs)-1, -1, -1):
-                    if pairs[i][1] is None:
-                        pairs[i] = (pairs[i][0], tsec)
+                for j in range(len(pairs)-1, -1, -1):
+                    if pairs[j]["immune_sec"] is None:
+                        pairs[j]["immune_sec"] = tsec
+                        pairs[j]["immune_idx"] = i
+                        # used は「有効ペア」確定後に加算する
                         break
 
-    if base_time_sec is None or not pairs:
-        return server, None, None, []
-
     # 計算
-    calc: List[Tuple[int, int]] = []  # (place, sec_from_midnight)
-    for place, immune in pairs:
-        if immune is None:
+    calc: List[Tuple[int, int]] = []
+    for pr in pairs:
+        if pr["immune_sec"] is None or base_time_sec is None:
             continue
-        calc.append((place, (base_time_sec + immune) % (24*3600)))
+        sec = (base_time_sec + int(pr["immune_sec"])) % (24*3600)
+        calc.append((pr["place"], sec))
+        # このペアは有効に使われたので参照行を used に入れる
+        used_idx.add(pr["place_idx"])
+        used_idx.add(pr["immune_idx"])
 
-    if not calc:
-        return server, _seconds_to_hms(base_time_sec), _seconds_to_hms(ceasefire_sec) if ceasefire_sec is not None else None, []
-
-    # 最上ブロック（最初のcalc）と停戦終了の差で補正
-    if ceasefire_sec is not None:
-        delta = (ceasefire_sec - calc[0][1])  # 正負OK
+    # 停戦補正
+    if calc and ceasefire_sec is not None:
+        delta = (ceasefire_sec - calc[0][1])
         calc = [(pl, (sec + delta) % (24*3600)) for (pl, sec) in calc]
-        # 先頭は停戦終了に合わせる
         calc[0] = (calc[0][0], ceasefire_sec % (24*3600))
 
     # 出力整形
     results: List[Tuple[int, str]] = [(pl, _seconds_to_hms(sec)) for (pl, sec) in calc]
-    base_str = _seconds_to_hms(base_time_sec)
+    base_str = _seconds_to_hms(base_time_sec) if base_time_sec is not None else None
     cease_str = _seconds_to_hms(ceasefire_sec) if ceasefire_sec is not None else None
-    return server, base_str, cease_str, results
+
+    # 診断情報
+    place_total = len(pairs)
+    place_missing_immune = sum(1 for pr in pairs if pr["immune_sec"] is None)
+    unused_lines = [lines[i] for i in range(len(lines)) if i not in used_idx]
+
+    diag = {
+        "server_found": server is not None,
+        "base_found": base_time_sec is not None,
+        "place_total": place_total,
+        "place_missing_immune": place_missing_immune,
+        "unused_lines": unused_lines
+    }
+    return server, base_str, cease_str, results, diag
 
 def build_result_message(server: Optional[str],
                          base_str: Optional[str],
                          cease_str: Optional[str],
-                         results: List[Tuple[int, str]]) -> str:
-    # 例） ✅ 解析完了！⏱️ 基準時間:17:26:45 (21:07:21)
-    if not base_str or not results or not server:
-        return "⚠️ 解析完了… ですが計算できませんでした。画像やOCR結果をご確認ください。"
-    head = f"✅ 解析完了！⏱️ 基準時間:{base_str}" + (f" ({cease_str})" if cease_str else "")
-    body_lines = [f"{server}-{pl}-{t}" for (pl, t) in results]
-    return head + "\n" + "\n".join(body_lines)
+                         results: List[Tuple[int, str]],
+                         diag: Dict) -> str:
+    # 成功
+    if base_str and results and server:
+        head = f"✅ 解析完了！⏱️ 基準時間:{base_str}" + (f" ({cease_str})" if cease_str else "")
+        body_lines = [f"{server}-{pl}-{t}" for (pl, t) in results]
+        return head + "\n" + "\n".join(body_lines)
+    # 失敗（理由つき）
+    return _build_failure_message(diag)
 
 # ---------------------------
 # パイプライン
@@ -1182,8 +1236,8 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, 
 
     oai_text, _ = openai_ocr_png(final_img)
 
-    server, base_str, cease_str, results = parse_and_compute(oai_text)
-    message = build_result_message(server, base_str, cease_str, results)
+    server, base_str, cease_str, results, diag = parse_and_compute(oai_text)
+    message = build_result_message(server, base_str, cease_str, results, diag)
 
     return final_img, message, (server or ""), results, oai_text
 
@@ -1250,21 +1304,17 @@ async def run_pipeline_for_attachments(
     pairs_all: List[Tuple[str, int, str]] = [(srv, plc, ts) for (srv, plc, ts, _w) in sorted_items]
 
     # ---- 表示用：重複は“遅い時刻”だけを1件表示、順番は並べ替えなし（OCR順） ----
-    # (server, place) -> 採用する timestr（=最遅）
     latest_timestr_map: Dict[Tuple[str, int], str] = {k: v[0] for k, v in latest_by_place.items()}
-
     reg_lines: List[str] = []
     already_emitted: Set[Tuple[str, int]] = set()  # 同時刻重複対策（片方だけ表示）
     for srv, plc, ts in raw_pairs_all:
         want_ts = latest_timestr_map.get((srv, plc))
         if want_ts is None:
             continue
-        # “遅い時刻”でなければスキップ（より遅いものが後で出てくる）
         if ts != want_ts:
-            continue
-        # 同時刻重複（完全一致）が複数来た場合は最初の1件だけ表示
+            continue  # “遅い時刻”だけ表示
         if (srv, plc) in already_emitted:
-            continue
+            continue  # 完全重複は片方だけ
         reg_lines.append(f"{srv}-{plc}-{ts}")
         already_emitted.add((srv, plc))
 
@@ -1295,7 +1345,7 @@ async def run_pipeline_for_attachments(
 # Commands
 # ---------------------------
 
-@bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR→計算（複数画像OK）。OCR原文も返します。")
+@bot.command(name="oaiocr", help="画像を添付して実行。処理→詰め→OpenAI OCR→計算（複数画像OK）。OCR原文も返します。※このコマンドはスケジュール登録しません。")
 async def oaiocr(ctx: commands.Context):
     try:
         atts = [a for a in ctx.message.attachments if _is_image_attachment(a)]
@@ -1316,9 +1366,9 @@ async def oaiocr(ctx: commands.Context):
         if fileobj:
             await ctx.send(file=fileobj)
 
-        # スケジュール登録＋ボード更新＋コピー即時通知（割り込み挿入）
-        if pairs:
-            await add_events_and_refresh_board(pairs)
+        # ❌ `!oaiocr` はスケジュール登録しない
+        # if pairs:
+        #     await add_events_and_refresh_board(pairs)
 
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
@@ -1548,7 +1598,7 @@ async def on_message(message: discord.Message):
             # プレースホルダを編集（解析完了通知）
             await placeholder.edit(content=result_text)
 
-            # スケジュール登録＋ボード更新＋コピー即時通知（割り込み挿入）
+            # ✅ 自動モードはスケジュール登録する（従来どおり）
             if pairs:
                 await add_events_and_refresh_board(pairs)
 
