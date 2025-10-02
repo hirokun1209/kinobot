@@ -107,6 +107,12 @@ RE_TIME_LOOSE  = re.compile(
 # OCRでサーバー拾う用（[S1234], S1234, s1234 など）
 RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")
 
+# 免戦行の先頭に「数字 免...」が来るパターン用（例: "1 免戦中 05:27:35"）
+RE_BARE_PLACE_BEFORE_IMMUNE = re.compile(r"^\s*(\d{1,3})\D*免")
+
+# コピーCHの自動行パターン（例: "1234-5-17:00:00"）※孤児クリーンアップで使用
+RE_COPY_LINE = re.compile(r"^\s*\d{2,5}-\d{1,3}-\d{2}:\d{2}:\d{2}\s*$")
+
 # フォールバック：ブロック高さに対する“必ず残す”上部割合
 FALLBACK_KEEP_TOP_RATIO = 0.35
 
@@ -163,12 +169,10 @@ def _extract_place(line: str) -> Optional[int]:
     タイトル行から駐騎場ナンバーだけを抽出。
     条件:
       - 行に「場/场」と、かつ「越/域/駐/驻/戦/戰/闘」のいずれかを含む
-      - 行に「免戦系」を含まない（免戦中行は除外）
+      - 「免戦行」でも許容（同一行に '...場 4 免戦中 ...' などがあるケース対応）
       - 「場」の直後にある 1-3 桁の数字のみ採用（行末数字のフォールバックはしない）
     """
     s = unicodedata.normalize("NFKC", line)
-    if _is_immune_line(s):
-        return None
     if not re.search(r"[场場]", s):
         return None
     if not re.search(r"[越域駐驻戦戰闘]", s):
@@ -529,6 +533,37 @@ async def _reorder_copy_channel_to_match_schedule():
                         print(f"[guard] copy edit failed: {e}")
                     it["copy_msg_id"] = msg.id
 
+async def _cleanup_copy_orphans(max_scan: int = 300):
+    """
+    コピーチャンネルの「ボットが送った自動行（server-place-HH:MM:SS）」のうち、
+    SCHEDULE から参照されていない（copy_msg_id に含まれない）ものを削除する。
+    """
+    if not COPY_CHANNEL_ID:
+        return
+    ch = await _get_text_channel(COPY_CHANNEL_ID)
+    if not ch or not bot.user:
+        return
+
+    async with SCHEDULE_LOCK:
+        valid_ids: Set[int] = {it["copy_msg_id"] for it in SCHEDULE if it.get("copy_msg_id")}
+
+    try:
+        async for msg in ch.history(limit=max_scan):
+            if msg.author.id != bot.user.id:
+                continue
+            if msg.pinned:
+                continue
+            if not RE_COPY_LINE.match(msg.content or ""):
+                continue
+            if msg.id in valid_ids:
+                continue
+            try:
+                await msg.delete()
+            except Exception as e:
+                print(f"[cleanup] delete failed: {e}")
+    except Exception as e:
+        print(f"[cleanup] history failed: {e}")
+
 @tasks.loop(seconds=60.0)
 async def order_guard_tick():
     """
@@ -537,6 +572,7 @@ async def order_guard_tick():
       - スキップフラグ再計算
       - 通知ボード再描画
       - コピー用チャンネルの整列補修（欠落補完＆内容入れ替え）
+      - コピーチャンネルの孤児メッセージ掃除
     """
     try:
         async with SCHEDULE_LOCK:
@@ -553,6 +589,11 @@ async def order_guard_tick():
         await _reorder_copy_channel_to_match_schedule()
     except Exception as e:
         print(f"[guard] reorder copy channel failed: {e}")
+
+    try:
+        await _cleanup_copy_orphans(max_scan=300)
+    except Exception as e:
+        print(f"[guard] cleanup failed: {e}")
 
 @order_guard_tick.before_loop
 async def before_guard():
@@ -1146,22 +1187,49 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
                 used_idx.add(i)
 
-        # place
+        # place（タイトルや同一行の「…場 4 免戦中 …」にも反応）
         pl = _extract_place(raw)
         if pl is not None:
             pairs.append({"place": pl, "place_idx": i, "immune_sec": None, "immune_idx": None})
 
         # immune time
         if _is_immune_line(raw):
+            # 免戦行に場番号が含まれているか（タイトル式 or 行頭数字式）
+            imm_pl: Optional[int] = pl
+            if imm_pl is None:
+                m_bare = RE_BARE_PLACE_BEFORE_IMMUNE.search(unicodedata.normalize("NFKC", raw))
+                if m_bare:
+                    try:
+                        imm_pl = int(m_bare.group(1))
+                    except Exception:
+                        imm_pl = None
+
             tt = _extract_time_like(raw)
             if tt:
                 tsec = _time_to_seconds(tt, prefer_mmss=True)
-                for j in range(len(pairs)-1, -1, -1):
-                    if pairs[j]["immune_sec"] is None:
-                        pairs[j]["immune_sec"] = tsec
-                        pairs[j]["immune_idx"] = i
-                        # used は「有効ペア」確定後に加算する
-                        break
+
+                assigned = False
+                if imm_pl is not None:
+                    # 同じ場番号で未割当の最新ペアを優先して割当
+                    for j in range(len(pairs)-1, -1, -1):
+                        if pairs[j]["place"] == imm_pl and pairs[j]["immune_sec"] is None:
+                            pairs[j]["immune_sec"] = tsec
+                            pairs[j]["immune_idx"] = i
+                            assigned = True
+                            break
+                    # まだ無ければ、当該場の新規ペアをこの行で作成
+                    if not assigned:
+                        pairs.append({"place": imm_pl, "place_idx": i, "immune_sec": tsec, "immune_idx": i})
+                        assigned = True
+                if not assigned:
+                    # フォールバック：直近の未割当ペアに付与
+                    for j in range(len(pairs)-1, -1, -1):
+                        if pairs[j]["immune_sec"] is None:
+                            pairs[j]["immune_sec"] = tsec
+                            pairs[j]["immune_idx"] = i
+                            assigned = True
+                            break
+                # used は「有効ペア」確定後に加算する（後でまとめて）
 
     # 計算
     calc: List[Tuple[int, int]] = []
