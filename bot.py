@@ -1325,15 +1325,15 @@ async def run_pipeline_for_attachments(
     atts: List[discord.Attachment],
     *,
     want_image: bool
-) -> Tuple[Optional[discord.File], str, List[Tuple[str, int, str]], str]:
+) -> Tuple[Optional[discord.File], str, List[Tuple[str, int, str]], str, str]:
     """
     複数画像を処理。
     return:
       - fileobj: 画像を返す場合は1枚（縦結合）
-      - message: 全結果の連結テキスト＋末尾に
-                 「登録リスト（重複は遅い時刻のみ／並べ替えなし=OCR順で表示）」を付与
+      - message: 全結果の連結テキスト（※登録リストは含めない）
       - pairs:   スケジュール登録用（同一(server,place)は遅い時刻のみ→時間順で整列）
       - ocr_joined: すべてのOCRテキストを連結（!oaiocr用デバッグ表示）
+      - reg_text: 1行1予定の登録リスト文字列（ヘッダー無し／OCR順で重複は遅い時刻のみ）
     """
     images: List[Image.Image] = []
     messages: List[str] = []
@@ -1386,16 +1386,10 @@ async def run_pipeline_for_attachments(
         reg_lines.append(f"{srv}-{plc}-{ts}")
         already_emitted.add((srv, plc))
 
-    reg_block = ""
-    if reg_lines:
-        reg_block = "📌 登録リスト（重複は“遅い時刻”のみ／並べ替えなし）\n" + "\n".join(reg_lines)
-
-    # 連結テキスト
+    # 連結テキスト（登録リストは別メッセージで出すため含めない）
     full_message = "\n\n".join(messages) if messages else "⚠️ 結果がありませんでした。"
-    if reg_block:
-        full_message = f"{full_message}\n\n{reg_block}"
 
-    # OCR原文（!oaiocr のみ付与）
+    # OCR原文（!oaiocr のみ付与用）
     ocr_joined = "\n\n".join(ocr_texts) if ocr_texts else ""
 
     # 画像は1枚にまとめる or 返さない
@@ -1407,7 +1401,8 @@ async def run_pipeline_for_attachments(
         out.seek(0)
         fileobj = discord.File(out, filename="result.png")
 
-    return fileobj, full_message, pairs_all, ocr_joined
+    reg_text = "\n".join(reg_lines) if reg_lines else ""
+    return fileobj, full_message, pairs_all, ocr_joined, reg_text
 
 # ---------------------------
 # Commands
@@ -1424,13 +1419,18 @@ async def oaiocr(ctx: commands.Context):
         # まずは即レス（のちに編集）
         placeholder = await ctx.reply("解析中…🔎")
 
-        fileobj, message, pairs, ocr_all = await run_pipeline_for_attachments(atts, want_image=True)
+        fileobj, message, pairs, ocr_all, reg_text = await run_pipeline_for_attachments(atts, want_image=True)
 
         # 結果＋OCR原文（コードブロック）に編集差し替え。画像は別送（1枚に統合）
         if ocr_all:
             message = f"{message}\n\n🧾 OpenAI OCR 原文:\n```\n{ocr_all}\n```"
 
         await placeholder.edit(content=message)
+
+        # ← 登録リストは別メッセージで送信（ヘッダー無し）
+        if reg_text:
+            await ctx.send(reg_text)
+
         if fileobj:
             await ctx.send(file=fileobj)
 
@@ -1661,10 +1661,14 @@ async def on_message(message: discord.Message):
             placeholder = await message.channel.send("解析中…🔎")
 
             # 解析（画像は返さない / OCR原文は自動モードでは省略）
-            _, result_text, pairs, _ = await run_pipeline_for_attachments(atts, want_image=False)
+            _, result_text, pairs, _, reg_text = await run_pipeline_for_attachments(atts, want_image=False)
 
             # プレースホルダを編集（解析完了通知）
             await placeholder.edit(content=result_text)
+
+            # 登録リストは別メッセージで送信（ヘッダー無し）
+            if reg_text:
+                await message.channel.send(reg_text)
 
             # ✅ 自動モードはスケジュール登録する（従来どおり）
             if pairs:
