@@ -1333,11 +1333,10 @@ async def run_pipeline_for_attachments(
       - message: 全結果の連結テキスト（※登録リストは含めない）
       - pairs:   スケジュール登録用（同一(server,place)は遅い時刻のみ→時間順で整列）
       - ocr_joined: すべてのOCRテキストを連結（!oaiocr用デバッグ表示）
-      - reg_text: 1行1予定の登録リスト文字列（ヘッダー無し／OCR順で重複は遅い時刻のみ）
+      - reg_text: 「📌 登録リスト」ヘッダ付きの行リスト（OCR順で重複は遅い時刻のみ。空なら ""）
     """
     images: List[Image.Image] = []
     messages: List[str] = []
-    # 表示用の“生”候補（OCR検出順を保持）
     raw_pairs_all: List[Tuple[str, int, str]] = []
     ocr_texts: List[str] = []
 
@@ -1401,7 +1400,9 @@ async def run_pipeline_for_attachments(
         out.seek(0)
         fileobj = discord.File(out, filename="result.png")
 
-    reg_text = "\n".join(reg_lines) if reg_lines else ""
+    # ✅ ヘッダ付きで返す（空なら ""）
+    reg_text = f"📌 登録リスト\n{'\n'.join(reg_lines)}" if reg_lines else ""
+
     return fileobj, full_message, pairs_all, ocr_joined, reg_text
 
 # ---------------------------
