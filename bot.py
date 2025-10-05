@@ -816,6 +816,26 @@ def _parse_register_list_block(text: str) -> List[Tuple[str, int, str]]:
         if server and place is not None and timestr:
             pairs.append((server, place, timestr))
     return pairs
+    
+def _parse_plain_reg_lines(text: str) -> List[Tuple[str, int, str]]:
+    """
+    ヘッダ無しの行（または !add の次行以降）を (server, place, timestr) に変換。
+    例: 1234-5-20:00:00 / s1234-5-20:00 など（:00 補完あり）
+    ※ 「📌 登録リスト」行や箇条書き記号（・-* >）が混ざってもスキップします。
+    """
+    pairs: List[Tuple[str, int, str]] = []
+    for ln in text.splitlines():
+        n = unicodedata.normalize("NFKC", ln).strip()
+        if not n:
+            continue
+        if RE_REG_HEADER.search(n):
+            continue
+        # 箇条書き記号などを除去
+        n = re.sub(r"^[\s・\-\*\u2022>]+", "", n)
+        server, place, timestr = _parse_spec_tokens([n])
+        if server and place is not None and timestr:
+            pairs.append((server, place, timestr))
+    return pairs
 
 # ---------------------------
 # スケジューラ（アラート＋消込み）
@@ -1478,18 +1498,65 @@ def _has_manage_perm(ctx: commands.Context) -> bool:
 @bot.command(
     name="add",
     aliases=["a"],
-    help="手動追加: !add s123 5 12:34[:56] / !add 1234 5 12:34[:56] / !add s123-5-12:34[:56] / !add 1234-5-12:34[:56]\n同一駐騎場が既にあれば遅い時間を採用（置換）"
+    help="手動追加: !add s123 5 12:34[:56] / !add 1234 5 12:34[:56] / !add s123-5-12:34[:56] / !add 1234-5-12:34[:56]\n\
+📌 登録リストやヘッダ無しの複数行を !add / !a の下に貼ると、同一(server,place)は“最後に書いた行”で**上書き**登録します。"
 )
 async def cmd_add(ctx: commands.Context, *args):
     try:
-        server, place, timestr = _parse_spec_tokens(list(args))
-        if not server or place is None or not timestr:
-            await ctx.reply("使い方: `!add 1234-1-17:00:00` など（`!add s123 1 17:00` 形式も可）")
+        raw = ctx.message.content or ""
+
+        # 1) 「📌 登録リスト」ブロック付き → 一括“上書き”
+        if RE_REG_HEADER.search(unicodedata.normalize("NFKC", raw)):
+            pairs = _parse_register_list_block(raw)
+            if not pairs:
+                await ctx.reply("登録リストの行が見つかりませんでした。`1234-5-12:34:56` 形式で書いてください。")
+                return
+            # 最後に書いた行が勝ち（上書き）
+            last_win: Dict[Tuple[str, int], str] = {}
+            order: List[Tuple[str, int]] = []
+            for s, p, t in pairs:
+                key = (s, p)
+                if key not in order:
+                    order.append(key)
+                last_win[key] = t
+
+            # 既存を削除 → 新規追加
+            for (s, p) in order:
+                await _delete_events(server=s, place=p, timestr=None)
+            to_add = [(s, p, last_win[(s, p)]) for (s, p) in order]
+            await add_events_and_refresh_board(to_add)
+            await ctx.reply(f"📌 登録リストから {len(to_add)} 件を**上書き**登録しました。")
             return
 
-        # 置換ロジックは add_events_and_refresh_board に内蔵
+        # 2) ヘッダ無しの“複数行”が !add の次行から貼られている → 一括“上書き”
+        after_cmd = raw.partition("\n")[2]  # 1行目(!add / !a)以降
+        pairs_plain = _parse_plain_reg_lines(after_cmd)
+        if pairs_plain:
+            last_win: Dict[Tuple[str, int], str] = {}
+            order: List[Tuple[str, int]] = []
+            for s, p, t in pairs_plain:
+                key = (s, p)
+                if key not in order:
+                    order.append(key)
+                last_win[key] = t
+
+            for (s, p) in order:
+                await _delete_events(server=s, place=p, timestr=None)
+            to_add = [(s, p, last_win[(s, p)]) for (s, p) in order]
+            await add_events_and_refresh_board(to_add)
+            await ctx.reply(f"{len(to_add)} 件を**上書き**登録しました。")
+            return
+
+        # 3) 従来の単発追加（1件）
+        server, place, timestr = _parse_spec_tokens(list(args))
+        if not server or place is None or not timestr:
+            await ctx.reply("使い方:\n- `!add 1234-1-17:00:00`\n- `!add s123 1 17:00`\n- または `!add` の下に複数行で\n```\n1272-7-20:04:54\n1272-8-20:10:09\n...```\nを貼ると一括**上書き**登録します。")
+            return
+
+        # 単発は従来どおり（遅い時間優先の置換は add_events 内に内蔵）
         await add_events_and_refresh_board([(server, place, timestr)])
         await ctx.reply(f"追加（または置換）しました: S{server}-{place}-{timestr}")
+
     except Exception as e:
         await ctx.reply(f"エラー: {e}")
 
@@ -1679,14 +1746,27 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        # --- 📌 登録リストブロック → まとめて登録（!add と同じロジック） ---
+        # --- 📌 登録リストブロック → まとめて登録（!add と同じ = 上書き） ---
         content_txt = (message.content or "")
         if content_txt and RE_REG_HEADER.search(unicodedata.normalize("NFKC", content_txt)):
             pairs_from_block = _parse_register_list_block(content_txt)
             if pairs_from_block:
-                await add_events_and_refresh_board(pairs_from_block)
+                # 最後に書いた行が勝ち（上書き）
+                last_win: Dict[Tuple[str, int], str] = {}
+                order: List[Tuple[str, int]] = []
+                for s, p, t in pairs_from_block:
+                    key = (s, p)
+                    if key not in order:
+                        order.append(key)
+                    last_win[key] = t
+
+                for (s, p) in order:
+                    await _delete_events(server=s, place=p, timestr=None)
+                to_add = [(s, p, last_win[(s, p)]) for (s, p) in order]
+                await add_events_and_refresh_board(to_add)
+
                 await message.channel.send(
-                    f"📥 登録リストを反映しました（{len(pairs_from_block)}件）",
+                    f"📥 登録リストを**上書き**反映しました（{len(to_add)}件）",
                     allowed_mentions=discord.AllowedMentions.none()
                 )
             else:
