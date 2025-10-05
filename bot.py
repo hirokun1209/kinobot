@@ -1400,8 +1400,12 @@ async def run_pipeline_for_attachments(
         out.seek(0)
         fileobj = discord.File(out, filename="result.png")
 
-    # ✅ ヘッダ付きで返す（空なら ""）
-    reg_text = f"📌 登録リスト\n{'\n'.join(reg_lines)}" if reg_lines else ""
+    # ✅ バックスラッシュを式中に書かないように分けて作る
+    if reg_lines:
+        body = "\n".join(reg_lines)
+        reg_text = f"📌 登録リスト\n{body}"
+    else:
+        reg_text = ""
 
     return fileobj, full_message, pairs_all, ocr_joined, reg_text
 
