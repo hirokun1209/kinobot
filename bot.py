@@ -794,6 +794,29 @@ def _parse_spec_tokens(args: List[str]) -> Tuple[Optional[str], Optional[int], O
     # 単体で s123 / 1234 などは不可
     return None, None, None
 
+# 「📌 登録リスト」ヘッダ検出
+RE_REG_HEADER = re.compile(r"^\s*[📌\-\*・]?\s*登録\s*リスト", re.IGNORECASE)
+
+def _parse_register_list_block(text: str) -> List[Tuple[str, int, str]]:
+    """
+    '📌 登録リスト' を含むテキストから 1234-5-12:34[:56] の行を抜き出し、
+    (server, place, timestr) の配列にして返す。
+    """
+    pairs: List[Tuple[str, int, str]] = []
+    for ln in text.splitlines():
+        n = unicodedata.normalize("NFKC", ln).strip()
+        if not n:
+            continue
+        # ヘッダ行はスキップ
+        if RE_REG_HEADER.search(n):
+            continue
+        # 箇条書き記号など除去（・-* や > など）
+        n = re.sub(r"^[\s・\-\*\u2022>]+", "", n)
+        server, place, timestr = _parse_spec_tokens([n])
+        if server and place is not None and timestr:
+            pairs.append((server, place, timestr))
+    return pairs
+
 # ---------------------------
 # スケジューラ（アラート＋消込み）
 # ---------------------------
@@ -1656,7 +1679,24 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        # 対象チャンネルかつ画像が含まれているか
+        # --- 📌 登録リストブロック → まとめて登録（!add と同じロジック） ---
+        content_txt = (message.content or "")
+        if content_txt and RE_REG_HEADER.search(unicodedata.normalize("NFKC", content_txt)):
+            pairs_from_block = _parse_register_list_block(content_txt)
+            if pairs_from_block:
+                await add_events_and_refresh_board(pairs_from_block)
+                await message.channel.send(
+                    f"📥 登録リストを反映しました（{len(pairs_from_block)}件）",
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            else:
+                await message.channel.send(
+                    "登録リストの行が見つかりませんでした。`1234-5-12:34:56` の形式で1行ずつ入れてください。",
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            return
+
+        # --- 送信専用チャンネル：画像が含まれているなら自動解析 ---
         if INPUT_CHANNEL_IDS and message.channel.id in INPUT_CHANNEL_IDS:
             atts = [a for a in message.attachments if _is_image_attachment(a)]
             if not atts:
@@ -1671,7 +1711,7 @@ async def on_message(message: discord.Message):
             # プレースホルダを編集（解析完了通知）
             await placeholder.edit(content=result_text)
 
-            # 登録リストは別メッセージで送信（ヘッダー無し）
+            # 登録リストは別メッセージで送信（ヘッダー付き）
             if reg_text:
                 await message.channel.send(reg_text)
 
