@@ -86,16 +86,28 @@ TRIM_RULES = {
 }
 
 # ---------------------------
-# 正規表現 / ルール
+# 正規表現 / ルール（差し替え）
 # ---------------------------
+
+# タイトルっぽさ判定に使う文字（どれか1つでもあればOK）
+TITLE_CHARS = "越域駐驻騎骑場场"
+
+# 免戦の最大秒数（08:00:00 = 8h）
+MAX_IMMUNE_SEC = 8 * 60 * 60
+
+# 駐騎ナンバーの最大値
+MAX_PLACE_NUM = 12
 
 # 「免戦中」厳密
 RE_IMMUNE = re.compile(r"免\s*戦\s*中")
 # 「免 / 戦 / 戰 / 中」いずれか1文字でも含めば候補（誤検知抑制のため時刻併記も必須にする）
 RE_IMMUNE_LOOSE = re.compile(r"[免戦戰中]")
 
-# タイトル系（圧縮用=形）
-RE_TITLE_COMPACT = re.compile(r"(?:越\s*域|戦\s*闘)\s*駐[\u4E00-\u9FFF]{0,3}\s*場")
+# 圧縮用タイトル検出（※どれか1文字でも含めばOKに緩和）
+RE_TITLE_COMPACT = re.compile(f"[{TITLE_CHARS}]")
+
+# “タイトルらしさ”検出（_extract_place のフォールバック用）
+RE_TITLE_ANY = re.compile(f"[{TITLE_CHARS}]")
 
 # 時刻検出
 RE_TIME_STRICT = re.compile(r"\d{1,2}[：:]\d{2}(?:[：:]\d{2})?")
@@ -116,10 +128,12 @@ RE_COPY_LINE = re.compile(r"^\s*\d{2,5}-\d{1,3}-\d{2}:\d{2}:\d{2}\s*$")
 # フォールバック：ブロック高さに対する“必ず残す”上部割合
 FALLBACK_KEEP_TOP_RATIO = 0.35
 
+
 def _has_time_like(s: str) -> bool:
     """行に“時刻っぽい”表記があるか（緩め判定）"""
     s = unicodedata.normalize("NFKC", s)
     return bool(RE_TIME_STRICT.search(s) or RE_TIME_LOOSE.search(s))
+
 
 def _extract_time_like(s: str) -> Optional[str]:
     """
@@ -155,34 +169,50 @@ def _extract_time_like(s: str) -> Optional[str]:
         return f"{a}:{b}:{c}"
     return f"{a}:{b}"
 
+
 def _is_immune_line(s: str) -> bool:
     """
     その行が「免戦中系」を指しているかの緩め判定：
-    - 厳密マッチ（免\s*戦\s*中）or
+    - 厳密マッチ（免\s*戦\s*中）※空白/改行も無視して判定
     - 1文字でも含む & 行内に時刻っぽい表記がある
     """
     n = unicodedata.normalize("NFKC", s)
-    return bool(RE_IMMUNE.search(n) or (RE_IMMUNE_LOOSE.search(n) and _has_time_like(n)))
+    n_nospace = re.sub(r"\s+", "", n)  # 改行や全角空白も削除して厳密判定に使う
+    return bool(RE_IMMUNE.search(n_nospace) or (RE_IMMUNE_LOOSE.search(n) and _has_time_like(n)))
+
 
 def _extract_place(line: str) -> Optional[int]:
     """
-    タイトル行から駐騎場ナンバーだけを抽出。
-    条件:
-      - 行に「場/场」と、かつ「越/域/駐/驻/戦/戰/闘」のいずれかを含む
-      - 「免戦行」でも許容（同一行に '...場 4 免戦中 ...' などがあるケース対応）
-      - 「場」の直後にある 1-3 桁の数字のみ採用（行末数字のフォールバックはしない）
+    駐騎場ナンバー抽出（緩和版）:
+      優先1) 「場/场」の直後の数字（1〜MAX_PLACE_NUM）
+      優先2) タイトルっぽい文字(TITLE_CHARS)を含み、かつ行内にコロン(:/：)がなく、
+             1〜MAX_PLACE_NUM の“単独数字”があれば採用
+      優先3) 行全体が 1〜MAX_PLACE_NUM の数字だけ（コロン無し）なら採用
     """
     s = unicodedata.normalize("NFKC", line)
-    if not re.search(r"[场場]", s):
-        return None
-    if not re.search(r"[越域駐驻戦戰闘]", s):
-        return None
+
+    # 優先1) 「場」の直後
     m = re.search(r"[场場]\s*([0-9]{1,3})\b", s)
     if m:
         try:
-            return int(m.group(1))
+            v = int(m.group(1))
+            if 1 <= v <= MAX_PLACE_NUM:
+                return v
         except Exception:
-            return None
+            pass
+
+    # 優先2) タイトル文字が1つでも含まれていて、コロンが無い行
+    if RE_TITLE_ANY.search(s) and (":" not in s and "：" not in s):
+        m2 = re.search(r"\b(1[0-2]|[1-9])\b", s)
+        if m2:
+            return int(m2.group(1))
+
+    # 優先3) 行全体が 1〜12 のみ（コロン無し）
+    if ":" not in s and "：" not in s:
+        m3 = re.fullmatch(r"\s*(1[0-2]|[1-9])\s*", s)
+        if m3:
+            return int(m3.group(1))
+
     return None
 
 # --------------- チャンネル取得（デバッグ出力込み） ---------------
@@ -1004,6 +1034,9 @@ def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[st
         line_boxes.append((text, (x1, y1, x2, y2)))
     return line_boxes
 
+# ---------------------------
+# compact_7_by_removing_sections（修正点のみ）
+# ---------------------------
 def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
     """
     7番ブロック内で、タイトル～免戦/時間の直下まで残し、それ以降を詰める
@@ -1018,6 +1051,7 @@ def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
 
     for text, (x1, y1, x2, y2) in lines:
         t = _norm(text)
+        # どれか1文字でも入っていればタイトル候補として採用
         if RE_TITLE_COMPACT.search(t):
             titles.append((y1, y2))
         # 「免戦中」1文字OK + 時刻っぽい も候補に
@@ -1184,12 +1218,10 @@ def _build_failure_message(diag: Dict) -> str:
         msg += f"\n{head}\n```\n{block}\n```"
     return msg
 
+# ---------------------------
+# parse_and_compute（差し替え：免戦時間の上限8hを適用）
+# ---------------------------
 def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[Tuple[int, str]], Dict]:
-    """
-    OCRテキストから
-      server(str), base_time(HH:MM:SS), ceasefire(HH:MM:SS), results[(place, time_str)], diag(dict)
-    を返す。diag は失敗理由と「未使用テキスト」生成に使う。
-    """
     raw_lines = [ln.rstrip() for ln in oai_text.splitlines()]
     lines = [ln.strip() for ln in raw_lines if ln.strip()]
     if not lines:
@@ -1249,30 +1281,35 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
 
             tt = _extract_time_like(raw)
             if tt:
+                # MM:SS 優先 / ただし 08:00:00 を上限にする
                 tsec = _time_to_seconds(tt, prefer_mmss=True)
+                if tsec > MAX_IMMUNE_SEC:
+                    # 上限超過は免戦時間としては不採用（誤検知とみなす）
+                    tsec = None
 
-                assigned = False
-                if imm_pl is not None:
-                    # 同じ場番号で未割当の最新ペアを優先して割当
-                    for j in range(len(pairs)-1, -1, -1):
-                        if pairs[j]["place"] == imm_pl and pairs[j]["immune_sec"] is None:
-                            pairs[j]["immune_sec"] = tsec
-                            pairs[j]["immune_idx"] = i
+                if tsec is not None:
+                    assigned = False
+                    if imm_pl is not None:
+                        # 同じ場番号で未割当の最新ペアを優先
+                        for j in range(len(pairs)-1, -1, -1):
+                            if pairs[j]["place"] == imm_pl and pairs[j]["immune_sec"] is None:
+                                pairs[j]["immune_sec"] = tsec
+                                pairs[j]["immune_idx"] = i
+                                assigned = True
+                                break
+                        # まだ無ければ、当該場の新規ペアをこの行で作成
+                        if not assigned:
+                            pairs.append({"place": imm_pl, "place_idx": i, "immune_sec": tsec, "immune_idx": i})
                             assigned = True
-                            break
-                    # まだ無ければ、当該場の新規ペアをこの行で作成
                     if not assigned:
-                        pairs.append({"place": imm_pl, "place_idx": i, "immune_sec": tsec, "immune_idx": i})
-                        assigned = True
-                if not assigned:
-                    # フォールバック：直近の未割当ペアに付与
-                    for j in range(len(pairs)-1, -1, -1):
-                        if pairs[j]["immune_sec"] is None:
-                            pairs[j]["immune_sec"] = tsec
-                            pairs[j]["immune_idx"] = i
-                            assigned = True
-                            break
-                # used は「有効ペア」確定後に加算する（後でまとめて）
+                        # フォールバック：直近の未割当ペアに付与
+                        for j in range(len(pairs)-1, -1, -1):
+                            if pairs[j]["immune_sec"] is None:
+                                pairs[j]["immune_sec"] = tsec
+                                pairs[j]["immune_idx"] = i
+                                assigned = True
+                                break
+                    # used は「有効ペア」確定後に加算する（後でまとめて）
 
     # 計算
     calc: List[Tuple[int, int]] = []
