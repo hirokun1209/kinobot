@@ -120,7 +120,7 @@ RE_TIME_LOOSE  = re.compile(
 RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")
 
 # 免戦行の先頭に「数字 免...」が来るパターン用（例: "1 免戦中 05:27:35"）
-RE_BARE_PLACE_BEFORE_IMMUNE = re.compile(r"^\s*(\d{1,3})\D*免")
+RE_BARE_PLACE_BEFORE_IMMUNE = re.compile(r"^\s*(1[0-2]|[1-9])\D*免")
 
 # コピーCHの自動行パターン（例: "1234-5-17:00:00"）※孤児クリーンアップで使用
 RE_COPY_LINE = re.compile(r"^\s*\d{2,5}-\d{1,3}-\d{2}:\d{2}:\d{2}\s*$")
@@ -1278,6 +1278,9 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
                         imm_pl = int(m_bare.group(1))
                     except Exception:
                         imm_pl = None
+            # 1〜12 の範囲外は無効化（誤検知防止）
+            if imm_pl is not None and not (1 <= imm_pl <= MAX_PLACE_NUM):
+                imm_pl = None
 
             tt = _extract_time_like(raw)
             if tt:
@@ -1512,9 +1515,11 @@ async def oaiocr(ctx: commands.Context):
 
         await placeholder.edit(content=message)
 
-        # ← 登録リストは別メッセージで送信（ヘッダー無し）
+        # ← 登録リストは別メッセージで送信（ヘッダー無しに統一）
         if reg_text:
-            await ctx.send(reg_text)
+            body_only = reg_text.partition("\n")[2] if reg_text.startswith("📌 登録リスト") else reg_text
+            if body_only.strip():
+                await ctx.send(body_only)
 
         if fileobj:
             await ctx.send(file=fileobj)
