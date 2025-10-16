@@ -695,7 +695,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
 
     emoji = str(payload.emoji)
-    if emoji not in ("❌", "⭕️"):
+    if emoji not in ("❌", "⭕️", "⭕"):
         return
 
     ch = await _get_text_channel(payload.channel_id)
@@ -715,15 +715,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # トグル実行
     if emoji == "❌":
         await _toggle_guard_by_message(msg, guarded=True)
-    else:  # "⭕️"
+    else:  # "⭕️" or "⭕"
         await _toggle_guard_by_message(msg, guarded=False)
 
-    # 後始末：ユーザーのリアクションを外す（任意）
+    # 後始末：ユーザーのリアクションを外す（Intent不要の書き方）
     try:
-        guild = msg.guild
-        member = payload.member or (guild and guild.get_member(payload.user_id))
-        if member:
-            await msg.remove_reaction(payload.emoji, member)
+        await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
     except Exception:
         pass
 
