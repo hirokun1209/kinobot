@@ -122,8 +122,8 @@ RE_SERVER = re.compile(r"\[?\s*[sS]\s*([0-9]{2,5})\]?")
 # 免戦行の先頭に「数字 免...」が来るパターン用（例: "1 免戦中 05:27:35"）
 RE_BARE_PLACE_BEFORE_IMMUNE = re.compile(r"^\s*(1[0-2]|[1-9])\D*免")
 
-# コピーCHの自動行パターン（例: "1234-5-17:00:00"）※孤児クリーンアップで使用
-RE_COPY_LINE = re.compile(r"^\s*\d{2,5}-\d{1,3}-\d{2}:\d{2}:\d{2}\s*$")
+# コピーCHの自動行パターン（例: "1234-5-17:00:00"）※「 警備多数」付きも許容
+RE_COPY_LINE = re.compile(r"^\s*\d{2,5}-\d{1,3}-\d{2}:\d{2}:\d{2}(?:\s*警備多数)?\s*$")
 
 # フォールバック：ブロック高さに対する“必ず残す”上部割合
 FALLBACK_KEEP_TOP_RATIO = 0.35
@@ -247,7 +247,8 @@ COPY_LOCK = asyncio.Lock()  # コピーCHの並べ替え挿入を直列化
 #   "when": datetime, "server": str, "place": int, "timestr": "HH:MM:SS",
 #   "key": (server, place, timestr),
 #   "skip2m": bool, "sent_2m": bool, "sent_15s": bool,
-#   "copy_msg_id": Optional[int]
+#   "copy_msg_id": Optional[int],
+#   "guarded": bool,
 # }
 SCHEDULE: List[Dict] = []
 
@@ -272,7 +273,8 @@ def _render_schedule_board() -> str:
     lines = []
     for item in SCHEDULE:
         t = item["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
-        lines.append(f"・{item['server']}-{item['place']}-{t}")
+        suffix = " 警備多数" if item.get("guarded") else ""
+        lines.append(f"・{item['server']}-{item['place']}-{t}{suffix}")
     return f"{header}\n" + "\n".join(lines)
 
 async def _ensure_schedule_message(channel: discord.TextChannel) -> None:
@@ -347,7 +349,8 @@ async def _delete_copy_message_if_exists(it: Dict):
 # ---- ここから：コピーCHの安全な“割り込み挿入”ロジック ----
 
 def _fmt_copy_line(it: Dict) -> str:
-    return f"{it['server']}-{it['place']}-{it['timestr']}"
+    suffix = " 警備多数" if it.get("guarded") else ""
+    return f"{it['server']}-{it['place']}-{it['timestr']}{suffix}"
 
 async def _insert_copy_sorted(new_items: List[Dict]):
     """
@@ -631,6 +634,99 @@ async def before_guard():
 
 # ---- ここまで：1分おきの監視・並び替えガード ----
 
+# コピーメッセ行から (server, place, timestr) を抜く（末尾「 警備多数」付きもOK）
+RE_COPY_PARSE = re.compile(
+    r"^\s*(?P<server>\d{2,5})-(?P<place>\d{1,3})-(?P<time>\d{2}:\d{2}:\d{2})(?:\s*警備多数)?\s*$"
+)
+
+async def _resolve_item_by_copy_message(msg: discord.Message) -> Optional[Dict]:
+    # 1) message.id で一致
+    async with SCHEDULE_LOCK:
+        for it in SCHEDULE:
+            if it.get("copy_msg_id") == msg.id:
+                return it
+
+    # 2) 文面から一致（サーバー-場所-時刻で探す）
+    m = RE_COPY_PARSE.match((msg.content or "").strip())
+    if not m:
+        return None
+    server = m.group("server")
+    place = int(m.group("place"))
+    timestr = m.group("time")
+
+    async with SCHEDULE_LOCK:
+        for it in SCHEDULE:
+            if it["server"] == server and it["place"] == place and it["timestr"] == timestr:
+                if not it.get("copy_msg_id"):
+                    it["copy_msg_id"] = msg.id  # ついでに補完
+                return it
+    return None
+    
+async def _toggle_guard_by_message(msg: discord.Message, *, guarded: bool) -> bool:
+    it = await _resolve_item_by_copy_message(msg)
+    if not it:
+        return False
+
+    changed = False
+    async with SCHEDULE_LOCK:
+        if bool(it.get("guarded")) != bool(guarded):
+            it["guarded"] = bool(guarded)
+            changed = True
+
+    if changed:
+        # コピーチャンネルの行を編集（末尾に「 警備多数」を付け外し）
+        try:
+            await msg.edit(content=_fmt_copy_line(it))
+        except Exception as e:
+            print(f"[guard-toggle] edit failed: {e}")
+
+        # ボード更新
+        await _refresh_board()
+
+    return changed
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # ボット自身は無視
+    if bot.user and payload.user_id == bot.user.id:
+        return
+    # 対象はコピーチャンネルのみ
+    if not COPY_CHANNEL_ID or payload.channel_id != COPY_CHANNEL_ID:
+        return
+
+    emoji = str(payload.emoji)
+    if emoji not in ("❌", "⭕️"):
+        return
+
+    ch = await _get_text_channel(payload.channel_id)
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(payload.message_id)
+    except Exception:
+        return
+
+    # ボットが送った自動行のみ対象
+    if msg.author.id != (bot.user.id if bot.user else 0):
+        return
+    if not RE_COPY_LINE.match(msg.content or ""):
+        return
+
+    # トグル実行
+    if emoji == "❌":
+        await _toggle_guard_by_message(msg, guarded=True)
+    else:  # "⭕️"
+        await _toggle_guard_by_message(msg, guarded=False)
+
+    # 後始末：ユーザーのリアクションを外す（任意）
+    try:
+        guild = msg.guild
+        member = payload.member or (guild and guild.get_member(payload.user_id))
+        if member:
+            await msg.remove_reaction(payload.emoji, member)
+    except Exception:
+        pass
+
 async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     """
     pairs: [(server, place, timestr)]
@@ -675,22 +771,24 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
 
             # 既存に (server, place) があれば “遅い方” を採用
             same_place_items = [it for it in SCHEDULE if it["server"] == server and it["place"] == place]
+            preserve_guarded = any(x.get("guarded") for x in same_place_items)  # ← 追加
+            
             if same_place_items:
                 current_latest = max(same_place_items, key=lambda x: x["when"])
                 if when > current_latest["when"]:
-                    # 新しい方が遅い → 既存を全て削除して置き換え
                     for it in same_place_items:
                         if it in SCHEDULE:
                             SCHEDULE.remove(it)
                             replaced_items.append(it)
                 else:
-                    # 既存の方が遅い（または同時刻）→ 追加不要
                     continue
-
+            
             item = {
                 "when": when, "server": server, "place": place, "timestr": timestr,
-                "key": (server, place, timestr), "skip2m": False, "sent_2m": False, "sent_15s": False,
-                "copy_msg_id": None
+                "key": (server, place, timestr),
+                "skip2m": False, "sent_2m": False, "sent_15s": False,
+                "copy_msg_id": None,
+                "guarded": preserve_guarded  # ← 追加（新規= False / 置換= 既存から引き継ぎ）
             }
             SCHEDULE.append(item)
             new_items.append(item)
@@ -918,10 +1016,14 @@ async def scheduler_tick():
 
     # アラート送信（5秒後削除）※ロールメンションのみ
     if alert_ch is not None:
+        # 2分前
         for it in to_alert_2m:
-            await _send_temp_alert(alert_ch, f"⏳ **2分前**: {it['server']}-{it['place']}-{it['timestr']}")
+            suffix = " 警備多数" if it.get("guarded") else ""
+            await _send_temp_alert(alert_ch, f"⏳ **2分前**: {it['server']}-{it['place']}-{it['timestr']}{suffix}")
+        # 15秒前
         for it in to_alert_15s:
-            await _send_temp_alert(alert_ch, f"⏱️ **15秒前**: {it['server']}-{it['place']}-{it['timestr']}")
+            suffix = " 警備多数" if it.get("guarded") else ""
+            await _send_temp_alert(alert_ch, f"⏱️ **15秒前**: {it['server']}-{it['place']}-{it['timestr']}{suffix}")
 
     # 本番：コピー専用チャンネルの個別メッセージを削除（通知送信はしない）
     if fired:
