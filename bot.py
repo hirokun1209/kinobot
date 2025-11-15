@@ -10,9 +10,6 @@ import discord
 from discord.ext import commands, tasks
 from PIL import Image, ImageDraw, ImageOps
 
-# Google Vision
-from google.cloud import vision
-
 # OpenAI (official SDK v1)
 from openai import OpenAI
 
@@ -25,7 +22,6 @@ from zoneinfo import ZoneInfo
 # ---------------------------
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GOOGLE_CLOUD_VISION_JSON = os.environ.get("GOOGLE_CLOUD_VISION_JSON", "")
 
 # 自動処理する送信専用チャンネル（カンマ区切りで複数OK）
 INPUT_CHANNEL_IDS = {
@@ -47,14 +43,6 @@ TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tokyo"))
 if not DISCORD_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("DISCORD_TOKEN / OPENAI_API_KEY が未設定です。")
 
-# Google Vision 認証（JSON文字列→一時ファイル）
-if GOOGLE_CLOUD_VISION_JSON:
-    cred_path = "/tmp/gcv_credentials.json"
-    with open(cred_path, "w", encoding="utf-8") as f:
-        f.write(GOOGLE_CLOUD_VISION_JSON)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-
-gcv_client = vision.ImageAnnotatorClient()
 oai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------
@@ -74,14 +62,13 @@ TARGET_WIDTH = 708
 
 # スライス境界（%）
 CUTS = [7.51, 11.63, 25.21, 29.85, 33.62, 38.41, 61.90]  # 上からの境界％
-# 残すブロック番号（1始まり）
-KEEP = [2, 4, 6, 7]
 
-# 横方向トリミング（左/右を％でカット）
+# 残すブロック番号（1始まり）※ 停戦終了帯(4)は使わない
+KEEP = [2, 6, 7]
+
 TRIM_RULES = {
     7: (20.0, 50.0),   # 駐騎ナンバー＋免戦時間
     6: (32.48, 51.50), # サーバー番号
-    4: (44.0, 20.19),  # 停戦終了
     2: (75.98, 10.73), # 時計
 }
 
@@ -1069,131 +1056,12 @@ def trim_lr_percent(im: Image.Image, left_pct: float, right_pct: float) -> Image
     right = max(left + 1, min(right, w))
     return im.crop((left, 0, right, h))
 
-def google_ocr_word_boxes(pil_im: Image.Image) -> List[Tuple[str, Tuple[int,int,int,int]]]:
-    """Google Vision で word 単位の文字とバウンディングボックスを返す"""
-    buf = io.BytesIO()
-    pil_im.convert("RGB").save(buf, format="JPEG", quality=95)
-    image = vision.Image(content=buf.getvalue())
-
-    response = gcv_client.document_text_detection(image=image)
-    if response.error.message:
-        raise RuntimeError(response.error.message)
-
-    words: List[Tuple[str, Tuple[int,int,int,int]]] = []
-    if not response.full_text_annotation.pages:
-        return words
-
-    for page in response.full_text_annotation.pages:
-        for block in page.blocks:
-            for para in block.paragraphs:
-                for word in para.words:
-                    txt = "".join([s.text for s in word.symbols])
-                    xs = [v.x for v in word.bounding_box.vertices]
-                    ys = [v.y for v in word.bounding_box.vertices]
-                    x1, x2 = min(xs), max(xs)
-                    y1, y2 = min(ys), max(ys)
-                    words.append((txt, (x1, y1, x2, y2)))
-    return words
-
-def google_ocr_line_boxes(pil_im: Image.Image, y_tol: int = 18) -> List[Tuple[str, Tuple[int,int,int,int]]]:
-    """wordをY座標で行グループ化して (line_text, (x1,y1,x2,y2)) を返す。"""
-    words = google_ocr_word_boxes(pil_im)
-    if not words:
-        return []
-
-    # 中心Yでソート
-    items = []
-    for txt, (x1, y1, x2, y2) in words:
-        cy = (y1 + y2) / 2.0
-        items.append((cy, x1, y1, x2, y2, txt))
-    items.sort(key=lambda t: (t[0], t[1]))
-
-    lines: List[List[Tuple[int,int,int,int,str]]] = []
-    for cy, x1, y1, x2, y2, txt in items:
-        if not lines:
-            lines.append([(x1, y1, x2, y2, txt)])
-            continue
-        last = lines[-1]
-        ly1 = min(a[1] for a in last)
-        ly2 = max(a[3] for a in last)
-        lcy = (ly1 + ly2) / 2.0
-        if abs(cy - lcy) <= y_tol:
-            last.append((x1, y1, x2, y2, txt))
-        else:
-            lines.append([(x1, y1, x2, y2, txt)])
-
-    line_boxes: List[Tuple[str, Tuple[int,int,int,int]]] = []
-    for chunks in lines:
-        chunks.sort(key=lambda a: a[0])  # x1
-        text = "".join(c[4] for c in chunks)  # スペース無しで連結
-        x1 = min(c[0] for c in chunks)
-        y1 = min(c[1] for c in chunks)
-        x2 = max(c[2] for c in chunks)
-        y2 = max(c[3] for c in chunks)
-        line_boxes.append((text, (x1, y1, x2, y2)))
-    return line_boxes
-
 # ---------------------------
 # compact_7_by_removing_sections（修正点のみ）
 # ---------------------------
 def compact_7_by_removing_sections(pil_im: Image.Image) -> Image.Image:
-    """
-    7番ブロック内で、タイトル～免戦/時間の直下まで残し、それ以降を詰める
-    """
-    im = pil_im.copy()
-    w, h = im.size
-
-    lines = google_ocr_line_boxes(im, y_tol=18)
-
-    titles: List[Tuple[int,int]] = []
-    candidates: List[Tuple[int,int]] = []
-
-    for text, (x1, y1, x2, y2) in lines:
-        t = _norm(text)
-        # どれか1文字でも入っていればタイトル候補として採用
-        if RE_TITLE_COMPACT.search(t):
-            titles.append((y1, y2))
-        # 「免戦中」1文字OK + 時刻っぽい も候補に
-        if _has_time_like(text) or _is_immune_line(text):
-            candidates.append((y1, y2))
-
-    titles.sort(key=lambda p: p[0])
-    candidates.sort(key=lambda p: p[0])
-
-    if not titles:
-        return im
-
-    keep_slices: List[Tuple[int,int]] = []
-    for i, (t_y1, t_y2) in enumerate(titles):
-        start = t_y1
-        end = titles[i + 1][0] if i + 1 < len(titles) else h
-        if end <= start:
-            continue
-
-        cand_bottom = None
-        for cy1, cy2 in candidates:
-            if start <= cy1 < end:
-                cand_bottom = cy2
-        if cand_bottom is not None:
-            cut_at = cand_bottom
-        else:
-            cut_at = min(end, int(round(start + (end - start) * FALLBACK_KEEP_TOP_RATIO)))
-            cut_at = max(cut_at, t_y2)
-
-        if cut_at > start:
-            keep_slices.append((start, cut_at))
-
-    if not keep_slices:
-        return im
-
-    segments = [im.crop((0, a, w, b)) for (a, b) in keep_slices]
-    out_h = sum(seg.height for seg in segments)
-    out = Image.new("RGBA", (w, out_h), (0, 0, 0, 0))
-    y = 0
-    for seg in segments:
-        out.paste(seg, (0, y))
-        y += seg.height
-    return out
+    """GCV撤去版：何もしないで返す"""
+    return pil_im
 
 def hstack(im_left: Image.Image, im_right: Image.Image, gap: int = 8, bg=(0,0,0,0)) -> Image.Image:
     """左右結合（高さは大きい方に合わせ中央寄せ）"""
@@ -1320,23 +1188,21 @@ def _build_failure_message(diag: Dict) -> str:
 # ---------------------------
 # parse_and_compute（差し替え：免戦時間の上限8hを適用）
 # ---------------------------
-def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[Tuple[int, str]], Dict]:
+def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], List[Tuple[int, str]], Dict]:
     raw_lines = [ln.rstrip() for ln in oai_text.splitlines()]
     lines = [ln.strip() for ln in raw_lines if ln.strip()]
     if not lines:
-        return None, None, None, [], {"unused_lines": [], "server_found": False, "base_found": False,
-                                      "place_total": 0, "place_missing_immune": 0}
+        return None, None, [], {"unused_lines": [], "server_found": False, "base_found": False,
+                                "place_total": 0, "place_missing_immune": 0}
 
     used_idx: Set[int] = set()
 
     server = None
     base_time_sec: Optional[int] = None
-    ceasefire_sec: Optional[int] = None
 
     # pair: {'place':int,'place_idx':int,'immune_sec':Optional[int],'immune_idx':Optional[int]}
     pairs: List[Dict] = []
 
-    # 1周: サーバー / 基準 / 停戦終了 / 越域駐〇場 + 免戦 を順に拾う
     for i, raw in enumerate(lines):
         n = _norm(raw)
 
@@ -1347,28 +1213,20 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
                 server = m.group(1)
                 used_idx.add(i)
 
-        # ceasefire
-        if "停戦" in n:
-            tt = _extract_time_like(raw)
-            if tt:
-                ceasefire_sec = _time_to_seconds(tt, prefer_mmss=False)
-                used_idx.add(i)
-
-        # base_time（免戦/停戦行は除外）
+        # 基準時刻（免戦行は除外／「停戦」は無視したいので除外キープ）
         if base_time_sec is None and (not _is_immune_line(raw)) and ("停戦" not in n):
             tt = _extract_time_like(raw)
             if tt:
                 base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
                 used_idx.add(i)
 
-        # place（タイトルや同一行の「…場 4 免戦中 …」にも反応）
+        # 駐騎場番号
         pl = _extract_place(raw)
         if pl is not None:
             pairs.append({"place": pl, "place_idx": i, "immune_sec": None, "immune_idx": None})
 
-        # immune time
+        # 免戦時間（MM:SS優先）
         if _is_immune_line(raw):
-            # 免戦行に場番号が含まれているか（タイトル式 or 行頭数字式）
             imm_pl: Optional[int] = pl
             if imm_pl is None:
                 m_bare = RE_BARE_PLACE_BEFORE_IMMUNE.search(unicodedata.normalize("NFKC", raw))
@@ -1377,65 +1235,45 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
                         imm_pl = int(m_bare.group(1))
                     except Exception:
                         imm_pl = None
-            # 1〜12 の範囲外は無効化（誤検知防止）
             if imm_pl is not None and not (1 <= imm_pl <= MAX_PLACE_NUM):
                 imm_pl = None
 
             tt = _extract_time_like(raw)
             if tt:
-                # MM:SS 優先 / ただし 08:00:00 を上限にする
                 tsec = _time_to_seconds(tt, prefer_mmss=True)
-                if tsec > MAX_IMMUNE_SEC:
-                    # 上限超過は免戦時間としては不採用（誤検知とみなす）
-                    tsec = None
-
-                if tsec is not None:
+                if tsec is not None and tsec <= MAX_IMMUNE_SEC:
                     assigned = False
                     if imm_pl is not None:
-                        # 同じ場番号で未割当の最新ペアを優先
                         for j in range(len(pairs)-1, -1, -1):
                             if pairs[j]["place"] == imm_pl and pairs[j]["immune_sec"] is None:
                                 pairs[j]["immune_sec"] = tsec
                                 pairs[j]["immune_idx"] = i
                                 assigned = True
                                 break
-                        # まだ無ければ、当該場の新規ペアをこの行で作成
                         if not assigned:
                             pairs.append({"place": imm_pl, "place_idx": i, "immune_sec": tsec, "immune_idx": i})
                             assigned = True
                     if not assigned:
-                        # フォールバック：直近の未割当ペアに付与
                         for j in range(len(pairs)-1, -1, -1):
                             if pairs[j]["immune_sec"] is None:
                                 pairs[j]["immune_sec"] = tsec
                                 pairs[j]["immune_idx"] = i
                                 assigned = True
                                 break
-                    # used は「有効ペア」確定後に加算する（後でまとめて）
 
-    # 計算
+    # 計算：基準 + 免戦
     calc: List[Tuple[int, int]] = []
     for pr in pairs:
         if pr["immune_sec"] is None or base_time_sec is None:
             continue
         sec = (base_time_sec + int(pr["immune_sec"])) % (24*3600)
         calc.append((pr["place"], sec))
-        # このペアは有効に使われたので参照行を used に入れる
         used_idx.add(pr["place_idx"])
         used_idx.add(pr["immune_idx"])
 
-    # 停戦補正
-    if calc and ceasefire_sec is not None:
-        delta = (ceasefire_sec - calc[0][1])
-        calc = [(pl, (sec + delta) % (24*3600)) for (pl, sec) in calc]
-        calc[0] = (calc[0][0], ceasefire_sec % (24*3600))
-
-    # 出力整形
     results: List[Tuple[int, str]] = [(pl, _seconds_to_hms(sec)) for (pl, sec) in calc]
     base_str = _seconds_to_hms(base_time_sec) if base_time_sec is not None else None
-    cease_str = _seconds_to_hms(ceasefire_sec) if ceasefire_sec is not None else None
 
-    # 診断情報
     place_total = len(pairs)
     place_missing_immune = sum(1 for pr in pairs if pr["immune_sec"] is None)
     unused_lines = [lines[i] for i in range(len(lines)) if i not in used_idx]
@@ -1447,19 +1285,16 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], Opti
         "place_missing_immune": place_missing_immune,
         "unused_lines": unused_lines
     }
-    return server, base_str, cease_str, results, diag
+    return server, base_str, results, diag
 
 def build_result_message(server: Optional[str],
                          base_str: Optional[str],
-                         cease_str: Optional[str],
                          results: List[Tuple[int, str]],
                          diag: Dict) -> str:
-    # 成功
     if base_str and results and server:
-        head = f"✅ 解析完了！⏱️ 基準時間:{base_str}" + (f" ({cease_str})" if cease_str else "")
+        head = f"✅ 解析完了！⏱️ 基準時間:{base_str}"
         body_lines = [f"{server}-{pl}-{t}" for (pl, t) in results]
         return head + "\n" + "\n".join(body_lines)
-    # 失敗（理由つき）
     return _build_failure_message(diag)
 
 # ---------------------------
@@ -1467,10 +1302,6 @@ def build_result_message(server: Optional[str],
 # ---------------------------
 
 def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, List[Tuple[int, str]], str]:
-    """
-    リサイズ→スライス→トリム→（7を詰め処理）→合成→OpenAI OCR→計算
-    戻り値: (最終合成画像, 結果メッセージ, server, results, ocr_text)
-    """
     base = resize_to_width(pil_im, TARGET_WIDTH)
     parts = slice_exact_7(base, CUTS)
 
@@ -1482,12 +1313,12 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, 
 
     kept[7] = compact_7_by_removing_sections(kept[7])
     top_row = hstack(kept[6], kept[2], gap=8)
-    final_img = vstack([top_row, kept[4], kept[7]], gap=10)
+    final_img = vstack([top_row, kept[7]], gap=10)   # ← 4 は使わない
 
     oai_text, _ = openai_ocr_png(final_img)
 
-    server, base_str, cease_str, results, diag = parse_and_compute(oai_text)
-    message = build_result_message(server, base_str, cease_str, results, diag)
+    server, base_str, results, diag = parse_and_compute(oai_text)
+    message = build_result_message(server, base_str, results, diag)
 
     return final_img, message, (server or ""), results, oai_text
 
