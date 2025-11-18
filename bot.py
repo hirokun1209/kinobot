@@ -8,7 +8,7 @@ from typing import List, Tuple, Dict, Optional, Set
 
 import discord
 from discord.ext import commands, tasks
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, ImageFilter
 
 # OpenAI (official SDK v1)
 from openai import OpenAI
@@ -1023,6 +1023,21 @@ async def before_scheduler():
 # ---------------------------
 # Helpers（画像系）
 # ---------------------------
+def preprocess_for_clock(im: Image.Image) -> Image.Image:
+    """
+    時計ブロック専用の軽量前処理（PILのみ）
+    - グレースケール化
+    - 1.6倍に拡大（小さい文字対策）
+    - 自動コントラスト
+    - アンシャープマスクで輪郭強調
+    """
+    g = im.convert("L")
+    w = int(max(1, g.width * 1.6))
+    h = int(max(1, g.height * 1.6))
+    g = g.resize((w, h), Image.LANCZOS)
+    g = ImageOps.autocontrast(g, cutoff=2)
+    g = g.filter(ImageFilter.UnsharpMask(radius=1.2, percent=170, threshold=3))
+    return g.convert("RGB")
 
 def _norm(s: str) -> str:
     return unicodedata.normalize("NFKC", s).replace(" ", "")
@@ -1310,6 +1325,10 @@ def process_image_pipeline(pil_im: Image.Image) -> Tuple[Image.Image, str, str, 
         block = parts[idx - 1]
         l_pct, r_pct = TRIM_RULES[idx]
         kept[idx] = trim_lr_percent(block, l_pct, r_pct)
+
+    # ⏰ 時計ブロックだけOCRしやすく前処理（!oaiocr / 自動どちらも同じパイプラインで適用）
+    if 2 in kept:
+        kept[2] = preprocess_for_clock(kept[2])
 
     kept[7] = compact_7_by_removing_sections(kept[7])
     top_row = hstack(kept[6], kept[2], gap=8)
