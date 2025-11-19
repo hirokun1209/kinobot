@@ -162,9 +162,15 @@ def _is_immune_line(s: str) -> bool:
     その行が「免戦中系」を指しているかの緩め判定：
     - 厳密マッチ（免\s*戦\s*中）※空白/改行も無視して判定
     - 1文字でも含む & 行内に時刻っぽい表記がある
+    ただし「起動中／稼働中／稼動中」は免戦ではないので除外
     """
     n = unicodedata.normalize("NFKC", s)
-    n_nospace = re.sub(r"\s+", "", n)  # 改行や全角空白も削除して厳密判定に使う
+    n_nospace = re.sub(r"\s+", "", n)
+
+    # ← ここを追加（除外）
+    if ("起動中" in n_nospace) or ("稼働中" in n_nospace) or ("稼動中" in n_nospace):
+        return False
+
     return bool(RE_IMMUNE.search(n_nospace) or (RE_IMMUNE_LOOSE.search(n) and _has_time_like(n)))
 
 
@@ -1218,6 +1224,30 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], List
     # pair: {'place':int,'place_idx':int,'immune_sec':Optional[int],'immune_idx':Optional[int]}
     pairs: List[Dict] = []
 
+    # --- 先行スキャン：最初の「駐騎場N」より前の時刻を基準候補にする ---
+    first_place_idx: Optional[int] = None
+    for i, raw in enumerate(lines):
+        if _extract_place(raw) is not None:
+            first_place_idx = i
+            break
+
+    if first_place_idx is not None and first_place_idx > 0:
+        base_idx: Optional[int] = None
+        for j in range(first_place_idx):
+            row = lines[j]
+            if _is_immune_line(row):
+                continue
+            n = _norm(row)
+            if "停戦" in n:
+                continue
+            tt = _extract_time_like(row)
+            if tt:
+                base_time_sec = _time_to_seconds(tt, prefer_mmss=False)
+                base_idx = j      # ← 直前の時刻が最終的に残る
+        if base_idx is not None:
+            used_idx.add(base_idx)
+
+    # ---- ここからは従来どおりの1パス処理（先行で決まってなければ拾う）----
     for i, raw in enumerate(lines):
         n = _norm(raw)
 
@@ -1228,7 +1258,7 @@ def parse_and_compute(oai_text: str) -> Tuple[Optional[str], Optional[str], List
                 server = m.group(1)
                 used_idx.add(i)
 
-        # 基準時刻（免戦行は除外／「停戦」は無視したいので除外キープ）
+        # 基準時刻（先行スキャンで未確定なら従来ロジックで拾う）
         if base_time_sec is None and (not _is_immune_line(raw)) and ("停戦" not in n):
             tt = _extract_time_like(raw)
             if tt:
