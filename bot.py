@@ -17,6 +17,11 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# 既存の下あたりに追加
+def _mirror_now_str() -> str:
+    # 例: "11/26 12:34:56"
+    return datetime.now(TIMEZONE).strftime("%m/%d %H:%M:%S")
+
 # ---------------------------
 # ENV/bootstrap
 # ---------------------------
@@ -26,6 +31,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 # 自動処理する送信専用チャンネル（カンマ区切りで複数OK）
 INPUT_CHANNEL_IDS = {
     int(x) for x in os.environ.get("INPUT_CHANNEL_IDS", "").split(",") if x.strip().isdigit()
+}
+# ---------------------------
+# ENV/bootstrap
+# ---------------------------
+# 既存の下あたりに追加
+MIRROR_CHANNEL_IDS = {
+    int(x) for x in os.environ.get("MIRROR_CHANNEL_IDS", "").split(",") if x.strip().isdigit()
 }
 # 通知（一覧＋開始時刻ボード）チャンネル
 NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or 0)
@@ -221,12 +233,19 @@ async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
     if not isinstance(ch, discord.TextChannel):
         return None
     # 送信権限チェック
-    me = ch.guild.me
-    if me is None:
-        return None
-    perms = ch.permissions_for(me)
-    if not perms.send_messages:
-        return None
+    me = getattr(ch.guild, "me", None)
+    if me is None and bot.user:
+        # キャッシュに無くても取得を試す
+        try:
+            me = ch.guild.get_member(bot.user.id) or await ch.guild.fetch_member(bot.user.id)
+        except Exception:
+            me = None
+    if me is not None:
+        perms = ch.permissions_for(me)
+        if not perms.send_messages:
+            return None
+        return ch
+    # ここまで来たら権限判定を諦め、送信時例外で判断（ログのみ）
     return ch
 
 # ---------------------------
@@ -235,7 +254,14 @@ async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
 
 SCHEDULE_LOCK = asyncio.Lock()
 COPY_LOCK = asyncio.Lock()  # コピーCHの並べ替え挿入を直列化
-
+MIRROR_LOCK = asyncio.Lock()
+MIRROR_LINES = 13                  # 1(ヘッダ) + 12(本文)
+MIRROR_BODY_LINES = MIRROR_LINES - 1
+MIRROR_BLANK = "\u200b"            # 見た目“空白”にする
+# channel_id -> [message_id x 13]
+MIRROR_MSG_IDS: Dict[int, List[int]] = {}
+# channel_id -> 直近の内容キャッシュ（差分編集のため）
+MIRROR_CACHE: Dict[int, List[str]] = {}
 # item: {
 #   "when": datetime, "server": str, "place": int, "timestr": "HH:MM:SS",
 #   "key": (server, place, timestr),
@@ -476,7 +502,146 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                 pos += 1
 
 # ---- ここまで：コピーCHの安全な“割り込み挿入”ロジック ----
+# ===== ここから新規追加（ファイル中ほどの任意の“関数群”の辺りに） =====
 
+async def _mirror_ensure_layout_for_channel(ch: discord.TextChannel) -> List[int]:
+    """
+    チャンネル ch に「ヘッダ1 + 本文12」の器を用意し、
+    それぞれの message_id を返す。ピン権限があればpinして復元性UP。
+    """
+    # 既に確保済みなら生存確認し、欠けていれば作り直し
+    ids = MIRROR_MSG_IDS.get(ch.id)
+    need_make = True
+    if ids and len(ids) == MIRROR_LINES:
+        ok = True
+        for mid in ids:
+            try:
+                await ch.fetch_message(mid)
+            except Exception:
+                ok = False
+                break
+        if ok:
+            return ids  # 既存器を使う
+        else:
+            MIRROR_MSG_IDS.pop(ch.id, None)
+
+    # ピンから復元を試みる（任意）
+    try:
+        pins = await ch.pins()
+        mypins = [m for m in pins if bot.user and m.author.id == bot.user.id]
+        if len(mypins) >= MIRROR_LINES:
+            mypins.sort(key=lambda m: m.created_at)  # 古い順=画面上部→下
+            ids = [m.id for m in mypins[:MIRROR_LINES]]
+            MIRROR_MSG_IDS[ch.id] = ids
+            return ids
+    except Exception:
+        pass
+
+    # 新規に13個の器を作る（ヘッダ + 空白×12）
+    lines = ["最終更新 " + _mirror_now_str()] + [MIRROR_BLANK] * MIRROR_BODY_LINES
+    created: List[int] = []
+    for i, content in enumerate(lines):
+        try:
+            m = await ch.send(content)
+            try:
+                await m.pin()  # 権限なければ無視
+            except Exception:
+                pass
+            created.append(m.id)
+        except Exception as e:
+            print(f"[mirror] create failed i={i}: {e}")
+            break
+
+    # 足りなければ次回再構築させる
+    if len(created) != MIRROR_LINES:
+        MIRROR_MSG_IDS.pop(ch.id, None)
+        return created
+
+    MIRROR_MSG_IDS[ch.id] = created
+    return created
+
+
+def _mirror_build_desired_lines() -> List[str]:
+    """
+    13行分の“望ましい内容”を返す。
+    0行目: 「最終更新 MM/DD HH:MM:SS」
+    1..12: 予定（時間順, server-place-HH:MM:SS）。足りない分は空白。
+    """
+    header = f"最終更新 {_mirror_now_str()}"
+    body: List[str] = []
+    # SCHEDULEスナップショット（when昇順を保証）
+    async def _snapshot():
+        async with SCHEDULE_LOCK:
+            items = list(SCHEDULE)
+        items.sort(key=lambda x: x["when"])
+        return items
+
+    # 同期関数から呼ぶために簡易ランナー
+    # （mirror_update内でawaitするので、ここはプレーンでOKにする手もあるが可読重視で分離）
+    return [header] + body  # ダミー（実体は mirror_update 内で埋める）
+
+async def mirror_update():
+    """
+    全ての MIRROR_CHANNEL_IDS に対して、
+    13行レイアウトを保証し、差分のある行のみ edit() する。
+    """
+    if not MIRROR_CHANNEL_IDS:
+        return
+
+    # SCHEDULE スナップショットを1回だけ取る
+    async with SCHEDULE_LOCK:
+        sched = list(SCHEDULE)
+    sched.sort(key=lambda x: x["when"])
+
+    # 望ましい本文を組み立て（最大12行）
+    desired_header = f"最終更新 {_mirror_now_str()}"
+    desired_body: List[str] = []
+    for it in sched[:MIRROR_BODY_LINES]:
+        # 仕様どおり "server-place-HH:MM:SS"（警備多数は表示しない版）
+        t = it["timestr"]  # guardタスクが随時正規化済み
+        desired_body.append(f"{it['server']}-{it['place']}-{t}")
+
+    # 足りない分は空白で埋める
+    while len(desired_body) < MIRROR_BODY_LINES:
+        desired_body.append(MIRROR_BLANK)
+
+    desired_all = [desired_header] + desired_body  # 長さ13固定
+
+    # 各チャンネルへ反映
+    for cid in list(MIRROR_CHANNEL_IDS):
+        ch = await _get_text_channel(cid)
+        if not ch:
+            continue
+
+        # 器を用意（13メッセ確保）
+        ids = await _mirror_ensure_layout_for_channel(ch)
+        if len(ids) != MIRROR_LINES:
+            # 器が揃っていなければ次回に持ち越し
+            continue
+
+        # 差分のみ編集
+        async with MIRROR_LOCK:
+            cache = MIRROR_CACHE.get(cid) or [""] * MIRROR_LINES
+            for i in range(MIRROR_LINES):
+                new_txt = desired_all[i]
+                if i < len(cache) and cache[i] == new_txt:
+                    continue  # 変化なし
+
+                try:
+                    msg = await ch.fetch_message(ids[i])
+                    await msg.edit(content=new_txt)
+                    cache[i] = new_txt
+                except discord.NotFound:
+                    # 壊れていたら器を作り直し（次回で復旧）
+                    MIRROR_MSG_IDS.pop(cid, None)
+                    break
+                except Exception as e:
+                    print(f"[mirror] edit failed ch={cid} idx={i}: {e}")
+                    break
+
+            MIRROR_CACHE[cid] = cache
+
+# ===== ここまで新規追加 =====
 # ---- ここから：1分おきの監視・並び替えガード ----
 
 async def _reorder_copy_channel_to_match_schedule():
@@ -600,12 +765,15 @@ async def order_guard_tick():
       - コピー用チャンネルの整列補修（欠落補完＆内容入れ替え）
       - コピーチャンネルの孤児メッセージ掃除
     """
+    
     try:
         async with SCHEDULE_LOCK:
             SCHEDULE.sort(key=lambda x: x["when"])
             for it in SCHEDULE:
                 # timestr を when に合わせて正規化（ズレの蓄積を防止）
                 it["timestr"] = it["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
+                # ← key も必ず最新に更新
+                it["key"] = (it["server"], it["place"], it["timestr"])
             _recompute_skip2m_flags()
     except Exception as e:
         print(f"[guard] schedule sort failed: {e}")
@@ -620,6 +788,11 @@ async def order_guard_tick():
         await _cleanup_copy_orphans(max_scan=300)
     except Exception as e:
         print(f"[guard] cleanup failed: {e}")
+    try:
+        await mirror_update()
+    except Exception as e:
+        print(f"[guard] mirror update failed: {e}")
+
 
 @order_guard_tick.before_loop
 async def before_guard():
@@ -799,6 +972,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
 
     # 通知ボード更新
     await _refresh_board()
+    await mirror_update()
 
 async def _clear_all_schedules() -> int:
     """全スケジュールを削除（コピーCHのメッセージも個別に削除）"""
@@ -809,6 +983,7 @@ async def _clear_all_schedules() -> int:
     for it in items:
         await _delete_copy_message_if_exists(it)
     await _refresh_board()
+    await mirror_update()
     return len(items)
 
 async def _delete_events(server: Optional[str] = None, place: Optional[int] = None, timestr: Optional[str] = None) -> int:
@@ -836,6 +1011,7 @@ async def _delete_events(server: Optional[str] = None, place: Optional[int] = No
     # ボード更新
     if to_delete:
         await _refresh_board()
+        await mirror_update()
     return len(to_delete)
 
 def _parse_time_str(s: str) -> Optional[str]:
@@ -1021,6 +1197,7 @@ async def scheduler_tick():
             await _delete_copy_message_if_exists(it)
         # ボード更新（過ぎたものを消した状態に）
         await _refresh_board()
+        await mirror_update()
 
 @scheduler_tick.before_loop
 async def before_scheduler():
@@ -1631,6 +1808,7 @@ async def _shift_items(places: Optional[Set[int]], delta_seconds: int) -> int:
             if (places is None) or (it["place"] in places):
                 it["when"] = it["when"] + timedelta(seconds=delta_seconds)
                 it["timestr"] = it["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
+                it["key"] = (it["server"], it["place"], it["timestr"]
                 changed.append(it)
         if changed:
             SCHEDULE.sort(key=lambda x: x["when"])
@@ -1855,7 +2033,10 @@ async def on_ready():
         scheduler_tick.start()
     if not order_guard_tick.is_running():
         order_guard_tick.start()
-
+    try:
+        await mirror_update()
+    except Exception as e:
+        print(f"[on_ready] mirror init failed: {e}")
 # ---------------------------
 # Run
 # ---------------------------
