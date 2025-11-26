@@ -1808,7 +1808,7 @@ async def _shift_items(places: Optional[Set[int]], delta_seconds: int) -> int:
             if (places is None) or (it["place"] in places):
                 it["when"] = it["when"] + timedelta(seconds=delta_seconds)
                 it["timestr"] = it["when"].astimezone(TIMEZONE).strftime("%H:%M:%S")
-                it["key"] = (it["server"], it["place"], it["timestr"]
+                it["key"] = (it["server"], it["place"], it["timestr"])
                 changed.append(it)
         if changed:
             SCHEDULE.sort(key=lambda x: x["when"])
