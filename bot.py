@@ -582,24 +582,33 @@ def _mirror_build_desired_lines() -> List[str]:
 
 async def mirror_update():
     """
-    全ての MIRROR_CHANNEL_IDS に対して、
-    13行レイアウトを保証し、差分のある行のみ edit() する。
+    すべての MIRROR_CHANNEL_IDS に対して、
+    13行（ヘッダ1 + 本文12）の器を保証し、差分のある行のみ edit() する。
+    基本は「コピーチャンネルの現況」をミラーし、1件も無い場合のみ SCHEDULE にフォールバック。
     """
     if not MIRROR_CHANNEL_IDS:
         return
 
-    # SCHEDULE スナップショットを1回だけ取る
-    async with SCHEDULE_LOCK:
-        sched = list(SCHEDULE)
-    sched.sort(key=lambda x: x["when"])
-
-    # 望ましい本文を組み立て（最大12行）
+    # 1) コピーCHの現況（ボットが送った自動行）を取得
     desired_header = f"最終更新 {_mirror_now_str()}"
     desired_body: List[str] = []
-    for it in sched[:MIRROR_BODY_LINES]:
-        # 仕様どおり "server-place-HH:MM:SS"（警備多数は表示しない版）
-        t = it["timestr"]  # guardタスクが随時正規化済み
-        desired_body.append(f"{it['server']}-{it['place']}-{t}")
+
+    copy_lines: List[str] = []
+    if COPY_CHANNEL_ID:
+        copy_lines = await _snapshot_copy_lines(max_scan=500)  # 旧→新の順
+
+    if copy_lines:
+        # 2) コピーCHの並びそのまま最大12行を採用（「 警備多数」も表示）
+        desired_body = copy_lines[:MIRROR_BODY_LINES]
+    else:
+        # 3) フォールバック：SCHEDULE から構築（こちらも警備多数を表示）
+        async with SCHEDULE_LOCK:
+            sched = list(SCHEDULE)
+        sched.sort(key=lambda x: x["when"])
+        for it in sched[:MIRROR_BODY_LINES]:
+            t = it["timestr"]
+            suffix = " 警備多数" if it.get("guarded") else ""
+            desired_body.append(f"{it['server']}-{it['place']}-{t}{suffix}")
 
     # 足りない分は空白で埋める
     while len(desired_body) < MIRROR_BODY_LINES:
@@ -607,19 +616,16 @@ async def mirror_update():
 
     desired_all = [desired_header] + desired_body  # 長さ13固定
 
-    # 各チャンネルへ反映
+    # 4) 各ミラーチャンネルへ反映（差分のみ編集）
     for cid in list(MIRROR_CHANNEL_IDS):
         ch = await _get_text_channel(cid)
         if not ch:
             continue
 
-        # 器を用意（13メッセ確保）
-        ids = await _mirror_ensure_layout_for_channel(ch)
+        ids = await _mirror_ensure_layout_for_channel(ch)  # 13個の器を用意/検証
         if len(ids) != MIRROR_LINES:
-            # 器が揃っていなければ次回に持ち越し
             continue
 
-        # 差分のみ編集
         async with MIRROR_LOCK:
             cache = MIRROR_CACHE.get(cid) or [""] * MIRROR_LINES
             for i in range(MIRROR_LINES):
@@ -632,7 +638,7 @@ async def mirror_update():
                     await msg.edit(content=new_txt)
                     cache[i] = new_txt
                 except discord.NotFound:
-                    # 壊れていたら器を作り直し（次回で復旧）
+                    # 器が壊れていたら次回作り直す
                     MIRROR_MSG_IDS.pop(cid, None)
                     break
                 except Exception as e:
@@ -640,8 +646,6 @@ async def mirror_update():
                     break
 
             MIRROR_CACHE[cid] = cache
-
-# ===== ここまで新規追加 =====
 # ---- ここから：1分おきの監視・並び替えガード ----
 
 async def _reorder_copy_channel_to_match_schedule():
@@ -755,6 +759,39 @@ async def _cleanup_copy_orphans(max_scan: int = 300):
     except Exception as e:
         print(f"[cleanup] history failed: {e}")
 
+async def _snapshot_copy_lines(max_scan: int = 500) -> List[str]:
+    """
+    コピーチャンネルの「ボットが送った自動行（server-place-HH:MM:SS［警備多数 任意］）」だけを
+    旧→新の順に配列で返す。上限 max_scan。
+    """
+    lines: List[str] = []
+    if not COPY_CHANNEL_ID:
+        return lines
+    ch = await _get_text_channel(COPY_CHANNEL_ID)
+    if not ch or not bot.user:
+        return lines
+
+    tmp: List[discord.Message] = []
+    try:
+        async for msg in ch.history(limit=max_scan):
+            if msg.author.id != bot.user.id:
+                continue
+            if msg.pinned:
+                continue
+            content = (msg.content or "").strip()
+            if not RE_COPY_LINE.match(content):
+                continue
+            tmp.append(msg)
+    except Exception as e:
+        print(f"[mirror-snap] history failed: {e}")
+        return lines
+
+    # 古い→新しい（画面上→下）順に
+    tmp.sort(key=lambda m: m.created_at)
+    for m in tmp:
+        lines.append((m.content or "").strip())
+    return lines
+
 @tasks.loop(seconds=60.0)
 async def order_guard_tick():
     """
@@ -848,6 +885,7 @@ async def _toggle_guard_by_message(msg: discord.Message, *, guarded: bool) -> bo
 
         # ボード更新
         await _refresh_board()
+        await mirror_update()
 
     return changed
 
@@ -889,7 +927,26 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
     except Exception:
         pass
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    # コピーCHで対象フォーマットが編集されたらミラーを更新
+    if COPY_CHANNEL_ID and after.channel.id == COPY_CHANNEL_ID:
+        try:
+            before_ok = bool(RE_COPY_LINE.match((before.content or "").strip()))
+            after_ok  = bool(RE_COPY_LINE.match((after.content or "").strip()))
+            if before_ok or after_ok:
+                await mirror_update()
+        except Exception:
+            pass
 
+@bot.event
+async def on_message_delete(message: discord.Message):
+    # コピーCHで対象フォーマットが消えたらミラーを更新
+    if COPY_CHANNEL_ID and message.channel.id == COPY_CHANNEL_ID:
+        try:
+            await mirror_update()
+        except Exception:
+            pass
 async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
     """
     pairs: [(server, place, timestr)]
@@ -1936,12 +1993,21 @@ async def roles(ctx: commands.Context):
 @bot.event
 async def on_message(message: discord.Message):
     try:
-        # 自分や他Botは無視
+        # --- コピーチャンネルでボットの自動行が投稿されたらミラー即更新 ---
+        # ※ bot自身のメッセージでもこのブロックは通す（その後にbot判定でreturn）
+        if COPY_CHANNEL_ID and message.channel.id == COPY_CHANNEL_ID and bot.user:
+            if message.author.id == bot.user.id and RE_COPY_LINE.match((message.content or "").strip()):
+                try:
+                    await mirror_update()
+                except Exception:
+                    pass
+
+        # 自分や他Botはここで打ち切り（↑のミラー更新は通した後）
         if message.author.bot:
             return
 
         # コマンドは先に処理
-        if message.content.startswith("!"):
+        if message.content and message.content.startswith("!"):
             await bot.process_commands(message)
             return
 
@@ -1994,7 +2060,7 @@ async def on_message(message: discord.Message):
             if reg_text:
                 await message.channel.send(reg_text)
 
-            # ✅ 自動モードはスケジュール登録する（従来どおり）
+            # ✅ 自動モードはスケジュール登録
             if pairs:
                 await add_events_and_refresh_board(pairs)
 
