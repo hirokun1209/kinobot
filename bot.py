@@ -29,8 +29,14 @@ INPUT_CHANNEL_IDS = {
 }
 # 通知（一覧＋開始時刻ボード）チャンネル
 NOTIFY_CHANNEL_ID = int(os.environ.get("NOTIFY_CHANNEL_ID", "0") or 0)
-# コピー専用チャンネル（即時通知／時間が過ぎたら削除）
-COPY_CHANNEL_ID = int(os.environ.get("COPY_CHANNEL_ID", "0") or 0)
+# コピー専用チャンネル（複数OK：カンマ区切り）※後方互換あり
+COPY_CHANNEL_IDS = {
+    int(x) for x in os.environ.get("COPY_CHANNEL_IDS", "").split(",") if x.strip().isdigit()
+}
+# 旧: 単体指定の後方互換
+_COPY_SINGLE = int(os.environ.get("COPY_CHANNEL_ID", "0") or 0)
+if not COPY_CHANNEL_IDS and _COPY_SINGLE:
+    COPY_CHANNEL_IDS = {_COPY_SINGLE}
 # アラート専用チャンネル（2分前/15秒前、5秒後に削除）
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0") or 0)
 # ⏰ アラートでメンションするロールID（カンマ区切り）
@@ -240,12 +246,17 @@ COPY_LOCK = asyncio.Lock()  # コピーCHの並べ替え挿入を直列化
 #   "when": datetime, "server": str, "place": int, "timestr": "HH:MM:SS",
 #   "key": (server, place, timestr),
 #   "skip2m": bool, "sent_2m": bool, "sent_15s": bool,
-#   "copy_msg_id": Optional[int],
+#   "copy_msg_ids": Dict[int,int],   # ← 単体IDではなく {channel_id: message_id}
 #   "guarded": bool,
 # }
 SCHEDULE: List[Dict] = []
 
 SCHEDULE_MSG_ID: Optional[int] = None  # 通知チャンネルの一覧メッセージ
+
+# ---- helper: copy ids dict -----------------------------------------------
+def _copy_ids_dict(it: Dict) -> Dict[int, int]:
+    """アイテムが持つ {channel_id: message_id} を安全に返す"""
+    return dict(it.get("copy_msg_ids") or {})
 
 def _next_occurrence_today_or_tomorrow(hms: str) -> datetime:
     """今日のその時刻、過ぎていれば翌日の同時刻（TZ考慮）"""
@@ -323,21 +334,17 @@ async def _send_temp_alert(channel: discord.TextChannel, text: str):
         print(f"[alert] send/delete failed: {e}")
 
 async def _delete_copy_message_if_exists(it: Dict):
-    """コピー専用チャンネルの個別メッセージを削除"""
-    if not COPY_CHANNEL_ID:
-        return
-    mid = it.get("copy_msg_id")
-    if not mid:
-        return
-    try:
-        ch = await _get_text_channel(COPY_CHANNEL_ID)
-        if ch:
-            msg = await ch.fetch_message(mid)
-            await msg.delete()
-    except Exception as e:
-        print(f"[copy] delete failed: {e}")
-    finally:
-        it["copy_msg_id"] = None
+    """全コピーCHから該当メッセージを削除"""
+    mids = _copy_ids_dict(it)
+    for cid, mid in list(mids.items()):
+        try:
+            ch = await _get_text_channel(cid)
+            if ch:
+                msg = await ch.fetch_message(mid)  # type: ignore
+                await msg.delete()
+        except Exception as e:
+            print(f"[copy] delete failed (ch={cid}): {e}")
+    it["copy_msg_ids"] = {}
 
 # ---- ここから：コピーCHの安全な“割り込み挿入”ロジック ----
 
@@ -345,24 +352,24 @@ def _fmt_copy_line(it: Dict) -> str:
     suffix = " 警備多数" if it.get("guarded") else ""
     return f"{it['server']}-{it['place']}-{it['timestr']}{suffix}"
 
-async def _insert_copy_sorted(new_items: List[Dict]):
+async def _insert_copy_sorted_one(channel_id: int, new_items: List[Dict]):
     """
-    コピーCHメッセージ列に new_items を**時間順**で割り込み挿入。
+    指定コピーCHに new_items を**時間順**で割り込み挿入。
+    既存の“押し出し”ロジックを1CHごとに適用。
     """
-    if not COPY_CHANNEL_ID or not new_items:
+    if not channel_id or not new_items:
         return
-    ch = await _get_text_channel(COPY_CHANNEL_ID)
+    ch = await _get_text_channel(channel_id)
     if not ch:
         return
 
-    # new_items 自体を時間順に
     new_items = sorted(new_items, key=lambda x: x["when"])
 
     async with COPY_LOCK:
         for it in new_items:
             line_new = _fmt_copy_line(it)
 
-            # SCHEDULE のスナップショット & 自分の位置と target を特定
+            # SCHEDULEスナップショット＆自分の位置
             async with SCHEDULE_LOCK:
                 sched = list(SCHEDULE)
                 try:
@@ -370,35 +377,36 @@ async def _insert_copy_sorted(new_items: List[Dict]):
                 except StopIteration:
                     idx = len(sched)
 
-            # idx 以降で最初に copy_msg_id を持つ item を探す（=時間順列の割込み先）
+            # idx以降で最初に「このCHの」copy_msg_idを持つitem
             target = None
             for k in range(idx, len(sched)):
-                if sched[k].get("copy_msg_id"):
+                if channel_id in _copy_ids_dict(sched[k]):
                     target = (k, sched[k])
                     break
 
+            # 末尾に新規
             if not target:
                 try:
                     msg = await ch.send(line_new)
                     async with SCHEDULE_LOCK:
-                        it["copy_msg_id"] = msg.id
+                        it.setdefault("copy_msg_ids", {})[channel_id] = msg.id
                 except Exception as e:
-                    print(f"[copy] send failed (tail): {e}")
+                    print(f"[copy] send failed (tail,ch={channel_id}): {e}")
                 continue
 
             k, tgt_item = target
-            target_msg_id = tgt_item["copy_msg_id"]
+            target_msg_id = _copy_ids_dict(tgt_item).get(channel_id)
 
             try:
-                msg_obj = await ch.fetch_message(target_msg_id)
+                msg_obj = await ch.fetch_message(target_msg_id)  # type: ignore
             except Exception as e:
-                print(f"[copy] fetch target failed: {e}")
+                print(f"[copy] fetch target failed (ch={channel_id}): {e}")
                 try:
                     msg = await ch.send(line_new)
                     async with SCHEDULE_LOCK:
-                        it["copy_msg_id"] = msg.id
+                        it.setdefault("copy_msg_ids", {})[channel_id] = msg.id
                 except Exception as e2:
-                    print(f"[copy] fallback send failed: {e2}")
+                    print(f"[copy] fallback send failed (ch={channel_id}): {e2}")
                 continue
 
             carry_text = msg_obj.content
@@ -407,16 +415,16 @@ async def _insert_copy_sorted(new_items: List[Dict]):
             try:
                 await msg_obj.edit(content=line_new)
                 async with SCHEDULE_LOCK:
-                    it["copy_msg_id"] = msg_obj.id
-                    carry_item["copy_msg_id"] = None
+                    it.setdefault("copy_msg_ids", {})[channel_id] = msg_obj.id
+                    carry_item.setdefault("copy_msg_ids", {}).pop(channel_id, None)
             except Exception as e:
-                print(f"[copy] edit target failed: {e}")
+                print(f"[copy] edit target failed (ch={channel_id}): {e}")
                 try:
                     msg = await ch.send(line_new)
                     async with SCHEDULE_LOCK:
-                        it["copy_msg_id"] = msg.id
+                        it.setdefault("copy_msg_ids", {})[channel_id] = msg.id
                 except Exception as e2:
-                    print(f"[copy] fallback send failed2: {e2}")
+                    print(f"[copy] fallback send failed2 (ch={channel_id}): {e2}")
                 continue
 
             # 連鎖で後続へ押し出し
@@ -424,51 +432,51 @@ async def _insert_copy_sorted(new_items: List[Dict]):
             while True:
                 async with SCHEDULE_LOCK:
                     next_item = SCHEDULE[pos] if pos < len(SCHEDULE) else None
-                    next_msg_id = next_item.get("copy_msg_id") if next_item else None
+                    next_msg_id = (_copy_ids_dict(next_item).get(channel_id) if next_item else None)
 
                 if not next_item:
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
-                            carry_item["copy_msg_id"] = msg2.id
+                            carry_item.setdefault("copy_msg_ids", {})[channel_id] = msg2.id
                     except Exception as e:
-                        print(f"[copy] chain tail send failed: {e}")
+                        print(f"[copy] chain tail send failed (ch={channel_id}): {e}")
                     break
 
                 if not next_msg_id:
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
-                            carry_item["copy_msg_id"] = msg2.id
+                            carry_item.setdefault("copy_msg_ids", {})[channel_id] = msg2.id
                     except Exception as e:
-                        print(f"[copy] chain send(no next id) failed: {e}")
+                        print(f"[copy] chain send(no next id) failed (ch={channel_id}): {e}")
                     break
 
                 try:
-                    next_msg = await ch.fetch_message(next_msg_id)
+                    next_msg = await ch.fetch_message(next_msg_id)  # type: ignore
                 except Exception as e:
-                    print(f"[copy] fetch next failed: {e}")
+                    print(f"[copy] fetch next failed (ch={channel_id}): {e}")
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
-                            carry_item["copy_msg_id"] = msg2.id
+                            carry_item.setdefault("copy_msg_ids", {})[channel_id] = msg2.id
                     except Exception as e2:
-                        print(f"[copy] chain tail send2 failed: {e2}")
+                        print(f"[copy] chain tail send2 failed (ch={channel_id}): {e2}")
                     break
 
                 prev_text = next_msg.content
                 try:
                     await next_msg.edit(content=carry_text)
                     async with SCHEDULE_LOCK:
-                        carry_item["copy_msg_id"] = next_msg.id
+                        carry_item.setdefault("copy_msg_ids", {})[channel_id] = next_msg.id
                 except Exception as e:
-                    print(f"[copy] edit next failed: {e}")
+                    print(f"[copy] edit next failed (ch={channel_id}): {e}")
                     try:
                         msg2 = await ch.send(carry_text)
                         async with SCHEDULE_LOCK:
-                            carry_item["copy_msg_id"] = msg2.id
+                            carry_item.setdefault("copy_msg_ids", {})[channel_id] = msg2.id
                     except Exception as e2:
-                        print(f"[copy] chain fallback send failed: {e2}")
+                        print(f"[copy] chain fallback send failed (ch={channel_id}): {e2}")
                     break
 
                 carry_text = prev_text
@@ -477,101 +485,115 @@ async def _insert_copy_sorted(new_items: List[Dict]):
 
 # ---- ここまで：コピーCHの安全な“割り込み挿入”ロジック ----
 
-# ---- ここから：1分おきの監視・並び替えガード ----
+# ---- 複数コピーCHへ展開するラッパ（毎分ガードが呼ぶ）---------------------
+async def _insert_copy_sorted(new_items: List[Dict]):
+    """新規アイテムを全コピーCHへ時間順で割り込み挿入"""
+    if not COPY_CHANNEL_IDS or not new_items:
+        return
+    for cid in COPY_CHANNEL_IDS:
+        await _insert_copy_sorted_one(cid, new_items)
 
 async def _reorder_copy_channel_to_match_schedule():
-    """
-    コピー用チャンネルのメッセージ内容を、SCHEDULEの**時間順**に整える。
-    - 欠落している copy_msg_id は補完（割り込み挿入）
-    - 既存メッセージは内容を入れ替えて順序を“見かけ上”揃える（送信順は変えられないため内容で整列）
-    """
-    if not COPY_CHANNEL_ID:
+    """全コピーCHのメッセ内容を SCHEDULE の順に揃える（欠落補完つき）"""
+    if not COPY_CHANNEL_IDS:
         return
-    ch = await _get_text_channel(COPY_CHANNEL_ID)
+    for cid in COPY_CHANNEL_IDS:
+        await _reorder_copy_channel_to_match_schedule_one(cid)
+
+async def _cleanup_copy_orphans(*, max_scan: int = 300):
+    """全コピーCHで、SCHEDULE から参照されない“自動行”を掃除"""
+    if not COPY_CHANNEL_IDS:
+        return
+    for cid in COPY_CHANNEL_IDS:
+        await _cleanup_copy_orphans_one(cid, max_scan=max_scan)
+
+# ---- ここから：1分おきの監視・並び替えガード ----
+
+async def _reorder_copy_channel_to_match_schedule_one(channel_id: int):
+    """このCHのメッセージをSCHEDULEの時間順に“内容で”整列。欠落は補完。"""
+    if not channel_id:
+        return
+    ch = await _get_text_channel(channel_id)
     if not ch:
         return
 
-    # 1) まず欠落しているメッセージを補完（ロック無しで安全APIを使用）
+    # 欠落補完
     async with SCHEDULE_LOCK:
-        missing_items = [it for it in SCHEDULE if not it.get("copy_msg_id")]
+        missing_items = [it for it in SCHEDULE if channel_id not in _copy_ids_dict(it)]
     if missing_items:
-        await _insert_copy_sorted(missing_items)
+        await _insert_copy_sorted_one(channel_id, missing_items)
 
-    # 2) 再スナップショット（copy_msg_id が生えているもの）
+    # 再スナップショット
     async with SCHEDULE_LOCK:
-        sched_items_with_msg = [it for it in SCHEDULE if it.get("copy_msg_id")]
-    if not sched_items_with_msg:
+        sched_items = [it for it in SCHEDULE if channel_id in _copy_ids_dict(it)]
+    if not sched_items:
         return
 
-    # 3) 実メッセージを取得（存在しないIDはクリア）
+    # 取得（存在しないIDは外す）
     fetched: Dict[int, Optional[discord.Message]] = {}
-    for it in sched_items_with_msg:
-        mid = it["copy_msg_id"]
+    for it in sched_items:
+        mid = _copy_ids_dict(it)[channel_id]
         try:
-            msg = await ch.fetch_message(mid)  # type: ignore
-            fetched[mid] = msg
+            fetched[mid] = await ch.fetch_message(mid)  # type: ignore
         except Exception:
             fetched[mid] = None
 
     async with SCHEDULE_LOCK:
-        for it in sched_items_with_msg:
-            if not fetched.get(it["copy_msg_id"]):
-                it["copy_msg_id"] = None
+        for it in sched_items:
+            mid = _copy_ids_dict(it)[channel_id]
+            if not fetched.get(mid):
+                it.setdefault("copy_msg_ids", {}).pop(channel_id, None)
 
-    # 4) 失敗したものをもう一度補完
+    # 補完やり直し
     async with SCHEDULE_LOCK:
-        missing_items2 = [it for it in SCHEDULE if not it.get("copy_msg_id")]
-    if missing_items2:
-        await _insert_copy_sorted(missing_items2)
+        missing2 = [it for it in SCHEDULE if channel_id not in _copy_ids_dict(it)]
+    if missing2:
+        await _insert_copy_sorted_one(channel_id, missing2)
 
-    # 5) 並びの修正：CH内のメッセージ送信時刻順 と SCHEDULE の when 順を対応付け
+    # 並べ替え（送信時刻順の並びに“内容”を合わせる）
     async with SCHEDULE_LOCK:
-        # SCHEDULE は when 昇順前提
-        sched_in_order = [it for it in SCHEDULE if it.get("copy_msg_id")]
-        msg_ids = [it["copy_msg_id"] for it in sched_in_order]
+        sched_in_order = [it for it in SCHEDULE if channel_id in _copy_ids_dict(it)]
+        msg_ids = [_copy_ids_dict(it)[channel_id] for it in sched_in_order]
 
-    # 現在のメッセージを取得＆送信時刻順に
     msg_objs: List[discord.Message] = []
     for mid in msg_ids:
         try:
-            msg = await ch.fetch_message(mid)  # type: ignore
-            msg_objs.append(msg)
+            msg_objs.append(await ch.fetch_message(mid))  # type: ignore
         except Exception:
             pass
-
     if not msg_objs:
         return
 
     msg_objs.sort(key=lambda m: m.created_at)
     L = min(len(msg_objs), len(sched_in_order))
 
-    # 6) 編集で整列（必ず COPY_LOCK → SCHEDULE_LOCK の順で取得）
     async with COPY_LOCK:
         async with SCHEDULE_LOCK:
             for i in range(L):
                 it = sched_in_order[i]
                 msg = msg_objs[i]
                 desired = _fmt_copy_line(it)
-                if msg.content != desired or it["copy_msg_id"] != msg.id:
+                if msg.content != desired or _copy_ids_dict(it).get(channel_id) != msg.id:
                     try:
                         await msg.edit(content=desired)
                     except Exception as e:
-                        print(f"[guard] copy edit failed: {e}")
-                    it["copy_msg_id"] = msg.id
+                        print(f"[guard] copy edit failed (ch={channel_id}): {e}")
+                    it.setdefault("copy_msg_ids", {})[channel_id] = msg.id
 
-async def _cleanup_copy_orphans(max_scan: int = 300):
-    """
-    コピーチャンネルの「ボットが送った自動行（server-place-HH:MM:SS）」のうち、
-    SCHEDULE から参照されていない（copy_msg_id に含まれない）ものを削除する。
-    """
-    if not COPY_CHANNEL_ID:
+async def _cleanup_copy_orphans_one(channel_id: int, max_scan: int = 300):
+    """このCHの“自動行”のうちSCHEDULEから参照されていないものを削除"""
+    if not channel_id:
         return
-    ch = await _get_text_channel(COPY_CHANNEL_ID)
+    ch = await _get_text_channel(channel_id)
     if not ch or not bot.user:
         return
 
     async with SCHEDULE_LOCK:
-        valid_ids: Set[int] = {it["copy_msg_id"] for it in SCHEDULE if it.get("copy_msg_id")}
+        valid_ids: Set[int] = {
+            _copy_ids_dict(it)[channel_id]
+            for it in SCHEDULE
+            if channel_id in _copy_ids_dict(it)
+        }
 
     try:
         async for msg in ch.history(limit=max_scan):
@@ -586,9 +608,9 @@ async def _cleanup_copy_orphans(max_scan: int = 300):
             try:
                 await msg.delete()
             except Exception as e:
-                print(f"[cleanup] delete failed: {e}")
+                print(f"[cleanup] delete failed (ch={channel_id}): {e}")
     except Exception as e:
-        print(f"[cleanup] history failed: {e}")
+        print(f"[cleanup] history failed (ch={channel_id}): {e}")
 
 @tasks.loop(seconds=60.0)
 async def order_guard_tick():
@@ -633,13 +655,17 @@ RE_COPY_PARSE = re.compile(
 )
 
 async def _resolve_item_by_copy_message(msg: discord.Message) -> Optional[Dict]:
-    # 1) message.id で一致
+    """コピーCHの自動行（1行）→ 対応する SCHEDULE アイテムを返す"""
+    ch_id = getattr(msg.channel, "id", None)
+
+    # 1) ID辞書で直接ヒットするか
     async with SCHEDULE_LOCK:
         for it in SCHEDULE:
-            if it.get("copy_msg_id") == msg.id:
+            mids = _copy_ids_dict(it)
+            if ch_id in mids and mids.get(ch_id) == msg.id:
                 return it
 
-    # 2) 文面から一致（サーバー-場所-時刻で探す）
+    # 2) 文面から（server-place-time）で探す
     m = RE_COPY_PARSE.match((msg.content or "").strip())
     if not m:
         return None
@@ -650,8 +676,8 @@ async def _resolve_item_by_copy_message(msg: discord.Message) -> Optional[Dict]:
     async with SCHEDULE_LOCK:
         for it in SCHEDULE:
             if it["server"] == server and it["place"] == place and it["timestr"] == timestr:
-                if not it.get("copy_msg_id"):
-                    it["copy_msg_id"] = msg.id  # ついでに補完
+                # ついでにID辞書へ補完
+                it.setdefault("copy_msg_ids", {})[ch_id] = msg.id
                 return it
     return None
     
@@ -683,8 +709,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # ボット自身は無視
     if bot.user and payload.user_id == bot.user.id:
         return
-    # 対象はコピーチャンネルのみ
-    if not COPY_CHANNEL_ID or payload.channel_id != COPY_CHANNEL_ID:
+    # 対象はコピー用チャンネル群のみ
+    if not COPY_CHANNEL_IDS or payload.channel_id not in COPY_CHANNEL_IDS:
         return
 
     emoji = str(payload.emoji)
@@ -777,7 +803,7 @@ async def add_events_and_refresh_board(pairs: List[Tuple[str, int, str]]):
                 "when": when, "server": server, "place": place, "timestr": timestr,
                 "key": (server, place, timestr),
                 "skip2m": False, "sent_2m": False, "sent_15s": False,
-                "copy_msg_id": None,
+                "copy_msg_ids": {}, 
                 "guarded": preserve_guarded  # ← 追加（新規= False / 置換= 既存から引き継ぎ）
             }
             SCHEDULE.append(item)
@@ -1626,6 +1652,8 @@ async def _shift_items(places: Optional[Set[int]], delta_seconds: int) -> int:
     コピーCHの個別メッセージ内容も更新（順序は維持）。
     """
     changed: List[Dict] = []
+    updates: List[Tuple[int, int, str]] = []  # (channel_id, message_id, new_content)
+
     async with SCHEDULE_LOCK:
         for it in SCHEDULE:
             if (places is None) or (it["place"] in places):
@@ -1636,19 +1664,27 @@ async def _shift_items(places: Optional[Set[int]], delta_seconds: int) -> int:
             SCHEDULE.sort(key=lambda x: x["when"])
             _recompute_skip2m_flags()
 
-    # コピーCHの内容を更新（順序はそのまま）
-    if changed and COPY_CHANNEL_ID:
-        ch = await _get_text_channel(COPY_CHANNEL_ID)
-        if ch:
+    # コピーCHの内容を更新（順序はそのまま／複数CH対応）※ロック外でI/O
+    if changed and COPY_CHANNEL_IDS:
+        # ロック内で編集内容だけ確定しておく
+        async with SCHEDULE_LOCK:
             for it in changed:
-                mid = it.get("copy_msg_id")
-                if not mid:
-                    continue
-                try:
-                    msg_obj = await ch.fetch_message(mid)
-                    await msg_obj.edit(content=_fmt_copy_line(it))
-                except Exception as e:
-                    print(f"[shift] copy edit failed: {e}")
+                content = _fmt_copy_line(it)
+                for cid in COPY_CHANNEL_IDS:
+                    mid = _copy_ids_dict(it).get(cid)
+                    if mid:
+                        updates.append((cid, mid, content))
+
+        # ロック外でDiscord API呼び出し
+        for cid, mid, content in updates:
+            ch = await _get_text_channel(cid)
+            if not ch:
+                continue
+            try:
+                msg_obj = await ch.fetch_message(mid)  # type: ignore
+                await msg_obj.edit(content=content)
+            except Exception as e:
+                print(f"[shift] copy edit failed (ch={cid}): {e}")
 
     # ボード更新
     if changed:
